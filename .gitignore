@@ -45,6 +45,7 @@ data/software_app/browser/*_profile/
 
 # Separately versioned userscript repository
 /油猴脚本/
+/greater-trawler/
 
 # Legacy implementations kept only as local references
 /推特爬虫/

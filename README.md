@@ -2,7 +2,7 @@
 
 欲求达是一个 Windows 桌面下载工具，用来查找、预览和保存多个内容平台上的图片、视频、音频及作品元数据。桌面端把平台候选、任务队列、下载历史、文件预览和黑名单放在同一个界面中；账号密码始终留在网站登录页，软件只读取后续请求需要的 Cookie。
 
-项目源码放在 [xiaohaoyiqu/fast-get-it](https://github.com/xiaohaoyiqu/fast-get-it)。配套浏览器脚本放在 [xiaohaoyiqu/tempermonkey-scripts](https://github.com/xiaohaoyiqu/tempermonkey-scripts)。
+项目源码和文档放在 [xiaohaoyiqu/fast-get-it](https://github.com/xiaohaoyiqu/fast-get-it)。配套浏览器脚本放在 [xiaohaoyiqu/tempermonkey-scripts](https://github.com/xiaohaoyiqu/tempermonkey-scripts)，早期参考爬虫的整理版放在 [xiaohaoyiqu/greater-trawler](https://github.com/xiaohaoyiqu/greater-trawler)。
 
 ## 目前能做什么
 
@@ -88,6 +88,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1
 - [E-Hentai / ExHentai](文档/平台/E-Hentai使用与登录.md)
 - [开发与架构说明](文档/开发与架构说明.md)
 - [仓库与目录说明](文档/仓库与目录说明.md)
+- [鸣谢与参考项目](文档/鸣谢.md)
 - [完整文档目录](文档/README.md)
 
 下载功能只应用于自己有权访问和保存的内容。平台规则或页面结构变化后，相关模块可能需要更新。
