@@ -17,12 +17,12 @@
 
 E-Hentai 表站和 ExHentai 里站按两个独立登录身份处理，账号可以不同，也不会互相回退或复用：
 
-| 登录入口 | 本机文件 | 必需 Cookie | 使用范围 |
+| 登录入口 | 保存文件 | 必需 Cookie | 使用范围 |
 | --- | --- | --- | --- |
 | `E-Hentai 表站` | `data/software_app/ehentai/e-hentai-cookies.json` | `ipb_member_id`、`ipb_pass_hash` | 仅 `e-hentai.org` 与表站收藏夹 |
 | `ExHentai 里站` | `data/software_app/ehentai/exhentai-cookies.json` | `ipb_member_id`、`ipb_pass_hash`、`igneous` | 仅 `exhentai.org` 与里站收藏夹 |
 
-旧版未区分站点的 `cookies.json` 不会自动读取或迁移，以免把表站账号误用于里站。缩略图主机 `ehgt.org` 和种子主机 `ehtracker.org` 也不会收到登录 Cookie。
+未区分站点的 `cookies.json` 不会自动读取，以免把表站账号误用于里站。缩略图主机 `ehgt.org` 和种子主机 `ehtracker.org` 也不会收到登录 Cookie。
 
 普通 Chrome 获取还会分别保存 `e-hentai-browser.json`、`exhentai-browser.json` 中的浏览器 User-Agent，后续请求按账号复用；文件不包含密码。表站与里站不会共用另一个账号的 User-Agent。
 

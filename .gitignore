@@ -45,15 +45,3 @@ data/software_app/browser/*_profile/
 
 # Separately versioned userscript repository
 /油猴脚本/
-/greater-trawler/
-
-# Legacy implementations kept only as local references
-/推特爬虫/
-/Pixiv爬虫/
-/JMComic爬虫/
-/谷歌图片搜索工具/
-/app_core/
-/adapters/
-/desktop_ui/
-/prototype.py
-/run_desktop.py
