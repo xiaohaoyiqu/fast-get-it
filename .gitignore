@@ -1,0 +1,58 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# IDE and local tooling
+.idea/
+.vscode/
+.continue/
+.codex/
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# Local databases and runtime state
+*.db
+*.sqlite
+*.sqlite3
+/data/software_app/
+data/**/downloads/
+**/downloaded_urls.json
+**/failed_urls.json
+**/following_accounts.json
+**/profile_previews/
+
+# Login cookies and browser drivers
+**/X_cookie.json
+**/*cookie*.json
+**/browser_headers.json
+**/chromedriver*.exe
+data/software_app/browser/*_profile/
+/1.txt
+
+# Separately versioned userscript repository
+/油猴脚本/
+
+# Legacy implementations kept only as local references
+/推特爬虫/
+/Pixiv爬虫/
+/JMComic爬虫/
+/谷歌图片搜索工具/
+/app_core/
+/adapters/
+/desktop_ui/
+/prototype.py
+/run_desktop.py

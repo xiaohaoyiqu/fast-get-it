@@ -1,0 +1,47 @@
+{
+  "cookie_file": "X_cookie.json",
+  "targets": [
+    {
+      "target": "",
+      "types": ""
+    },
+    {
+      "target": "",
+      "types": ""
+    },
+    {
+      "target": "",
+      "types": ""
+    },
+    {
+      "target": "",
+      "types": ""
+    },
+    {
+      "target": "",
+      "types": ""
+    }
+  ],
+  "download_types": "",
+  "output_dir": ".",
+  "download_record_file": "downloaded_urls.json",
+  "failed_url_file": "failed_urls.json",
+  "max_users": 5,
+  "parallel_users": 2,
+  "bootstrap_timeout": 20,
+  "page_load_timeout": 30,
+  "media_wait_timeout": 30,
+  "max_idle_rounds": 6,
+  "cells_per_round": 7,
+  "stable_scroll_rounds": 2,
+  "download_workers": 6,
+  "request_connect_timeout": 10,
+  "request_read_timeout": 60,
+  "max_retries": 5,
+  "image_format": "png",
+  "audio_format": "mp3",
+  "convert_gif": true,
+  "keep_gif_mp4": false,
+  "gif_fps": 12,
+  "gif_width": 0
+}
