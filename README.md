@@ -39,9 +39,20 @@ python .\run_software.py
 | `python .\run_software.py browser-driver --download` | 自动安装或更新匹配的 ChromeDriver |
 | `python .\run_software.py aria2` | 检查可选的 aria2 BT 引擎 |
 
+## 打包为 exe
+
+使用 PyInstaller 打包，配置文件为项目根目录的 `欲求达.spec`：
+
+```powershell
+python -m pip install -r .\requirements-build.txt
+pyinstaller .\欲求达.spec --clean
+```
+
+打包产物在 `dist/欲求达/`，包含 `欲求达.exe`（GUI 版）和 `欲求达-cli.exe`（命令行版）。
+
 ## 登录资料和本地数据
 
-程序运行数据保存在 `data/software_app/`，下载目录可以在设置中修改。
+源码运行时数据保存在项目目录的 `data/software_app/`；打包版（exe）运行时数据保存在 exe 所在目录的 `data/software_app/`，可绿色便携使用。下载目录可以在设置中修改。
 
 Twitter/X、Pixiv、FANBOX 和 Instagram 可以在设置页打开临时登录浏览器。JMComic 与 E-Hentai 使用普通 Chrome 登录资料，关闭登录窗口后再读取 Cookie。E-Hentai 表站和 ExHentai 里站分别保存会话，两个账号不会互相覆盖。
 
@@ -64,6 +75,7 @@ BT 下载期间，Tracker 和其他节点仍可能看到公网 IP，也可能产
 
 ## 文档入口
 
+- [更新日志](文档/更新日志.md)
 - [用户手册](文档/用户手册.md)
 - [浏览器登录与 Cookie](文档/平台/浏览器登录与Cookie.md)
 - [E-Hentai / ExHentai](文档/平台/E-Hentai使用与登录.md)

@@ -1466,19 +1466,22 @@ class SoftwareDesktop(
             return
 
         if module_id == "twitter":
-            try:
-                adapter = self.manager.get_adapter("twitter")
-                payload = adapter.load_profile_preview(target, Path(self.output_dir_var.get()))
-            except Exception as exc:  # noqa: BLE001
-                self._append_log(f"读取本地主页资料失败: {exc}")
-            else:
-                payload["download_description"] = preview.description
-                payload["normalized_target"] = preview.normalized_target
-                payload["warnings"] = preview.warnings
-                self._write_profile_preview(payload)
-                handle = str(payload.get("handle") or self._target_to_handle(target)).strip()
-                self.status_var.set(f"已显示本地主页资料: @{handle}" if handle else "已显示本地主页资料")
-                return
+            output_dir = self.output_dir_var.get()
+            self.status_var.set("正在读取本地主页资料…")
+
+            def worker() -> None:
+                try:
+                    adapter = self.manager.get_adapter("twitter")
+                    payload = adapter.load_profile_preview(target, Path(output_dir))
+                    payload["download_description"] = preview.description
+                    payload["normalized_target"] = preview.normalized_target
+                    payload["warnings"] = preview.warnings
+                    self.ui_queue.put(("profile_preview_local_loaded", payload))
+                except Exception as exc:  # noqa: BLE001
+                    self.ui_queue.put(("profile_preview_local_error", str(exc)))
+
+            threading.Thread(target=worker, name="twitter-local-preview", daemon=True).start()
+            return
 
         self._render_generic_preview(preview)
 
@@ -1673,19 +1676,21 @@ class SoftwareDesktop(
             messagebox.showwarning("缺少目标", "请输入推特作者")
             return
         self._select_twitter_module()
-        adapter = self.manager.get_adapter("twitter")
-        try:
-            local_payload = adapter.load_profile_preview(target, Path(self.output_dir_var.get()))
-            local_payload["download_description"] = f"下载类型: {self._selected_types()}"
-            self._write_profile_preview(local_payload)
-        except Exception as exc:  # noqa: BLE001
-            self._append_log(f"读取本地主页资料失败: {exc}")
+        output_dir = self.output_dir_var.get()
+        types_text = self._selected_types()
         self.status_var.set("正在刷新推特主页")
         self._append_log(f"开始刷新推特主页: {target}")
         self.online_button.state(["disabled"])
         self.online_button.configure(text="资料获取中…")
 
         def worker() -> None:
+            adapter = self.manager.get_adapter("twitter")
+            try:
+                local_payload = adapter.load_profile_preview(target, Path(output_dir))
+                local_payload["download_description"] = f"下载类型: {types_text}"
+                self.ui_queue.put(("profile_preview_local_loaded", local_payload))
+            except Exception as exc:  # noqa: BLE001
+                self.ui_queue.put(("profile_preview_local_error", str(exc)))
             try:
                 payload = adapter.fetch_profile_preview(target, timeout_seconds=60)
             except Exception as exc:  # noqa: BLE001
@@ -2435,6 +2440,54 @@ class SoftwareDesktop(
 
         threading.Thread(target=worker, name=f"twitter-avatar-{handle}", daemon=True).start()
 
+    def _build_task_confirm_message(self, target: str, options: dict) -> str:
+        lines = []
+        lines.append(f"目标：{target}")
+        lines.append(f"平台：{self._selected_adapter().display_name}")
+        lines.append(f"保存目录：{self.output_dir_var.get()}")
+        lines.append("")
+        lines.append("【统一输出格式】")
+        lines.append(f"  图片：{self.image_format_var.get()}")
+        lines.append(f"  视频：{self.video_format_var.get()}")
+        lines.append(f"  动图：{self.animation_format_var.get()}")
+        lines.append(f"  音频：{self.audio_format_var.get()}")
+        lines.append("")
+        lines.append("【公共压缩 / 解压】")
+        lines.append(f"  任务完成后：{self.archive_mode_var.get()}")
+        lines.append(f"  安全解压ZIP：{'开启' if self.extract_archives_var.get() else '关闭'}")
+        lines.append(f"  压缩后清理源文件：{'开启' if self.archive_cleanup_sources_var.get() else '关闭'}")
+        lines.append("")
+        module_id = self.module_var.get()
+        if module_id == "twitter":
+            lines.append("【Twitter 设置】")
+            lines.append(f"  下载类型：{self._selected_types()}（1=图片 2=视频 3=GIF 4=音频）")
+            lines.append(f"  失败重试：{self.retries_var.get()} 次")
+        elif module_id == "pixiv":
+            lines.append("【Pixiv 设置】")
+            lines.append(f"  单任务最多作品：{self.pixiv_max_works_var.get()}")
+            lines.append(f"  收藏/关注范围：{self.pixiv_visibility_var.get()}")
+            lines.append(f"  年龄分区：{self.pixiv_age_mode_var.get()}")
+            lines.append(f"  跳过AI作品：{'开启' if self.pixiv_filter_ai_var.get() else '关闭'}")
+        elif module_id == "jmcomic":
+            lines.append("【JMComic 设置】")
+            lines.append(f"  排序：{self.jm_order_var.get()}")
+            lines.append(f"  时间范围：{self.jm_time_var.get()}")
+            lines.append(f"  后处理：{self.jm_postprocess_var.get()}")
+        elif module_id == "google_image":
+            lines.append("【相似图片设置】")
+            lines.append(f"  每张候选数：{self.google_limit_var.get()}")
+            lines.append(f"  验证等待：{self.google_wait_var.get()} 秒")
+        else:
+            lines.append(f"【{self._selected_adapter().display_name} 设置】")
+            lines.append(f"  失败重试：{self.retries_var.get()} 次")
+        proxy = str(self.storage.get_setting("proxy_url", "") or "").strip()
+        if proxy:
+            lines.append(f"  代理：{proxy}")
+        lines.append("")
+        lines.append("注意：下载和后处理可能占用较多磁盘、网络和 CPU 资源。")
+        lines.append("点击“是”开始任务，点击“否”取消。")
+        return "\n".join(lines)
+
     def _start_download(self) -> None:
         target = self.target_var.get().strip()
         if not target:
@@ -2457,6 +2510,9 @@ class SoftwareDesktop(
                 f"本任务将按“{actual_scope}”记录并下载。是否继续？",
             ):
                 return
+        if not messagebox.askyesno("确认开始下载", self._build_task_confirm_message(target, options)):
+            self.status_var.set("已取消任务")
+            return
         callbacks = self._task_callbacks()
         try:
             task = self.manager.start_task(
@@ -2631,6 +2687,19 @@ class SoftwareDesktop(
                     label = TASK_STATUS_LABELS.get(str(status), str(status))
                     self.status_var.set(f"任务 {task_id}：{label}")
                     self._append_log(f"任务结束: {task_id} {label}")
+                    if str(status) == "completed":
+                        try:
+                            task_files = list(self.storage.list_files(task_id=task_id, limit=100000))
+                            file_count = len(task_files)
+                            total_size = sum(int(r.get("size") or 0) for r in task_files)
+                            size_mb = total_size / (1024 * 1024)
+                            output_dir = self.output_dir_var.get()
+                            detail = f"任务ID：{task_id}\n下载文件：{file_count} 个\n总大小：{size_mb:.1f} MB\n保存目录：{output_dir}\n\n可在“下载库”页面查看和管理文件。"
+                        except Exception:
+                            detail = f"任务ID：{task_id}\n保存目录：{self.output_dir_var.get()}\n\n可在“下载库”页面查看和管理文件。"
+                        messagebox.showinfo("下载完成", detail)
+                    elif str(status) in {"failed", "error"}:
+                        messagebox.showwarning("下载结束", f"任务 {task_id} 未能完成，请查看任务日志了解原因。")
                 self.current_task_ids.discard(task_id)
                 if task_id == self.current_task_id:
                     self.current_task_id = next(iter(self.current_task_ids), None)
@@ -2645,6 +2714,19 @@ class SoftwareDesktop(
                     self._preview_target()
                 if self.module_var.get() != "twitter":
                     self._populate_platform_history(self.module_var.get())
+            elif event_type == "twitter_history_loaded":
+                rows = payload if isinstance(payload, list) else []
+                self._apply_twitter_history(rows)
+            elif event_type == "twitter_history_error":
+                self._append_log(f"读取推特下载历史失败: {payload}")
+            elif event_type == "profile_preview_local_loaded":
+                payload_dict = payload if isinstance(payload, dict) else {}
+                self._write_profile_preview(payload_dict)
+                handle = str(payload_dict.get("handle") or "").strip()
+                self.status_var.set(f"已显示本地主页资料: @{handle}" if handle else "已显示本地主页资料")
+            elif event_type == "profile_preview_local_error":
+                self._append_log(f"读取本地主页资料失败: {payload}")
+                self.status_var.set("本地主页资料读取失败")
             elif event_type == "profile_preview_loaded":
                 payload_dict = payload if isinstance(payload, dict) else {}
                 self.online_button.configure(text="在线获取资料")
@@ -2665,13 +2747,6 @@ class SoftwareDesktop(
                     self.online_button.state(["!disabled"])
                 self.status_var.set("在线主页刷新未完成，已保留本地资料")
                 self._append_log(message)
-                try:
-                    local_payload = self.manager.get_adapter("twitter").load_profile_preview(
-                        str(target), Path(self.output_dir_var.get())
-                    )
-                    self._write_profile_preview(local_payload)
-                except Exception:
-                    pass
             elif event_type == "profile_avatar_loaded":
                 request_id, handle, path = payload  # type: ignore[misc]
                 current_handle = self.profile_handle_var.get().strip().lstrip("@")

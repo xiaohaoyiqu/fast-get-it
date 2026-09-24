@@ -1749,8 +1749,22 @@ class FollowingTabMixin:
     def _load_twitter_history(self) -> None:
         if not hasattr(self, "twitter_history_tree"):
             return
-        adapter = self.manager.get_adapter("twitter")
-        self.twitter_history_rows = adapter.downloaded_users(Path(self.output_dir_var.get()))
+        output_dir = self.output_dir_var.get()
+
+        def worker() -> None:
+            try:
+                adapter = self.manager.get_adapter("twitter")
+                rows = adapter.downloaded_users(Path(output_dir))
+                self.ui_queue.put(("twitter_history_loaded", rows))
+            except Exception as exc:  # noqa: BLE001
+                self.ui_queue.put(("twitter_history_error", str(exc)))
+
+        threading.Thread(target=worker, name="twitter-history-load", daemon=True).start()
+
+    def _apply_twitter_history(self, rows: list[dict]) -> None:
+        if not hasattr(self, "twitter_history_tree"):
+            return
+        self.twitter_history_rows = rows
         for item in self.twitter_history_tree.get_children():
             self.twitter_history_tree.delete(item)
         for index, row in enumerate(self.twitter_history_rows):

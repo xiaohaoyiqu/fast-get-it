@@ -17,9 +17,7 @@ def runtime_root(*, frozen: bool | None = None) -> Path:
     is_frozen = bool(getattr(sys, "frozen", False)) if frozen is None else bool(frozen)
     if not is_frozen:
         return PROJECT_ROOT
-    local_app_data = str(os.environ.get("LOCALAPPDATA") or "").strip()
-    base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
-    return (base / "YuqiuDa").resolve()
+    return INSTALL_ROOT
 
 
 RUNTIME_ROOT = runtime_root()
@@ -36,7 +34,7 @@ GOOGLE_IMAGE_DATA_DIR = SOFTWARE_DATA_DIR / "google_image"
 BROWSER_TOOLS_DIR = SOFTWARE_DATA_DIR / "browser"
 SOFTWARE_TOOLS_DIR = SOFTWARE_DATA_DIR / "tools"
 MANUAL_BROWSER_PROFILE_ROOT = BROWSER_TOOLS_DIR / "manual_login_profiles"
-DB_PATH = SOFTWARE_DATA_DIR / "content_downloader_v2.db"
+DB_PATH = SOFTWARE_DATA_DIR / "content_downloader.db"
 
 ORIGINAL_TWITTER_ROOT = PROJECT_ROOT / "推特爬虫"
 TWITTER_ROOT = PROJECT_ROOT / "software_app" / "crawlers" / "twitter"

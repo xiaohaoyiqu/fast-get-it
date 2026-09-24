@@ -340,13 +340,28 @@ class TwitterNativeAdapter(CrawlerAdapter):
             return unique_display_names.get(str(name or "").strip().casefold(), normalized)
 
         output_root = Path(output_dir).expanduser() if output_dir else None
-        if output_root and output_root.exists():
-            for child in output_root.iterdir():
-                if not child.is_dir():
-                    continue
-                for local_file in child.rglob("*"):
-                    if local_file.is_file():
-                        local_owner_by_filename.setdefault(local_file.name.lower(), child.name)
+        if output_root:
+            try:
+                root_exists = output_root.exists()
+            except OSError:
+                root_exists = False
+            if root_exists:
+                try:
+                    children = list(output_root.iterdir())
+                except OSError:
+                    children = []
+                for child in children:
+                    try:
+                        if not child.is_dir():
+                            continue
+                        for local_file in child.rglob("*"):
+                            try:
+                                if local_file.is_file():
+                                    local_owner_by_filename.setdefault(local_file.name.lower(), child.name)
+                            except OSError:
+                                continue
+                    except OSError:
+                        continue
 
         history = _read_json_file(self.downloaded_users_file(), {"items": {}})
         history_items = history.get("items", {}) if isinstance(history, dict) else {}
