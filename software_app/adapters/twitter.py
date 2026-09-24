@@ -1003,8 +1003,19 @@ class TwitterNativeAdapter(CrawlerAdapter):
         if not script.exists():
             raise FileNotFoundError(script)
 
+        python_exe = sys.executable
+        if getattr(sys, "frozen", False):
+            import shutil
+            python_exe = shutil.which("py") or shutil.which("python") or shutil.which("python3")
+            if not python_exe:
+                raise RuntimeError(
+                    "打包版运行推特主页预览需要系统安装 Python。\n"
+                    "请安装 Python 3.10+ 并确保 py 或 python 命令可用，\n"
+                    "或使用源码版运行。"
+                )
+
         command = [
-            sys.executable,
+            python_exe,
             str(script),
             target,
             "--cookie",

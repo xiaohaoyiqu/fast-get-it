@@ -96,6 +96,10 @@ class TaskQueueTabMixin:
         detail_x = ttk.Scrollbar(detail_text_frame, orient="horizontal", command=self.task_detail_text.xview)
         detail_x.grid(row=1, column=0, sticky="ew")
         self.task_detail_text.configure(yscrollcommand=detail_y.set, xscrollcommand=detail_x.set, state="disabled")
+        self._task_detail_scroll_grabbed = False
+        detail_y.bind("<ButtonPress-1>", lambda _e: setattr(self, "_task_detail_scroll_grabbed", True))
+        detail_y.bind("<ButtonRelease-1>", lambda _e: setattr(self, "_task_detail_scroll_grabbed", False))
+        self.task_detail_text.bind("<ButtonPress-1>", lambda _e: setattr(self, "_task_detail_scroll_grabbed", False))
         self._write_text(self.task_detail_text, "选择上方任务后，这里会显示完整参数、错误、日志和本任务文件。")
 
         task_panes.add(task_list_panel, weight=3)

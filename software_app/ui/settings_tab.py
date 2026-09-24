@@ -943,11 +943,24 @@ class SettingsTabMixin:
         self.jm_auth_status_var.set(f"{status['message']}；{header_text}；{account_text}")
 
     def _open_jmcomic_guide(self) -> None:
-        guide = PROJECT_ROOT / "文档" / "平台" / "JMComic使用与登录.md"
-        try:
-            os.startfile(str(guide.resolve()))  # type: ignore[attr-defined]
-        except OSError as exc:
-            messagebox.showerror("无法打开 JMComic 使用说明", str(exc))
+        messagebox.showinfo(
+            "JMComic 使用与登录说明",
+            "【登录步骤】\n"
+            "1. 在设置页确认站点域名、代理和账号用户名。\n"
+            "2. 点「打开普通 Chrome 登录」，在浏览器中完成 Cloudflare 验证和账号登录。\n"
+            "3. 登录后打开漫画收藏页，确认内容可见。\n"
+            "4. 关闭该 Chrome 的全部窗口，回到软件点「登录完成后获取」。\n"
+            "5. 软件检测到非空 AVS 后才会更新 Cookie；未取得时保留原文件。\n"
+            "\n"
+            "【注意事项】\n"
+            "- cf_clearance 只是 Cloudflare 通行凭证，不能证明账号已登录。\n"
+            "- 账号功能（收藏/追更/观看记录）需要 AVS 登录会话。\n"
+            "- 获取前必须关闭专用 Chrome 全部窗口，否则 Windows 会锁住 Cookie 数据库。\n"
+            "- 出现 HTTP 403 时，应在相同代理下重新通过验证，再一起更新 Cookie、请求头和 User-Agent。\n"
+            "- 也可使用「请求头 TXT → JSON」从浏览器抓包导入。\n"
+            "\n"
+            "Cookie 保存在 data/software_app/jmcomic/cookies.json，不会显示在日志中。",
+        )
 
     def _open_plugins_folder(self) -> None:
         PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
@@ -958,11 +971,30 @@ class SettingsTabMixin:
 
 
     def _open_plugin_guide(self) -> None:
-        guide = PROJECT_ROOT / "文档" / "插件开发.md"
-        try:
-            os.startfile(str(guide.resolve()))  # type: ignore[attr-defined]
-        except OSError as exc:
-            messagebox.showerror("无法打开插件说明", str(exc))
+        guide_text = (
+            "【插件目录结构】\n"
+            "data/software_app/plugins/<plugin-id>/\n"
+            "  plugin.json  （清单文件）\n"
+            "  plugin.py    （适配器代码）\n"
+            "\n"
+            "【最小 plugin.json】\n"
+            '{\n  "id": "sample-plugin",\n  "name": "示例平台",\n'
+            '  "api_version": 1,\n  "enabled": true,\n'
+            '  "module": "plugin.py",\n  "factory": "create_adapters"\n}'
+            "\n\n"
+            "【开发要求】\n"
+            "- create_adapters() 返回一个 CrawlerAdapter 或 Adapter 列表。\n"
+            "- 每个 Adapter 至少实现 preview_target() 和 download()。\n"
+            "- 支持搜索时实现 search_targets() 并在 ModuleInfo.capabilities 中声明。\n"
+            "- 只有 enabled=true 才会加载，模块 ID 重复会被拒绝。\n"
+            '- 需替换内置模块时，清单须增加 "replaces": "pixiv"，这是显式接管。\n'
+            "\n"
+            "【管理方式】\n"
+            "- 设置页「平台插件」可查看加载状态、启用/停用外部插件。\n"
+            "- 修改清单或代码后需重启软件。\n"
+            "- 命令行执行 python run_software.py plugins 可查看加载状态。"
+        )
+        messagebox.showinfo("平台插件开发说明", guide_text)
 
 
     def _refresh_plugin_tree(self) -> None:
@@ -1249,11 +1281,32 @@ class SettingsTabMixin:
 
 
     def _open_cookie_capture_guide(self) -> None:
-        guide = PROJECT_ROOT / "文档" / "平台" / "浏览器登录与Cookie.md"
-        try:
-            os.startfile(str(guide.resolve()))  # type: ignore[attr-defined]
-        except OSError as exc:
-            messagebox.showerror("无法打开浏览器登录说明", str(exc))
+        messagebox.showinfo(
+            "浏览器登录与 Cookie 说明",
+            "【使用步骤】\n"
+            "1. 打开设置 → 浏览器登录与 Cookie。\n"
+            "2. 选择平台：Twitter/X、Pixiv、FANBOX、Instagram、E-Hentai 表站或 ExHentai 里站。\n"
+            "3. 确认代理 URL（登录窗口会使用当前值）。\n"
+            "4. 普通平台点「打开登录浏览器并获取」；EH 点「打开普通 Chrome 登录」。\n"
+            "5. 在官网窗口自行登录并完成验证，不要把密码输入软件。\n"
+            "6. 普通平台检测到必需 Cookie 后自动保存并关闭窗口。\n"
+            "   EH 需关闭全部专用窗口后点「登录完成后获取」。\n"
+            "\n"
+            "【各平台必需 Cookie】\n"
+            "- Twitter/X: auth_token、ct0\n"
+            "- Pixiv: PHPSESSID（账号接口验证成功）\n"
+            "- FANBOX: FANBOXSESSID\n"
+            "- Instagram: sessionid\n"
+            "- E-Hentai 表站: ipb_member_id、ipb_pass_hash\n"
+            "- ExHentai 里站: ipb_member_id、ipb_pass_hash、igneous\n"
+            "\n"
+            "【注意事项】\n"
+            "- 软件不保存账号密码，Cookie 只保存在 data/software_app/。\n"
+            "- 登录等待上限 10 分钟，可提前点「停止获取」。\n"
+            "- 平台拒绝自动化登录时，可用「请求头 TXT → JSON」从普通浏览器导入。\n"
+            "- Pixiv 和 FANBOX 需分别登录；EH 表站和里站也需分别配置。\n"
+            "- Bluesky、Google 相似搜索、普通网页不需要 Cookie。",
+        )
 
 
     def _start_cookie_capture(self) -> None:

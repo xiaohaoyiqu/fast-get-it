@@ -2608,6 +2608,8 @@ class SoftwareDesktop(
                     self.task_progress_var.set(3.0)
                 elif event.status == "running" and self.task_progress_var.get() < 8:
                     self.task_progress_var.set(8.0)
+                if event.task_id in self.task_tree.selection():
+                    changed_task_detail = True
             elif event_type == "file":
                 record = payload
                 assert isinstance(record, FileRecord)
@@ -3328,6 +3330,9 @@ class SoftwareDesktop(
         widget.delete("1.0", tk.END)
         widget.insert(tk.END, text)
         widget.configure(state=tk.DISABLED)
+        if hasattr(self, "task_detail_text") and widget is self.task_detail_text:
+            if not getattr(self, "_task_detail_scroll_grabbed", False):
+                widget.see(tk.END)
 
 
 def main() -> None:
