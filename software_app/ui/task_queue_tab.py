@@ -18,6 +18,9 @@ class TaskQueueTabMixin:
         self._task_programmatic_selection: set[str] = set()
         self._task_detail_refresh_pending = False
         self._last_task_detail_render_at = 0.0
+        self._task_active_media: dict[str, int] = {}
+        self._task_last_activity: dict[str, str] = {}
+        self.task_activity_var = tk.StringVar(value="当前操作：等待任务")
         self.task_log_level_var = tk.StringVar(value="全部")
         self.task_log_search_var = tk.StringVar(value="")
         self.tasks_tab.columnconfigure(0, weight=1)
@@ -95,8 +98,13 @@ class TaskQueueTabMixin:
         ttk.Button(log_tools, text="清除", command=lambda: self.task_log_search_var.set("")).grid(row=0, column=4, padx=(0, 6))
         self.task_log_export_button = ttk.Button(log_tools, text="导出日志", command=self._export_selected_task_logs)
         self.task_log_export_button.grid(row=0, column=5, padx=(0, 6))
+        self.task_log_clear_button = ttk.Button(log_tools, text="清理日志", command=self._clear_selected_task_logs)
+        self.task_log_clear_button.grid(row=0, column=6, padx=(0, 6))
         self.task_log_count_var = tk.StringVar(value="选择单个任务后可筛选和导出日志")
-        ttk.Label(log_tools, textvariable=self.task_log_count_var, style="Small.TLabel").grid(row=0, column=6, sticky="w")
+        ttk.Label(log_tools, textvariable=self.task_log_count_var, style="Small.TLabel").grid(row=0, column=7, sticky="w")
+        ttk.Label(log_tools, textvariable=self.task_activity_var, style="Small.TLabel", anchor="w").grid(
+            row=1, column=0, columnspan=8, sticky="ew", pady=(3, 0)
+        )
         self.task_log_level_combo.bind("<<ComboboxSelected>>", self._task_log_filter_changed)
         self.task_log_search_var.trace_add("write", lambda *_args: self._task_log_filter_changed())
 
@@ -344,7 +352,9 @@ class TaskQueueTabMixin:
             ):
                 button.state(["disabled"])
             self.task_log_export_button.state(["disabled"])
+            self.task_log_clear_button.state(["disabled"])
             self.task_log_count_var.set("选择单个任务后可筛选和导出日志")
+            self.task_activity_var.set("当前操作：等待任务")
             return
 
         retryable = [row for row in rows if self._task_can_retry(row)]
@@ -355,7 +365,9 @@ class TaskQueueTabMixin:
         self.task_delete_button.state(["!disabled"])
         if len(rows) > 1:
             self.task_log_export_button.state(["disabled"])
+            self.task_log_clear_button.state(["!disabled"])
             self.task_log_count_var.set("多选时显示任务摘要；选择单个任务查看日志")
+            self.task_activity_var.set(f"当前操作：已选择 {len(rows)} 个任务；可批量清理其日志")
             self.task_use_button.state(["!disabled"] if len(selected_modules) == 1 else ["disabled"])
             self.task_folder_button.state(["disabled"])
             summary = f"已选 {len(rows)} 项 · 可重试 {len(retryable)} · 可取消 {len(cancellable)} · 可删除 {len(rows)}"
@@ -380,7 +392,9 @@ class TaskQueueTabMixin:
         logs = list(reversed(self.storage.list_logs(task_id, limit=500)))
         filtered_logs = self._filter_task_logs(logs)
         self.task_log_export_button.state(["!disabled"] if logs else ["disabled"])
+        self.task_log_clear_button.state(["!disabled"] if logs else ["disabled"])
         self.task_log_count_var.set(f"显示 {len(filtered_logs)} / {len(logs)} 条")
+        self._update_task_activity_label(task_id, status)
         files = self.storage.list_files(task_id=task_id, limit=500)
         target = str(row.get("normalized_target") or row.get("target") or "-")
         self.task_detail_var.set(
@@ -427,6 +441,62 @@ class TaskQueueTabMixin:
             self.task_folder_button.state(["!disabled"])
         else:
             self.task_folder_button.state(["disabled"])
+
+    def _update_task_activity_from_event(self, event) -> None:
+        task_id = str(getattr(event, "task_id", "") or "")
+        if not task_id:
+            return
+        metadata = getattr(event, "metadata", {}) or {}
+        phase = str(metadata.get("phase") or "")
+        result = str(metadata.get("result") or "")
+        message = str(getattr(event, "message", "") or "").strip()
+        if phase == "media" and result == "processing":
+            self._task_active_media[task_id] = self._task_active_media.get(task_id, 0) + 1
+            self._task_last_activity[task_id] = message
+        elif phase == "media" and result in {"completed", "skipped", "failed"}:
+            self._task_active_media[task_id] = max(0, self._task_active_media.get(task_id, 0) - 1)
+            self._task_last_activity[task_id] = message
+        elif message:
+            self._task_last_activity[task_id] = message
+        if task_id in {str(value) for value in self.task_tree.selection()}:
+            status = str(self.task_rows.get(task_id, {}).get("status") or "running")
+            self._update_task_activity_label(task_id, status)
+
+    def _update_task_activity_label(self, task_id: str, status: str) -> None:
+        active = self._task_active_media.get(task_id, 0)
+        latest = self._task_last_activity.get(task_id, "").replace("\n", " ").strip()
+        if len(latest) > 180:
+            latest = latest[:177] + "…"
+        if active:
+            text = f"媒体下载/处理进行中（{active} 项）"
+            if latest:
+                text += f" · 最近：{latest}"
+        elif latest:
+            text = f"当前操作：{latest}"
+        elif status == "queued":
+            text = "当前操作：等待平台并发槽位"
+        else:
+            text = f"当前操作：{TASK_STATUS_LABELS.get(status, status)}"
+        self.task_activity_var.set(text)
+
+    def _clear_selected_task_logs(self) -> None:
+        rows = self._selected_task_rows()
+        if not rows:
+            messagebox.showwarning("未选择任务", "请先选择一个或多个任务")
+            return
+        task_ids = {str(row["task_id"]) for row in rows}
+        if not messagebox.askyesno(
+            "清理任务日志",
+            f"清理所选 {len(task_ids)} 个任务的日志？\n\n"
+            "只删除日志，不删除任务记录、任务状态、文件索引或本地媒体。\n"
+            "运行中的任务会继续写入后续日志。",
+        ):
+            return
+        deleted = self.storage.delete_task_logs(task_ids)
+        self.task_log_search_var.set("")
+        self._refresh_tasks()
+        self.status_var.set(f"已清理 {deleted} 条任务日志")
+        self._append_log(f"已清理任务日志：tasks={len(task_ids)}, logs={deleted}")
 
     def _filter_task_logs(self, logs: list[dict]) -> list[dict]:
         level = self.task_log_level_var.get().strip().upper()

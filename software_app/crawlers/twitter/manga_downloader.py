@@ -13,6 +13,7 @@ try:
         download_audio,
         download_pic,
         download_video,
+        media_filename,
         request_with_retries,
         safe_filename,
     )
@@ -23,6 +24,7 @@ except ImportError:  # Preserve direct script execution.
         download_audio,
         download_pic,
         download_video,
+        media_filename,
         request_with_retries,
         safe_filename,
     )
@@ -60,6 +62,28 @@ def emit_media_result(callback, media_type, status, path=None, reason=""):
         callback(media_type, status, path, reason)
     except Exception as error:  # UI reporting must never break a download worker.
         print(f"媒体结果通知失败: {short_error(error)}")
+
+
+def media_display_name(src, media_type, filename_base, options):
+    preferred_format = str(
+        options.get("image_format") if media_type == "image"
+        else options.get("audio_format") if media_type == "audio"
+        else "mp4"
+    ).strip().lower()
+    allowed_formats = {
+        "image": {"png", "jpg", "jpeg", "webp", "bmp", "avif"},
+        "audio": {"mp3", "wav", "flac", "m4a", "aac", "ogg"},
+        "video": {"mp4"},
+        "gif": {"mp4"},
+    }
+    if preferred_format == "original" or preferred_format not in allowed_formats.get(media_type, {"mp4"}):
+        preferred_format = "png" if media_type == "image" else "mp3" if media_type == "audio" else "mp4"
+    return media_filename(
+        src,
+        f".{preferred_format}",
+        filename_base,
+        force_ext=media_type in {"image", "audio"},
+    )
 
 
 def normalize_datetime_text(value):
@@ -479,6 +503,8 @@ def download_status_from_syndication(
         if cancel_event is not None and cancel_event.is_set():
             break
         stats.inc(f"queued_{media_type}")
+        display_name = media_display_name(src, media_type, filename_base, config)
+        emit_media_result(on_media_result, media_type, "processing", display_name, "下载进行中")
         reported = [False]
         def report(kind, status, path=None, reason=""):
             reported[0] = True
@@ -628,6 +654,8 @@ def download_worker(worker_id, q, folder, video_folder, audio_folder, record, st
         try:
             if cancel_event is not None and cancel_event.is_set():
                 continue
+            display_name = media_display_name(src, media_type, filename_base, options)
+            emit_media_result(on_media_result, media_type, "processing", display_name, "下载进行中")
             if media_type == "image":
                 download_pic(
                     src,

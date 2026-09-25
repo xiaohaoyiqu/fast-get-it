@@ -89,7 +89,7 @@ class TwitterCrawlerService:
                     )
                 except OSError:
                     pass
-            state_label = {"completed": "完成", "skipped": "跳过", "failed": "失败"}.get(result, result)
+            state_label = {"processing": "下载中", "completed": "完成", "skipped": "跳过", "failed": "失败"}.get(result, result)
             detail = f"：{path.name}" if path is not None else ""
             if reason:
                 detail += f"（{reason}）"
@@ -99,7 +99,10 @@ class TwitterCrawlerService:
                     task.task_id, task.module_id, level,
                     f"{media_label}{state_label}{detail}",
                     status="running",
-                    metadata={"phase": "media", "result": result, "media_type": media_type},
+                    metadata={
+                        "phase": "media", "result": result, "media_type": media_type,
+                        "filename": path.name if path is not None else "",
+                    },
                 )
             )
 

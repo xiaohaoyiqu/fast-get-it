@@ -361,6 +361,19 @@ class AppStorage:
         with self.connect() as conn:
             return list(conn.execute("SELECT * FROM logs ORDER BY id DESC LIMIT ?", (limit,)))
 
+    def delete_task_logs(self, task_ids: list[str] | tuple[str, ...] | set[str]) -> int:
+        """Delete logs for selected tasks without changing tasks or file indexes."""
+        identifiers = sorted({str(task_id).strip() for task_id in task_ids if str(task_id).strip()})
+        if not identifiers:
+            return 0
+        placeholders = ",".join("?" for _ in identifiers)
+        with self.connect() as conn:
+            cursor = conn.execute(
+                f"DELETE FROM logs WHERE task_id IN ({placeholders})",
+                identifiers,
+            )
+            return cursor.rowcount if cursor.rowcount is not None else 0
+
     def set_setting(self, key: str, value: object) -> None:
         with self.connect() as conn:
             conn.execute(

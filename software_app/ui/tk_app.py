@@ -3017,6 +3017,7 @@ class SoftwareDesktop(
             if event_type == "progress":
                 event = payload
                 assert isinstance(event, ProgressEvent)
+                self._update_task_activity_from_event(event)
                 progress_log_lines.append(f"[{event.level}] {event.message}")
                 if self.task_tree.exists(event.task_id):
                     if event.task_id in self.task_rows:
@@ -3112,6 +3113,11 @@ class SoftwareDesktop(
                         )
             elif event_type == "done":
                 task_id, status = payload  # type: ignore[misc]
+                self._task_active_media.pop(str(task_id), None)
+                done_label = TASK_STATUS_LABELS.get(str(status), str(status))
+                self._task_last_activity[str(task_id)] = f"任务状态：{done_label}"
+                if str(task_id) in {str(value) for value in self.task_tree.selection()}:
+                    self._update_task_activity_label(str(task_id), str(status))
                 batch_task = task_id in self._task_follow_order
                 pending_delete = task_id in self.pending_task_deletions
                 if pending_delete:
