@@ -4,8 +4,6 @@ import csv
 import json
 import re
 import shutil
-import subprocess
-import sys
 import threading
 import uuid
 from datetime import datetime
@@ -22,6 +20,7 @@ from software_app.crawlers.common import safe_component
 from software_app.crawlers.twitter import TwitterCrawlerService
 from software_app.crawlers.twitter.download_method import configure_downloads, request_with_retries
 from software_app.crawlers.twitter.following_collector import collect_following
+from software_app.crawlers.twitter.profile_preview import collect_profile_preview
 from software_app.crawlers.twitter.twitter_Crawler_2 import DEFAULT_CONFIG, config_bool, load_config
 
 
@@ -198,6 +197,14 @@ class TwitterNativeAdapter(CrawlerAdapter):
             source = self.twitter_root / name
             if not target.exists() and source.exists():
                 shutil.copy2(source, target)
+        config = self.runtime_data_dir / "config.json"
+        if not config.exists():
+            try:
+                with config.open("x", encoding="utf-8") as file:
+                    json.dump(DEFAULT_CONFIG, file, ensure_ascii=False, indent=2)
+                    file.write("\n")
+            except FileExistsError:
+                pass
 
     def preview_target(self, raw_target: str, options: dict | None = None) -> TargetPreview:
         options = options or {}
@@ -999,55 +1006,13 @@ class TwitterNativeAdapter(CrawlerAdapter):
         self._ensure_runtime_files()
         output = self.profile_preview_file(target)
         cookie = self.runtime_data_dir / "X_cookie.json"
-        script = self.twitter_root / "profile_preview.py"
-        if not script.exists():
-            raise FileNotFoundError(script)
-
-        python_exe = sys.executable
-        if getattr(sys, "frozen", False):
-            import shutil
-            python_exe = shutil.which("py") or shutil.which("python") or shutil.which("python3")
-            if not python_exe:
-                raise RuntimeError(
-                    "打包版运行推特主页预览需要系统安装 Python。\n"
-                    "请安装 Python 3.10+ 并确保 py 或 python 命令可用，\n"
-                    "或使用源码版运行。"
-                )
-
-        command = [
-            python_exe,
-            str(script),
-            target,
-            "--cookie",
-            str(cookie),
-            "--output",
-            str(output),
-            "--page-load-timeout",
-            str(max(10, min(int(timeout_seconds or 60), 30))),
-        ]
-        try:
-            result = subprocess.run(
-                command,
-                cwd=str(self.twitter_root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-                timeout=max(60, int(timeout_seconds or 60) + 45),
-            )
-        except subprocess.TimeoutExpired as exc:
-            output_text = (exc.stdout or "").strip()
-            detail = f"\n{output_text}" if output_text else ""
-            raise RuntimeError(f"主页预览超时，已停止。{detail}") from exc
-
-        if result.returncode != 0:
-            message = (result.stdout or "").strip() or f"主页预览脚本退出码: {result.returncode}"
-            raise RuntimeError(message)
-        payload = json.loads(output.read_text(encoding="utf-8-sig"))
+        payload = collect_profile_preview(
+            cookie_file=cookie,
+            output_file=output,
+            target=target,
+            page_load_timeout=max(10, min(int(timeout_seconds or 60), 30)),
+        )
         payload["source"] = "live_profile"
-        payload["log"] = result.stdout or ""
         return payload
 
 

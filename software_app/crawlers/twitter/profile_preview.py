@@ -17,6 +17,8 @@ try:
     from .driver_init import cookies_web, initialize_driver
     from .following_collector import discover_current_handle, normalize_handle, page_has_login_or_restriction, safe_get, short_error
 except ImportError:  # Direct script execution used by the desktop subprocess.
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from driver_init import cookies_web, initialize_driver
     from following_collector import discover_current_handle, normalize_handle, page_has_login_or_restriction, safe_get, short_error
 

@@ -18,6 +18,7 @@ from software_app.ui.desktop_support import (
     collect_image_files as _collect_image_files,
     download_module_for_target,
     download_types_for_discovered_target,
+    select_treeview_row_at_event,
 )
 from software_app.ui.scrolling import bind_canvas_mousewheel
 
@@ -175,8 +176,8 @@ class GoogleSearchTabMixin:
         self.google_result_tree.tag_configure("restricted", background="#fff8e6", foreground="#865d12")
         self.google_result_tree.tag_configure("blocked", background="#f2e9f3", foreground="#75417c")
         self.google_result_tree.bind("<<TreeviewSelect>>", lambda _event: self._update_google_result_summary())
-        self.google_result_tree.bind("<Double-Button-1>", lambda _event: self._preview_selected_google_result())
-        self.google_result_tree.bind("<Return>", lambda _event: self._preview_selected_google_result())
+        self.google_result_tree.bind("<Double-Button-1>", self._preview_double_clicked_google_result)
+        self.google_result_tree.bind("<Return>", self._preview_focused_google_result)
         self.google_result_tree.bind("<Control-a>", lambda _event: self._select_all_google_results())
 
         self.google_selection_detail_var = tk.StringVar(value="选中候选可查看跳转地址和黑名单状态。")
@@ -194,6 +195,10 @@ class GoogleSearchTabMixin:
         self.google_clear_button.grid(row=0, column=1, padx=(0, 6))
         self.google_preview_button = ttk.Button(action_row, text="打开网页", style="Compact.TButton", command=self._preview_selected_google_result)
         self.google_preview_button.grid(row=0, column=2, sticky="w")
+        self.google_fill_button = ttk.Button(action_row, text="批量填入工作台", style="Compact.TButton", command=self._fill_selected_google_results)
+        self.google_fill_button.grid(row=1, column=0, sticky="w", pady=(5, 0))
+        self.google_batch_info_button = ttk.Button(action_row, text="批量获取资料", style="Compact.TButton", command=self._fetch_selected_google_info)
+        self.google_batch_info_button.grid(row=1, column=1, sticky="w", padx=(6, 0), pady=(5, 0))
         self.google_check_button = ttk.Button(action_row, text="检查链接", style="Compact.TButton", command=self._check_selected_google_results)
         self.google_check_button.grid(row=0, column=3, padx=(6, 0))
         self.google_mark_missing_button = ttk.Button(
@@ -248,6 +253,8 @@ class GoogleSearchTabMixin:
             self.google_pixiv_button,
             self.google_twitter_button,
             self.google_crawl_button,
+            self.google_fill_button,
+            self.google_batch_info_button,
             self.google_block_button,
             self.google_pixiv_inspect_button,
             self.google_unblock_button,
@@ -639,7 +646,10 @@ class GoogleSearchTabMixin:
             self.google_selection_detail_var.set(f"已选 {selected} 个候选，其中黑名单屏蔽 {selected_blocked} 个；下载时会自动跳过。")
         self.google_select_all_button.state(["!disabled"] if total else ["disabled"])
         self.google_clear_button.state(["!disabled"] if selected else ["disabled"])
-        self.google_preview_button.state(["!disabled"] if selected else ["disabled"])
+        self.google_preview_button.state(["!disabled"] if selected == 1 else ["disabled"])
+        workbench_targets = self._google_workbench_targets(selected_rows)
+        self.google_fill_button.state(["!disabled"] if workbench_targets else ["disabled"])
+        self.google_batch_info_button.state(["!disabled"] if workbench_targets and len(workbench_targets[1]) <= 50 else ["disabled"])
         checking = self.google_link_check_cancel_event is not None
         self.google_check_button.configure(text="停止检查" if checking else "检查链接")
         self.google_check_button.state(["!disabled"] if selected or checking else ["disabled"])
@@ -701,6 +711,33 @@ class GoogleSearchTabMixin:
             except (ValueError, IndexError):
                 continue
         return rows
+
+    @staticmethod
+    def _google_workbench_targets(rows: list[dict]) -> tuple[str, list[str]] | None:
+        targets = list(dict.fromkeys(
+            str(row.get("final_url") or row.get("url") or "").strip()
+            for row in rows
+            if str(row.get("final_url") or row.get("url") or "").strip().startswith(("http://", "https://"))
+        ))
+        return ("website", targets) if targets else None
+
+    def _fill_selected_google_results(self) -> None:
+        selected = self._google_workbench_targets(self._selected_google_rows())
+        if not selected:
+            messagebox.showwarning("无法批量填入", "请先选择一个或多个有效候选页面")
+            return
+        self._fill_targets_into_workbench(*selected)
+
+    def _fetch_selected_google_info(self) -> None:
+        selected = self._google_workbench_targets(self._selected_google_rows())
+        if not selected:
+            messagebox.showwarning("无法批量获取资料", "请先选择一个或多个有效候选页面")
+            return
+        if len(selected[1]) > 50:
+            messagebox.showwarning("目标过多", "一次最多批量获取 50 个候选页面资料")
+            return
+        self._fill_targets_into_workbench(*selected)
+        self._batch_fetch_target_info()
 
     def _block_selected_google_results(self) -> None:
         rows = [row for row in self._selected_google_rows() if not self._google_result_blocked(row)]
@@ -864,6 +901,18 @@ class GoogleSearchTabMixin:
         else:
             messagebox.showerror("打开失败", url)
 
+    def _preview_double_clicked_google_result(self, event) -> str:
+        if select_treeview_row_at_event(self.google_result_tree, event):
+            self._preview_selected_google_result()
+        return "break"
+
+    def _preview_focused_google_result(self, _event=None) -> str:
+        item_id = str(self.google_result_tree.focus() or "")
+        if item_id and self.google_result_tree.exists(item_id):
+            self.google_result_tree.selection_set(item_id)
+            self._preview_selected_google_result()
+        return "break"
+
 
     @staticmethod
     def _download_module_for_target(module_id: str, target: str) -> str:
@@ -974,6 +1023,7 @@ class GoogleSearchTabMixin:
             return
         callbacks = self._task_callbacks()
         created = 0
+        created_task_ids: list[str] = []
         for row in rows:
             url = self._pixiv_result_target(row)
             try:
@@ -1003,9 +1053,11 @@ class GoogleSearchTabMixin:
                 self._append_log(f"Pixiv 作品加入队列失败：{url} | {exc}")
                 continue
             created += 1
+            created_task_ids.append(task.task_id)
             self.current_task_id = task.task_id
             self.current_task_ids.add(task.task_id)
         self._refresh_tasks()
+        self._follow_task_batch(created_task_ids)
         self.status_var.set(f"已将 {created} 个 Pixiv 作品加入下载队列")
 
     def _queue_selected_google_as_twitter(self) -> None:
@@ -1023,6 +1075,7 @@ class GoogleSearchTabMixin:
             return
         callbacks = self._task_callbacks()
         created = 0
+        created_task_ids: list[str] = []
         for target in targets:
             try:
                 task = self.manager.start_task(
@@ -1040,9 +1093,11 @@ class GoogleSearchTabMixin:
                 self._append_log(f"X 帖子加入队列失败：{target} | {exc}")
                 continue
             created += 1
+            created_task_ids.append(task.task_id)
             self.current_task_id = task.task_id
             self.current_task_ids.add(task.task_id)
         self._refresh_tasks()
+        self._follow_task_batch(created_task_ids)
         self.status_var.set(f"已将 {created} 个 X 帖子加入下载队列")
 
 
@@ -1068,6 +1123,7 @@ class GoogleSearchTabMixin:
             return
         callbacks = self._task_callbacks()
         created = 0
+        created_task_ids: list[str] = []
         routed: dict[str, int] = {}
         for row in rows:
             url = str(row.get("url") or "").strip()
@@ -1101,6 +1157,7 @@ class GoogleSearchTabMixin:
                 self._append_log(f"候选页面加入失败: {url} | {exc}")
                 continue
             created += 1
+            created_task_ids.append(task.task_id)
             routed[module_id] = routed.get(module_id, 0) + 1
             self.current_task_id = task.task_id
             self.current_task_ids.add(task.task_id)
@@ -1115,5 +1172,6 @@ class GoogleSearchTabMixin:
         self.status_var.set(f"已加入 {created} 个下载任务：{route_text}")
         self.notebook.select(self.tasks_tab)
         self._refresh_tasks()
+        self._follow_task_batch(created_task_ids)
 
 

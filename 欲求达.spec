@@ -1,19 +1,32 @@
 ﻿# -*- mode: python ; coding: utf-8 -*-
-
 a = Analysis(
     ["run_software.py"],
     pathex=[],
-    binaries=[],
+    binaries=[
+        ("software_app/crawlers/twitter/chromedriver.exe", "."),
+    ],
     datas=[
         ("software_app/crawlers/twitter", "software_app/crawlers/twitter"),
         ("software_app/crawlers/pixiv", "software_app/crawlers/pixiv"),
         ("software_app/crawlers/jmcomic", "software_app/crawlers/jmcomic"),
     ],
-    hiddenimports=[],
-    hookspath=[],
+    hiddenimports=[
+        "PIL",
+        "PIL._imaging",
+        "PIL._imagingft",
+        "PIL._imagingmath",
+        "PIL._imagingmorph",
+        "PIL._tkinter_finder",
+        "PIL.Image",
+        "PIL.ImageTk",
+        "tkinterweb",
+        "win32crypt",
+        "Crypto.Cipher.AES",
+    ],
+    hookspath=["pyinstaller_hooks"],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=["torch", "torchvision", "torchaudio", "pandas", "scipy", "matplotlib"],
     noarchive=False,
     optimize=0,
 )
@@ -31,6 +44,7 @@ common_kwargs = dict(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon="1.ico",
 )
 
 gui_exe = EXE(

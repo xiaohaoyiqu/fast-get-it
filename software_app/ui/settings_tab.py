@@ -123,6 +123,34 @@ class SettingsTabMixin:
             row=1, column=1, sticky="w", padx=(6, 18), pady=(9, 0)
         )
 
+        concurrency_grid = ttk.LabelFrame(option_grid, text="下载任务并发上限", style="Panel.TLabelframe", padding=8)
+        concurrency_grid.grid(row=2, column=0, columnspan=8, sticky="ew", pady=(12, 0))
+        for column in (1, 2, 3):
+            concurrency_grid.columnconfigure(column, weight=1)
+        for column, title in enumerate(("平台", "平台总上限", "作品 / 单项", "作者 / 范围")):
+            ttk.Label(concurrency_grid, text=title, style="Panel.TLabel").grid(
+                row=0, column=column, sticky="w", padx=(0, 10), pady=(0, 4)
+            )
+        for row_index, adapter in enumerate(self.adapters, start=1):
+            variables = self.platform_concurrency_vars[adapter.module_id]
+            ttk.Label(concurrency_grid, text=adapter.display_name, style="Panel.TLabel").grid(
+                row=row_index, column=0, sticky="w", padx=(0, 10), pady=2
+            )
+            for column, key in enumerate(("total", "single", "collection"), start=1):
+                ttk.Spinbox(
+                    concurrency_grid,
+                    from_=1,
+                    to=20,
+                    textvariable=variables[key],
+                    width=6,
+                ).grid(row=row_index, column=column, sticky="w", padx=(0, 10), pady=2)
+        ttk.Label(
+            concurrency_grid,
+            text="默认作品 / 单项上限跟随平台总上限，作者 / 范围上限为 1。单平台总并发会同时限制两类任务；设置只影响之后加入队列的任务。",
+            style="Small.TLabel",
+            wraplength=700,
+        ).grid(row=len(self.adapters) + 1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
         format_grid = ttk.LabelFrame(body, text="统一输出格式", style="Panel.TLabelframe", padding=10)
         format_grid.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(14, 0))
         for column in (1, 3, 5, 7):
@@ -631,6 +659,14 @@ class SettingsTabMixin:
             manual_wait = max(0, min(int(self.google_wait_var.get()), 300))
             max_files = max(1, min(int(self.google_max_files_var.get()), 200))
             webpage_timeout = max(30, min(int(self.webpage_timeout_var.get()), 600))
+            task_concurrency_values = {}
+            for module_id, variables in self.platform_concurrency_vars.items():
+                total = max(1, min(20, int(variables["total"].get())))
+                task_concurrency_values[module_id] = {
+                    "total": total,
+                    "single": min(total, max(1, min(20, int(variables["single"].get())))),
+                    "collection": min(total, max(1, min(20, int(variables["collection"].get())))),
+                }
             pixiv_max_works = max(1, min(int(self.pixiv_max_works_var.get()), 100))
             pixiv_filter_ai = bool(self.pixiv_filter_ai_var.get())
             pixiv_visibility = PIXIV_VISIBILITY_LABELS.get(str(self.pixiv_visibility_var.get() or ""), "")
@@ -659,7 +695,7 @@ class SettingsTabMixin:
         except (TypeError, ValueError, tk.TclError):
             messagebox.showwarning(
                 "设置无效",
-                "请检查重试、候选数、等待时间、网页超时、文件数、Pixiv 作品上限、输出格式和公共压缩方式",
+                "请检查重试、候选数、等待时间、网页超时、文件数、平台并发数、Pixiv 作品上限、输出格式和公共压缩方式",
             )
             return
         for label, value in (("开始日期", pixiv_start_date), ("结束日期", pixiv_end_date)):
@@ -731,6 +767,9 @@ class SettingsTabMixin:
         self.google_wait_var.set(manual_wait)
         self.google_max_files_var.set(max_files)
         self.webpage_timeout_var.set(webpage_timeout)
+        for module_id, limits in task_concurrency_values.items():
+            for key, value in limits.items():
+                self.platform_concurrency_vars[module_id][key].set(value)
         self.pixiv_max_works_var.set(pixiv_max_works)
         self.pixiv_filter_ai_var.set(pixiv_filter_ai)
         self.pixiv_visibility_var.set(
@@ -764,6 +803,10 @@ class SettingsTabMixin:
         self.storage.set_setting("google_manual_wait", manual_wait)
         self.storage.set_setting("webpage_max_files", max_files)
         self.storage.set_setting("webpage_read_timeout", webpage_timeout)
+        for module_id, limits in task_concurrency_values.items():
+            self.storage.set_setting(f"task_concurrency_{module_id}", limits["total"])
+            self.storage.set_setting(f"task_concurrency_single_{module_id}", limits["single"])
+            self.storage.set_setting(f"task_concurrency_collection_{module_id}", limits["collection"])
         self.storage.set_setting("pixiv_max_works", pixiv_max_works)
         self.storage.set_setting("pixiv_filter_ai", pixiv_filter_ai)
         self.storage.set_setting("pixiv_visibility", pixiv_visibility)

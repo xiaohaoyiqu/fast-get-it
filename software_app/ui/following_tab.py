@@ -13,7 +13,10 @@ from software_app.core.bluesky_account import BlueskyAccountManager
 from software_app.core.candidate_lists import export_candidate_list, import_candidate_list
 from software_app.crawlers.pixiv import parse_pixiv_target
 from software_app.crawlers.pixiv.catalog import filter_bookmark_candidates
-from software_app.ui.desktop_support import bounded_int as _bounded_int
+from software_app.ui.desktop_support import (
+    bounded_int as _bounded_int,
+    select_treeview_row_at_event,
+)
 from software_app.ui.platform_config import PLATFORM_CONTENT_SCOPES, TASK_STATUS_LABELS
 from software_app.ui.scrolling import bind_canvas_mousewheel
 
@@ -69,6 +72,16 @@ class FollowingTabMixin:
             button_row, text="加入队列", command=self._download_selected_platform_candidate
         )
         self.candidate_download_button.grid(row=1, column=2, pady=(7, 0))
+        self.candidate_fill_batch_button = ttk.Button(
+            button_row, text="批量填入工作台", command=self._fill_selected_candidates
+        )
+        self.candidate_fill_batch_button.grid(row=7, column=0, padx=(0, 6), pady=(7, 0), sticky="w")
+        self.candidate_batch_info_button = ttk.Button(
+            button_row, text="批量获取资料", command=self._fetch_selected_candidate_info
+        )
+        self.candidate_batch_info_button.grid(row=7, column=1, padx=(0, 6), pady=(7, 0), sticky="w")
+        self.candidate_fill_batch_button.state(["disabled"])
+        self.candidate_batch_info_button.state(["disabled"])
         self.candidate_block_author_button = ttk.Button(button_row, text="屏蔽选中作者", command=self._block_selected_candidate_authors)
         self.candidate_block_author_button.grid(row=1, column=3, padx=(6, 0), pady=(7, 0))
         self.candidate_block_work_button = ttk.Button(button_row, text="屏蔽选中作品", command=self._block_selected_candidate_works)
@@ -204,7 +217,7 @@ class FollowingTabMixin:
         self.following_tree.column("bio", width=520)
         following_tree_frame.grid(row=1, column=0, sticky="nsew")
         self.following_tree.bind("<<TreeviewSelect>>", self._candidate_selection_changed)
-        self.following_tree.bind("<Double-Button-1>", lambda _event: self._use_selected_platform_candidate())
+        self.following_tree.bind("<Double-Button-1>", self._use_double_clicked_platform_candidate)
 
     def _build_twitter_history_tab(self) -> None:
         self.twitter_history_tab.columnconfigure(0, weight=1)
@@ -219,6 +232,9 @@ class FollowingTabMixin:
         self.history_preview_button.grid(row=0, column=2, padx=(0, 6))
         self.history_clear_selected_button = ttk.Button(button_row, text="清理选中", command=self._clear_selected_platform_history)
         self.history_clear_selected_button.grid(row=0, column=3, padx=(0, 6))
+        self.history_fill_batch_button = ttk.Button(button_row, text="批量填入工作台", command=self._fill_selected_histories)
+        self.history_fill_batch_button.grid(row=0, column=5, padx=(6, 0))
+        self.history_fill_batch_button.state(["disabled"])
         self.clear_history_var = tk.StringVar(value="清理本平台全部")
         self.history_clear_all_button = ttk.Button(
             button_row, textvariable=self.clear_history_var, command=self._clear_platform_history
@@ -245,7 +261,7 @@ class FollowingTabMixin:
         self.twitter_history_tree.column("source", width=220)
         history_tree_frame.grid(row=1, column=0, sticky="nsew")
         self.twitter_history_tree.bind("<<TreeviewSelect>>", self._history_selection_changed)
-        self.twitter_history_tree.bind("<Double-Button-1>", lambda _event: self._use_selected_platform_history())
+        self.twitter_history_tree.bind("<Double-Button-1>", self._use_double_clicked_platform_history)
 
     def _refresh_platform_tabs(self) -> None:
         if not hasattr(self, "following_tree"):
@@ -1098,6 +1114,9 @@ class FollowingTabMixin:
         single = len(rows) == 1
         for button in (self.candidate_use_button, self.candidate_preview_button):
             button.state(["!disabled"] if single else ["disabled"])
+        batch_targets = self._candidate_workbench_targets(rows)
+        for button in (self.candidate_fill_batch_button, self.candidate_batch_info_button):
+            button.state(["!disabled"] if batch_targets else ["disabled"])
         adapter = self._selected_adapter()
         can_download = (
             enabled and all(bool(item.get("downloadable", True)) for item in rows)
@@ -1139,7 +1158,7 @@ class FollowingTabMixin:
                 f"已选：{name or target}  →  {target}" + (f"；只读：{read_only}" if read_only else "")
             )
         else:
-            self.candidate_selection_var.set(f"已预选 {len(rows)} 项；点击“加入下载队列”后按平台并发上限执行")
+            self.candidate_selection_var.set(f"已选 {len(rows)} 项；可批量获取资料、填入工作台或加入队列")
 
     def _candidate_author_key(self, row: dict):
         module_id = str(row.get("module_id") or self.module_var.get())
@@ -1147,6 +1166,49 @@ class FollowingTabMixin:
         if module_id == "pixiv" and author_id:
             return "pixiv", author_id
         return account_from_target(module_id, str(row.get("target") or ""), str(row.get("input_kind") or ""))
+
+    def _candidate_workbench_targets(self, rows: list[dict]) -> tuple[str, list[str]] | None:
+        if not rows:
+            return None
+        module_ids = set()
+        targets = []
+        for row in rows:
+            module_id = str(row.get("module_id") or self.module_var.get())
+            target = str(row.get("target") or "").strip()
+            if module_id == "google_image" and target.startswith(("http://", "https://")):
+                module_id = "website"
+            if not target:
+                continue
+            module_ids.add(module_id)
+            targets.append(target)
+        if len(module_ids) != 1 or not targets:
+            return None
+        return next(iter(module_ids)), list(dict.fromkeys(targets))
+
+    def _fill_targets_into_workbench(self, module_id: str, targets: list[str]) -> None:
+        if module_id != self.module_var.get():
+            self._select_module(module_id)
+        display_value = " / ".join(targets)
+        self.target_var.set(display_value)
+        self._prefilled_task_targets = (module_id, display_value, list(targets))
+        self.target_entry.focus_set()
+        self.target_entry.selection_range(0, tk.END)
+        self.status_var.set(f"已将 {len(targets)} 个目标填入工作台；可批量获取资料或加入下载队列")
+
+    def _fill_selected_candidates(self) -> None:
+        selected = self._candidate_workbench_targets(self._selected_platform_candidates())
+        if not selected:
+            messagebox.showwarning("无法批量填入", "请选中同一平台的有效目标")
+            return
+        self._fill_targets_into_workbench(*selected)
+
+    def _fetch_selected_candidate_info(self) -> None:
+        selected = self._candidate_workbench_targets(self._selected_platform_candidates())
+        if not selected:
+            messagebox.showwarning("无法批量获取资料", "请选中同一平台的有效目标")
+            return
+        self._fill_targets_into_workbench(*selected)
+        self._batch_fetch_target_info()
 
     def _block_selected_candidate_authors(self) -> None:
         keys = list(dict.fromkeys(key for row in self._selected_platform_candidates() if (key := self._candidate_author_key(row))))
@@ -1187,6 +1249,11 @@ class FollowingTabMixin:
         self.target_entry.selection_range(0, tk.END)
         self.status_var.set(f"已填入目标：{target}")
 
+    def _use_double_clicked_platform_candidate(self, event) -> str:
+        if select_treeview_row_at_event(self.following_tree, event):
+            self._use_selected_platform_candidate()
+        return "break"
+
     def _preview_selected_platform_candidate(self) -> None:
         row = self._selected_platform_candidate()
         if not row:
@@ -1221,6 +1288,7 @@ class FollowingTabMixin:
             return
         callbacks = self._task_callbacks()
         created = 0
+        created_task_ids: list[str] = []
         failures: list[str] = []
         module_ids: set[str] = set()
         for row in rows:
@@ -1252,6 +1320,7 @@ class FollowingTabMixin:
                 failures.append(f"{target}: {exc}")
                 continue
             created += 1
+            created_task_ids.append(task.task_id)
             module_ids.add(module_id)
             self.current_task_id = task.task_id
             self.current_task_ids.add(task.task_id)
@@ -1260,7 +1329,7 @@ class FollowingTabMixin:
             messagebox.showerror("加入失败", failures[0] if failures else "没有候选成功加入下载队列")
             return
         concurrency = ", ".join(
-            f"{self.manager.get_adapter(module_id).display_name} {self.manager.get_adapter(module_id).max_concurrency} 路"
+            f"{self.manager.get_adapter(module_id).display_name} {self.manager.get_concurrency_limits(module_id)[0]} 路"
             for module_id in sorted(module_ids)
         )
         self.status_var.set(f"已加入 {created} 个下载任务；并发上限：{concurrency}")
@@ -1268,6 +1337,7 @@ class FollowingTabMixin:
             self._append_log(f"另有 {len(failures)} 个候选加入失败：{failures[0]}")
         self.notebook.select(self.tasks_tab)
         self._refresh_tasks()
+        self._follow_task_batch(created_task_ids)
 
     def _load_platform_history(self) -> None:
         if self.module_var.get() == "twitter":
@@ -1282,14 +1352,20 @@ class FollowingTabMixin:
 
     def _selected_platform_histories(self) -> list[dict]:
         rows: list[dict] = []
+        history_rows = self.twitter_history_rows if self.module_var.get() == "twitter" else self.platform_history_rows
         for item_id in self.twitter_history_tree.selection():
             try:
                 index = int(item_id)
             except ValueError:
                 continue
-            if index < len(self.platform_history_rows):
-                rows.append(self.platform_history_rows[index])
+            if index < len(history_rows):
+                rows.append(history_rows[index])
         return rows
+
+    def _use_double_clicked_platform_history(self, event) -> str:
+        if select_treeview_row_at_event(self.twitter_history_tree, event):
+            self._use_selected_platform_history()
+        return "break"
 
     def _history_selection_changed(self, _event=None) -> None:
         rows = self._selected_platform_histories()
@@ -1297,6 +1373,7 @@ class FollowingTabMixin:
         self.history_use_button.state(["!disabled"] if single else ["disabled"])
         self.history_preview_button.state(["!disabled"] if single else ["disabled"])
         self.history_clear_selected_button.state(["!disabled"] if rows else ["disabled"])
+        self.history_fill_batch_button.state(["!disabled"] if self._history_workbench_targets(rows) else ["disabled"])
         if not rows:
             self.history_selection_var.set("尚未选择历史记录；可用 Ctrl/Shift 多选")
         elif single:
@@ -1316,6 +1393,28 @@ class FollowingTabMixin:
             return
         self.target_var.set(target)
         self._preview_target()
+
+    def _history_workbench_targets(self, rows: list[dict]) -> tuple[str, list[str]] | None:
+        if not rows:
+            return None
+        module_id = self.module_var.get()
+        if module_id != "twitter":
+            scopes = {str(row.get("handle") or "").strip() for row in rows if str(row.get("handle") or "").strip()}
+            if len(scopes) > 1:
+                return None
+        targets = [self._history_row_target(row) for row in rows]
+        targets = list(dict.fromkeys(target.strip() for target in targets if target and target.strip()))
+        return (module_id, targets) if targets else None
+
+    def _fill_selected_histories(self) -> None:
+        rows = self._selected_platform_histories()
+        selected = self._history_workbench_targets(rows)
+        if not selected:
+            messagebox.showwarning("无法批量填入", "请选中一条或多条有效历史记录；非 Twitter 历史需属于同一内容种类")
+            return
+        if self.module_var.get() != "twitter" and rows:
+            self._apply_history_scope(rows[0])
+        self._fill_targets_into_workbench(*selected)
 
     def _preview_selected_platform_history(self) -> None:
         row = self._selected_platform_history()

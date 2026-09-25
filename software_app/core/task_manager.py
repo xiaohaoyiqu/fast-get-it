@@ -30,13 +30,28 @@ class TaskManager:
         self.blocklist = BlocklistStore(storage.db_path.with_name("blocklist.json"))
         self.adapters: dict[str, CrawlerAdapter] = {}
         self.running: dict[str, RunningTask] = {}
-        self._module_slots: dict[str, threading.BoundedSemaphore] = {}
+        self._slot_condition = threading.Condition()
+        self._active_by_module: dict[str, int] = {}
+        self._active_by_group: dict[tuple[str, str], int] = {}
         self._lock = threading.Lock()
 
     def register_adapter(self, adapter: CrawlerAdapter) -> None:
         self.adapters[adapter.module_id] = adapter
-        self._module_slots[adapter.module_id] = threading.BoundedSemaphore(max(1, int(adapter.max_concurrency)))
         self.storage.register_module(adapter.info)
+
+    def get_concurrency_limits(self, module_id: str) -> tuple[int, int, int]:
+        adapter = self.get_adapter(module_id)
+        total_default = max(1, int(adapter.max_concurrency))
+        total = self._setting_limit(f"task_concurrency_{module_id}", total_default)
+        single = self._setting_limit(f"task_concurrency_single_{module_id}", total)
+        collection = self._setting_limit(f"task_concurrency_collection_{module_id}", 1)
+        return total, single, collection
+
+    def _setting_limit(self, key: str, default: int) -> int:
+        try:
+            return max(1, min(20, int(self.storage.get_setting(key, default))))
+        except (TypeError, ValueError):
+            return max(1, min(20, int(default)))
 
     def list_adapters(self) -> list[CrawlerAdapter]:
         return list(self.adapters.values())
@@ -65,6 +80,11 @@ class TaskManager:
     ) -> DownloadTask:
         adapter = self.get_adapter(module_id)
         task_options = dict(options or {})
+        total_limit, single_limit, collection_limit = self.get_concurrency_limits(module_id)
+        task_options["_task_concurrency_total"] = total_limit
+        task_options["_task_concurrency_single"] = single_limit
+        task_options["_task_concurrency_collection"] = collection_limit
+        task_options["_task_concurrency_group"] = self._concurrency_group(module_id, target, task_options)
         author_id = str(task_options.get("author_id") or "")
         inspected_work_id = str(task_options.get("pixiv_work_id") or "")
         if module_id in {"google_image", "website"} and inspected_work_id:
@@ -96,6 +116,31 @@ class TaskManager:
             self.running[task.task_id] = RunningTask(task, thread, cancel_event, adapter)
         thread.start()
         return task
+
+    @staticmethod
+    def _concurrency_group(module_id: str, target: str, options: dict[str, Any]) -> str:
+        kind = str(options.get("input_kind") or "").strip().casefold()
+        scope = str(options.get("content_scope") or options.get("search_mode") or "").strip().casefold()
+        value = str(target or "").strip().casefold()
+        if module_id == "pixiv":
+            if kind in {"work", "novel"}:
+                return "single"
+            if (kind == "fanbox" and "/posts/" in value) or (kind == "sketch" and "/artworks/" in value):
+                return "single"
+            return "collection"
+        if module_id == "jmcomic":
+            return "single" if kind in {"album", "photo"} or scope in {"漫画 id / 链接", "章节 id / 链接"} else "collection"
+        if module_id == "twitter":
+            return "single" if "/status/" in value else "collection"
+        if module_id == "bluesky":
+            return "single" if "/post/" in value else "collection"
+        if module_id == "instagram":
+            return "single" if any(route in value for route in ("/p/", "/reel/", "/tv/")) else "collection"
+        if module_id == "ehentai":
+            return "single" if scope == "画廊链接 / id" or "/g/" in value else "collection"
+        if module_id in {"google_image", "website"}:
+            return "single"
+        return "single"
 
     def retry_task(
         self,
@@ -203,17 +248,14 @@ class TaskManager:
         normalized_target = ""
         emitted_records: list[FileRecord] = []
         wrapped_callbacks = self._wrap_callbacks(callbacks, emitted_records)
-        slot = self._module_slots[task.module_id]
         acquired = False
+        scan_started_at: float | None = None
 
         try:
             wrapped_callbacks.on_progress(
                 ProgressEvent(task.task_id, task.module_id, "info", "任务已排队，等待平台并发槽位", status="queued")
             )
-            while not acquired:
-                if cancel_event.is_set():
-                    raise TaskCancelled("任务在排队期间已取消")
-                acquired = slot.acquire(timeout=0.2)
+            acquired = self._acquire_slot(task, cancel_event)
             preview = adapter.preview_target(task.target, task.options)
             normalized_target = preview.normalized_target
             self.storage.update_task_status(task.task_id, "running", normalized_target=normalized_target)
@@ -356,8 +398,58 @@ class TaskManager:
                 )
             )
         finally:
+            if status != "completed" and scan_started_at is not None:
+                try:
+                    partial_records = self.storage.scan_media_files(
+                        task.output_dir,
+                        task.module_id,
+                        task.task_id,
+                        modified_after=scan_started_at,
+                    )
+                    known_paths = {str(record.path).casefold() for record in emitted_records}
+                    newly_indexed = []
+                    for record in partial_records:
+                        path_key = str(record.path).casefold()
+                        if path_key in known_paths:
+                            continue
+                        known_paths.add(path_key)
+                        emitted_records.append(record)
+                        newly_indexed.append(record)
+                        try:
+                            callbacks.on_file(record)
+                        except Exception as exc:  # noqa: BLE001
+                            self.storage.add_log(
+                                task.task_id, task.module_id, "warning",
+                                f"部分文件已入库，但界面文件通知失败: {exc}",
+                            )
+                    if newly_indexed:
+                        partial_message = (
+                            f"任务未完整完成；已保留并登记本次下载的 {len(newly_indexed)} 个文件。"
+                        )
+                        error = f"{error}\n{partial_message}".strip()
+                        try:
+                            wrapped_callbacks.on_progress(
+                                ProgressEvent(
+                                    task.task_id,
+                                    task.module_id,
+                                    "warning",
+                                    partial_message,
+                                    status=status,
+                                    metadata={"partial_files": len(newly_indexed)},
+                                )
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            self.storage.add_log(
+                                task.task_id, task.module_id, "warning",
+                                f"部分下载状态通知失败: {exc}",
+                            )
+                except Exception as exc:  # noqa: BLE001
+                    self.storage.add_log(
+                        task.task_id, task.module_id, "warning",
+                        f"任务结束后扫描部分下载文件失败: {exc}",
+                    )
             if acquired:
-                slot.release()
+                self._release_slot(task)
             self.storage.update_task_status(task.task_id, status, error, normalized_target)
             with self._lock:
                 self.running.pop(task.task_id, None)
@@ -367,6 +459,53 @@ class TaskManager:
                 # A UI callback must never keep a finished worker registered as
                 # active or prevent its final database state from being saved.
                 self.storage.add_log(task.task_id, task.module_id, "warning", f"任务结束回调失败: {exc}")
+
+    def _acquire_slot(self, task: DownloadTask, cancel_event: threading.Event) -> bool:
+        module_id = task.module_id
+        group = str(task.options.get("_task_concurrency_group") or "single")
+        total_limit = max(1, min(20, int(task.options.get("_task_concurrency_total") or 1)))
+        group_limit = max(
+            1,
+            min(
+                total_limit,
+                int(
+                    task.options.get(
+                        f"_task_concurrency_{group}",
+                        total_limit,
+                    )
+                    or 1
+                ),
+            ),
+        )
+        group_key = (module_id, group)
+        while True:
+            if cancel_event.is_set():
+                raise TaskCancelled("任务在排队期间已取消")
+            with self._slot_condition:
+                module_active = self._active_by_module.get(module_id, 0)
+                group_active = self._active_by_group.get(group_key, 0)
+                if module_active < total_limit and group_active < group_limit:
+                    self._active_by_module[module_id] = module_active + 1
+                    self._active_by_group[group_key] = group_active + 1
+                    return True
+                self._slot_condition.wait(timeout=0.2)
+
+    def _release_slot(self, task: DownloadTask) -> None:
+        module_id = task.module_id
+        group = str(task.options.get("_task_concurrency_group") or "single")
+        group_key = (module_id, group)
+        with self._slot_condition:
+            module_active = self._active_by_module.get(module_id, 0) - 1
+            group_active = self._active_by_group.get(group_key, 0) - 1
+            if module_active > 0:
+                self._active_by_module[module_id] = module_active
+            else:
+                self._active_by_module.pop(module_id, None)
+            if group_active > 0:
+                self._active_by_group[group_key] = group_active
+            else:
+                self._active_by_group.pop(group_key, None)
+            self._slot_condition.notify_all()
 
     def _wrap_callbacks(self, callbacks: CallbackSet, emitted_records: list[FileRecord]) -> CallbackSet:
         def on_progress(event: ProgressEvent) -> None:

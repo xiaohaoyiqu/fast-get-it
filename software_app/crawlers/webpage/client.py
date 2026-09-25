@@ -4,6 +4,7 @@ import ipaddress
 import mimetypes
 import os
 import re
+import socket
 import threading
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -47,6 +48,8 @@ CONTENT_TYPE_EXTENSIONS = {
     "audio/wav": ".wav",
 }
 MAX_HTML_BYTES = 5 * 1024 * 1024
+MAX_HTTP_REDIRECTS = 5
+HTTP_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,73 @@ def normalize_page_url(raw_url: str) -> str:
     if address and not address.is_global:
         raise ValueError("不允许爬取内网或保留地址")
     return urlunparse(parsed._replace(fragment=""))
+
+
+def _validate_public_destination(raw_url: str) -> str:
+    """Reject destinations that resolve to loopback, private, or reserved IPs."""
+    url = normalize_page_url(raw_url)
+    parsed = urlparse(url)
+    host = str(parsed.hostname or "")
+    try:
+        addresses = {ipaddress.ip_address(host)}
+    except ValueError:
+        try:
+            addresses = {
+                ipaddress.ip_address(result[4][0].split("%", 1)[0])
+                for result in socket.getaddrinfo(host, parsed.port, type=socket.SOCK_STREAM)
+            }
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"无法安全解析网页地址：{host}") from exc
+    if not addresses or any(not address.is_global for address in addresses):
+        raise ValueError("不允许访问解析到内网或保留地址的网页")
+    return url
+
+
+def _request_public_url(
+    session: requests.Session,
+    raw_url: str,
+    *,
+    timeout: tuple[int, int],
+    headers: dict[str, str] | None = None,
+) -> requests.Response:
+    """Fetch a public URL while validating every redirect before following it."""
+    current_url = _validate_public_destination(raw_url)
+    request_headers = dict(headers or {})
+    original = urlparse(current_url)
+    original_origin = (original.scheme, str(original.hostname or "").casefold(), original.port)
+    for redirect_count in range(MAX_HTTP_REDIRECTS + 1):
+        response = session.get(
+            current_url,
+            stream=True,
+            timeout=timeout,
+            allow_redirects=False,
+            headers=request_headers,
+        )
+        if response.status_code not in HTTP_REDIRECT_STATUSES:
+            return response
+        location = str(response.headers.get("Location") or "").strip()
+        response.close()
+        if not location:
+            raise requests.HTTPError(f"网页重定向缺少目标地址：HTTP {response.status_code}")
+        if redirect_count >= MAX_HTTP_REDIRECTS:
+            raise requests.TooManyRedirects(f"网页重定向超过 {MAX_HTTP_REDIRECTS} 次")
+        next_url = _validate_public_destination(urljoin(current_url, location))
+        next_parts = urlparse(next_url)
+        next_origin = (next_parts.scheme, str(next_parts.hostname or "").casefold(), next_parts.port)
+        if next_origin != original_origin:
+            sensitive_headers = {"authorization", "proxy-authorization", "cookie"}
+            if session.auth or any(
+                str(key).casefold() in sensitive_headers for key in session.headers
+            ) or any(
+                str(key).casefold() in sensitive_headers for key in request_headers
+            ):
+                raise ValueError("携带账号凭据的网页不允许跳转到其他主机")
+            request_headers = {
+                key: value for key, value in request_headers.items()
+                if str(key).casefold() not in sensitive_headers | {"referer"}
+            }
+        current_url = next_url
+    raise requests.TooManyRedirects(f"网页重定向超过 {MAX_HTTP_REDIRECTS} 次")
 
 
 def _media_url(raw_url: str, base_url: str) -> str:
@@ -346,7 +416,9 @@ class WebPageCrawler:
         options = options or {}
         connect_timeout = max(10, min(int(options.get("page_connect_timeout") or 20), 120))
         read_timeout = max(30, min(int(options.get("page_read_timeout") or 60), 600))
-        with session.get(url, stream=True, timeout=(connect_timeout, read_timeout), allow_redirects=True) as response:
+        with _request_public_url(
+            session, url, timeout=(connect_timeout, read_timeout)
+        ) as response:
             response.raise_for_status()
             final_url = normalize_page_url(response.url)
             content_type = response.headers.get("Content-Type", "").lower()
@@ -382,11 +454,10 @@ class WebPageCrawler:
         options = options or {}
         connect_timeout = max(10, min(int(options.get("media_connect_timeout") or 20), 120))
         read_timeout = max(30, min(int(options.get("media_read_timeout") or 120), 1200))
-        with session.get(
+        with _request_public_url(
+            session,
             candidate.url,
-            stream=True,
             timeout=(connect_timeout, read_timeout),
-            allow_redirects=True,
             headers=headers,
         ) as response:
             response.raise_for_status()

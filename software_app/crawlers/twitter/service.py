@@ -8,7 +8,7 @@ from typing import Any
 from software_app.core.adapter import TaskCancelled
 from software_app.core.blocklist import BlocklistStore
 from software_app.core.events import CallbackSet
-from software_app.core.models import DownloadTask, ProgressEvent
+from software_app.core.models import DownloadTask, FileRecord, ProgressEvent, classify_file
 
 from .download_method import DownloadFailureRecord, DownloadRecord, configure_downloads
 from .manga_downloader import download_status_from_syndication
@@ -75,6 +75,34 @@ class TwitterCrawlerService:
             ProgressEvent(task.task_id, task.module_id, "info", f"启动软件内置 Twitter 爬虫 {CRAWLER_VERSION}")
         )
 
+        def report_media_result(media_type: str, result: str, file_path=None, reason: str = "") -> None:
+            media_label = {"image": "图片", "video": "视频", "gif": "GIF", "audio": "音频"}.get(media_type, media_type)
+            path = Path(file_path) if file_path else None
+            if result in {"completed", "skipped"} and path is not None and path.is_file():
+                try:
+                    callbacks.on_file(
+                        FileRecord(
+                            path=path.resolve(), module_id=task.module_id, task_id=task.task_id,
+                            media_type=classify_file(path), size=path.stat().st_size,
+                            title=path.name, metadata={"source": "twitter_media"},
+                        )
+                    )
+                except OSError:
+                    pass
+            state_label = {"completed": "完成", "skipped": "跳过", "failed": "失败"}.get(result, result)
+            detail = f"：{path.name}" if path is not None else ""
+            if reason:
+                detail += f"（{reason}）"
+            level = "error" if result == "failed" else "warning" if result == "skipped" else "info"
+            callbacks.on_progress(
+                ProgressEvent(
+                    task.task_id, task.module_id, level,
+                    f"{media_label}{state_label}{detail}",
+                    status="running",
+                    metadata={"phase": "media", "result": result, "media_type": media_type},
+                )
+            )
+
         status_match = re.search(r"/status/(\d+)(?:/|$)", target_url)
         if status_match:
             callbacks.on_progress(
@@ -88,6 +116,7 @@ class TwitterCrawlerService:
                 DownloadFailureRecord(failed_path),
                 config,
                 cancel_event,
+                report_media_result,
             )
             if syndication_stats is not None:
                 success = sum(int(syndication_stats.get(f"success_{kind}") or 0) for kind in ("image", "video", "gif", "audio"))
@@ -144,6 +173,10 @@ class TwitterCrawlerService:
                 DownloadRecord(record_path),
                 DownloadFailureRecord(failed_path),
                 cancel_event=cancel_event,
+                on_status=lambda message: callbacks.on_progress(
+                    ProgressEvent(task.task_id, task.module_id, "warning", message, status="running")
+                ),
+                on_media_result=report_media_result,
             )
             if cancel_event.is_set():
                 raise TaskCancelled("任务已取消")

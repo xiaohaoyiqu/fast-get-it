@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import io
 import queue
+import re
 import threading
 import time
 import tkinter as tk
@@ -24,7 +25,7 @@ from software_app.core.blocklist_sources import (
     read_x_archive,
 )
 from software_app.core.events import CallbackSet
-from software_app.core.models import FileRecord, ProgressEvent
+from software_app.core.models import FileRecord, ProgressEvent, TargetPreview
 from software_app.core.settings import DEFAULT_OUTPUT_DIR
 from software_app.crawlers.common import normalize_output_format
 from software_app.ui.desktop_support import (
@@ -76,6 +77,62 @@ DEFAULT_TYPES_VALUE = "1,2,3,4"
 def _format_label(labels: dict[str, str], value: object, key: str) -> str:
     normalized = normalize_output_format(key, value)
     return next((label for label, stored in labels.items() if stored == normalized), next(iter(labels)))
+
+
+def split_task_targets(
+    value: str,
+    *,
+    split_slashes: bool = True,
+    module_id: str = "",
+) -> list[str]:
+    """Split target lists conservatively; slash is ambiguous in URLs and IDs."""
+    targets: list[str] = []
+    seen: set[str] = set()
+    chunks = re.split(r"[、\\\r\n]+", str(value or ""))
+    for chunk in chunks:
+        chunk = chunk.strip().strip("\"'")
+        if not chunk:
+            continue
+        if re.search(r"https?://", chunk, re.IGNORECASE):
+            pieces = re.split(r"/+(?=https?://)", chunk, flags=re.IGNORECASE)
+        elif re.match(r"(?i)^(?:www\.)?[a-z0-9.-]+\.[a-z]{2,}(?:/|$)", chunk):
+            pieces = [chunk]
+        elif module_id == "ehentai" and split_slashes:
+            parts = chunk.split("/")
+            is_gallery_id = len(parts) >= 2 and len(parts) % 2 == 0 and all(
+                parts[index].isdigit() and re.fullmatch(r"[0-9a-fA-F]{10}", parts[index + 1])
+                for index in range(0, len(parts), 2)
+            )
+            pieces = ["/".join(parts[index:index + 2]) for index in range(0, len(parts), 2)] if is_gallery_id else [chunk]
+        elif split_slashes:
+            pieces = chunk.split("/")
+        else:
+            pieces = [chunk]
+        for piece in pieces:
+            target = piece.strip().strip("\"'")
+            if target and target.casefold() not in seen:
+                seen.add(target.casefold())
+                targets.append(target)
+    return targets
+
+
+def slash_separates_targets(module_id: str, scope: str) -> bool:
+    """Only split slashes for scopes that accept concrete targets, never free-text queries."""
+    normalized_scope = str(scope or "").strip()
+    target_scopes = {
+        "twitter": {"关注账号", "用户 / @用户名", "帖子 / 媒体 URL"},
+        "pixiv": {
+            "作品 ID", "作者 ID", "关注画师", "漫画系列", "小说 ID", "作者小说",
+            "小说系列", "FANBOX", "Sketch",
+        },
+        "jmcomic": {"漫画 ID / 链接", "章节 ID / 链接"},
+        "bluesky": {"关注账号", "帖子 / 媒体"},
+        "instagram": {"账号 / 用户名", "帖子 / 链接", "Reels / 链接"},
+        "ehentai": {"画廊链接 / ID"},
+        "google_image": {"候选页面"},
+        "website": {"网页"},
+    }
+    return normalized_scope in target_scopes.get(module_id, set())
 
 
 class SoftwareDesktop(
@@ -153,6 +210,8 @@ class SoftwareDesktop(
         self.current_candidate_rows: list[dict] = []
         self.platform_history_rows: list[dict] = []
         self.target_browser_rows = []
+        self.batch_info_request_id = 0
+        self.batch_info_cancel_event: threading.Event | None = None
         self.google_result_rows: list[dict] = []
         self.google_image_paths: list[Path] = []
         self.google_search_cancel_event: threading.Event | None = None
@@ -192,10 +251,37 @@ class SoftwareDesktop(
         self.module_labels = {}
         self.module_label_var = tk.StringVar()
         self.target_var = tk.StringVar()
+        self._prefilled_task_targets: tuple[str, str, list[str]] | None = None
         self.output_dir_var = tk.StringVar(value=str(saved_output_dir or DEFAULT_OUTPUT_DIR))
         self.proxy_var = tk.StringVar(value=str(saved_proxy_url or ""))
         self.retries_var = tk.IntVar(value=saved_retries)
         self.types_var = tk.StringVar(value=DEFAULT_TYPES_VALUE)
+        self.platform_concurrency_vars: dict[str, dict[str, tk.IntVar]] = {}
+        for adapter in self.adapters:
+            module_id = adapter.module_id
+            total = _bounded_int(
+                self.storage.get_setting(f"task_concurrency_{module_id}", adapter.max_concurrency),
+                adapter.max_concurrency,
+                1,
+                20,
+            )
+            single = _bounded_int(
+                self.storage.get_setting(f"task_concurrency_single_{module_id}", total),
+                total,
+                1,
+                20,
+            )
+            collection = _bounded_int(
+                self.storage.get_setting(f"task_concurrency_collection_{module_id}", 1),
+                1,
+                1,
+                20,
+            )
+            self.platform_concurrency_vars[module_id] = {
+                "total": tk.IntVar(value=total),
+                "single": tk.IntVar(value=single),
+                "collection": tk.IntVar(value=collection),
+            }
         self.google_image_var = tk.StringVar()
         self.google_limit_var = tk.IntVar(value=saved_google_limit)
         self.google_max_files_var = tk.IntVar(value=saved_google_max_files)
@@ -286,6 +372,7 @@ class SoftwareDesktop(
         self.profile_handle_var = tk.StringVar(value="")
         self.profile_bio_var = tk.StringVar(value="")
         self.profile_url_var = tk.StringVar(value="")
+        self.profile_target_hint_var = tk.StringVar(value="资料区一次显示一个目标")
         self.profile_links: list[dict] = []
         self.profile_block_key: AccountKey | None = None
         self.profile_link_var = tk.StringVar(value="未获取到主页外链")
@@ -309,6 +396,7 @@ class SoftwareDesktop(
         self.following_cancel_event: threading.Event | None = None
         self._build_styles()
         self._build_layout()
+        self.target_var.trace_add("write", self._refresh_profile_target_hint)
         self._refresh_jm_auth_status()
         self.protocol("WM_DELETE_WINDOW", self._request_close)
         self.bind("<Configure>", self._handle_window_resize, add="+")
@@ -332,6 +420,8 @@ class SoftwareDesktop(
             self.preview_text.widget.grid()
 
     def destroy(self) -> None:
+        if self.batch_info_cancel_event is not None:
+            self.batch_info_cancel_event.set()
         if self.cookie_capture_cancel_event is not None:
             self.cookie_capture_cancel_event.set()
         if self.following_cancel_event is not None:
@@ -534,8 +624,14 @@ class SoftwareDesktop(
             wraplength=240,
         )
         self.profile_url_label.grid(row=3, column=1, sticky="w", pady=(4, 0))
+        ttk.Label(
+            target_card,
+            textvariable=self.profile_target_hint_var,
+            style="Small.TLabel",
+            wraplength=240,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
         link_panel = ttk.Frame(target_card, style="Panel.TFrame")
-        link_panel.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(7, 0))
+        link_panel.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(7, 0))
         link_panel.columnconfigure(0, weight=1)
         ttk.Label(link_panel, textvariable=self.profile_link_summary_var, style="Small.TLabel").grid(
             row=0, column=0, sticky="w"
@@ -564,7 +660,7 @@ class SoftwareDesktop(
         )
         target_card.bind("<Configure>", self._update_target_card_wrap)
         self.preview_text = TargetPreviewRenderer(target_card)
-        self.preview_text.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.preview_text.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.module_detail = self.preview_text
         self._write_text(self.preview_text, "选择历史目标，或在右侧输入目标 / URL 后点击预览。")
         bind_canvas_mousewheel(target_card_canvas, target_card)
@@ -622,9 +718,11 @@ class SoftwareDesktop(
         self.preview_button.grid(row=0, column=1, padx=(0, 6))
         self.online_button = ttk.Button(header_actions, text="在线获取资料", command=self._preview_online)
         self.online_button.grid(row=0, column=2, padx=(0, 6))
+        self.batch_info_button = ttk.Button(header_actions, text="批量获取资料", command=self._batch_fetch_target_info)
+        self.batch_info_button.grid(row=0, column=3, padx=(0, 6))
         self.browser_button = ttk.Button(header_actions, text="打开网页", command=self._open_target_in_browser)
-        self.browser_button.grid(row=0, column=3, padx=(0, 6))
-        ttk.Button(header_actions, text="取消", command=self._cancel_task).grid(row=0, column=4)
+        self.browser_button.grid(row=0, column=4, padx=(0, 6))
+        ttk.Button(header_actions, text="取消", command=self._cancel_task).grid(row=0, column=5)
 
         top = ttk.Frame(main, style="Panel.TFrame", padding=9)
         top.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -648,6 +746,11 @@ class SoftwareDesktop(
         ttk.Button(type_label_frame, text="说明", width=4, command=self._show_download_type_help).grid(row=0, column=1, padx=(5, 0))
         self.types_entry = ttk.Entry(top, textvariable=self.types_var, width=14)
         self.types_entry.grid(row=1, column=5, sticky="ew", pady=(10, 0))
+        ttk.Label(
+            top,
+            text="多目标用 /、反斜杠或顿号分隔；开始任务可批量下载，批量获取资料可逐项查看；URL 和搜索词内的 / 会保留。",
+            style="Small.TLabel",
+        ).grid(row=2, column=1, columnspan=5, sticky="w", pady=(3, 0))
         self.notebook = ttk.Notebook(main)
         self.notebook.grid(row=2, column=0, sticky="nsew")
         self.google_search_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=10)
@@ -777,6 +880,24 @@ class SoftwareDesktop(
                     for index, item in enumerate(rows, 1)
                 ),
             )
+            return
+        if row.get("_batch_result"):
+            index = int(row.get("_batch_index") or 1)
+            count = int(row.get("_batch_count") or 1)
+            target = str(row.get("target") or "").strip()
+            self.target_selection_var.set(
+                f"批量资料 · 第 {index}/{count} 项 · {row.get('name') or target}"
+            )
+            payload = row.get("_batch_payload")
+            preview = row.get("_batch_preview")
+            if isinstance(payload, dict):
+                self._write_profile_preview(payload)
+            elif preview is not None:
+                self._render_generic_preview(preview)
+            else:
+                self._write_target_browser_detail(row)
+            self.profile_target_hint_var.set(f"批量资料第 {index}/{count} 项；左侧资料卡一次显示一项")
+            self.status_var.set(f"正在显示第 {index}/{count} 项批量资料")
             return
         target = str(row.get("target") or "").strip()
         source = str(row.get("source") or "目标")
@@ -929,10 +1050,12 @@ class SoftwareDesktop(
             self.platform_search_mode_combo.configure(values=scopes)
         if hasattr(self, "content_scope_combo"):
             self.content_scope_combo.configure(values=scopes)
+        self._refresh_profile_target_hint()
 
     def _content_scope_changed(self, _event=None) -> None:
         module_id = self.module_var.get()
         self.platform_scope_selection[module_id] = self.content_scope_var.get()
+        self._refresh_profile_target_hint()
         if module_id == "pixiv":
             self.content_scope_help_var.set(
                 PIXIV_SCOPE_HINTS.get(self.content_scope_var.get(), PLATFORM_SCOPE_HINTS["pixiv"])
@@ -1386,6 +1509,9 @@ class SoftwareDesktop(
         bio = str(row.get("bio") or "").strip()
         if bio:
             lines.extend(["", bio])
+        detail = str(row.get("detail") or "").strip()
+        if detail and detail != bio:
+            lines.extend(["", detail])
         profile_url = str(row.get("profile_url") or "").strip()
         if profile_url:
             lines.extend(["", profile_url])
@@ -1450,9 +1576,8 @@ class SoftwareDesktop(
         )
 
     def _preview_target(self) -> None:
-        target = self.target_var.get().strip()
+        target = self._single_target_for_action("本地预览")
         if not target:
-            messagebox.showwarning("缺少目标", "请输入目标")
             return
         module_id = self.module_var.get()
         if module_id != "twitter":
@@ -1476,9 +1601,10 @@ class SoftwareDesktop(
                     payload["download_description"] = preview.description
                     payload["normalized_target"] = preview.normalized_target
                     payload["warnings"] = preview.warnings
+                    payload["_requested_target"] = target
                     self.ui_queue.put(("profile_preview_local_loaded", payload))
                 except Exception as exc:  # noqa: BLE001
-                    self.ui_queue.put(("profile_preview_local_error", str(exc)))
+                    self.ui_queue.put(("profile_preview_local_error", (target, str(exc))))
 
             threading.Thread(target=worker, name="twitter-local-preview", daemon=True).start()
             return
@@ -1594,6 +1720,50 @@ class SoftwareDesktop(
         else:
             self._write_text(self.preview_text, fallback)
 
+    def _current_input_targets(self) -> list[str]:
+        module_id = self.module_var.get()
+        prefilled = getattr(self, "_prefilled_task_targets", None)
+        current_value = self.target_var.get().strip()
+        if prefilled and prefilled[0] == module_id and prefilled[1] == current_value:
+            return list(prefilled[2])
+        return split_task_targets(
+            current_value,
+            split_slashes=slash_separates_targets(module_id, self.content_scope_var.get()),
+            module_id=module_id,
+        )
+
+    def _is_current_input_target(self, target: str, module_id: str = "") -> bool:
+        if module_id and module_id != self.module_var.get():
+            return False
+        targets = self._current_input_targets()
+        return bool(targets and targets[0].casefold() == str(target or "").strip().casefold())
+
+    def _refresh_profile_target_hint(self, *_args) -> None:
+        targets = self._current_input_targets()
+        if len(targets) > 1:
+            self.profile_target_hint_var.set(
+                f"当前输入 {len(targets)} 个目标；资料区一次显示一个，预览操作使用第 1 个"
+            )
+        elif targets:
+            self.profile_target_hint_var.set("资料区一次显示一个目标；多目标下载请点“开始任务”")
+        else:
+            self.profile_target_hint_var.set("资料区一次显示一个目标")
+
+    def _single_target_for_action(self, action: str) -> str:
+        targets = self._current_input_targets()
+        if not targets:
+            messagebox.showwarning("缺少目标", "请输入目标")
+            return ""
+        if len(targets) > 1:
+            selected = targets[0]
+            self.profile_target_hint_var.set(
+                f"资料区显示第 1/{len(targets)} 个目标：{selected}"
+            )
+            self.status_var.set(f"{action}只处理第 1/{len(targets)} 个目标；其余目标仍留在输入框中")
+            return selected
+        self.profile_target_hint_var.set(f"资料区显示：{targets[0]}")
+        return targets[0]
+
     @staticmethod
     def _decode_visible_text(value: object) -> str:
         text = str(value or "")
@@ -1608,9 +1778,8 @@ class SoftwareDesktop(
         if self.module_var.get() == "twitter":
             self._preview_twitter_page()
             return
-        target = self.target_var.get().strip()
+        target = self._single_target_for_action("在线获取资料")
         if not target:
-            messagebox.showwarning("缺少目标", "请输入目标")
             return
         module_id = self.module_var.get()
         self.status_var.set("正在获取在线预览")
@@ -1633,10 +1802,210 @@ class SoftwareDesktop(
         self.online_button.configure(text="资料获取中…")
         threading.Thread(target=worker, name=f"{module_id}-online-preview", daemon=True).start()
 
+    def _batch_fetch_target_info(self) -> None:
+        if self.batch_info_cancel_event is not None:
+            if not self.batch_info_cancel_event.is_set():
+                self._cancel_batch_info()
+            return
+        targets = self._current_input_targets()
+        if not targets:
+            messagebox.showwarning("缺少目标", "请输入一个或多个作者/作品目标")
+            return
+        if len(targets) > 50:
+            messagebox.showwarning("目标过多", f"一次最多获取 50 个目标资料；当前识别到 {len(targets)} 个")
+            return
+        module_id = self.module_var.get()
+        target_options = [(target, self._current_target_options(target)) for target in targets]
+        self.batch_info_request_id += 1
+        request_id = self.batch_info_request_id
+        cancel_event = threading.Event()
+        self.batch_info_cancel_event = cancel_event
+        self.batch_info_button.state(["!disabled"])
+        self.batch_info_button.configure(text="取消资料获取")
+        self.profile_target_hint_var.set(f"正在批量获取 {len(targets)} 个目标；完成后可逐项查看")
+        self.status_var.set(f"开始批量获取 {len(targets)} 个目标资料")
+
+        def worker() -> None:
+            rows: list[dict] = []
+            try:
+                adapter = self.manager.get_adapter(module_id)
+                for index, (target, options) in enumerate(target_options, start=1):
+                    if cancel_event.is_set():
+                        break
+                    try:
+                        if module_id == "twitter" and "/status/" not in target.casefold():
+                            payload = adapter.fetch_profile_preview(target, timeout_seconds=60)
+                            row = self._twitter_batch_info_row(target, payload)
+                        else:
+                            batch_options = dict(options)
+                            try:
+                                batch_options["page_read_timeout"] = min(
+                                    max(30, int(batch_options.get("page_read_timeout") or 60)), 60
+                                )
+                            except (TypeError, ValueError):
+                                batch_options["page_read_timeout"] = 60
+                            preview = adapter.preview_target(
+                                target,
+                                {**batch_options, "live": True},
+                            )
+                            row = self._generic_batch_info_row(target, preview)
+                    except Exception as exc:  # noqa: BLE001
+                        message = str(exc).splitlines()
+                        row = {
+                            "module_id": module_id,
+                            "source": "批量资料",
+                            "target": target,
+                            "name": target,
+                            "detail": f"获取失败：{(message[0] if message else type(exc).__name__)[:240]}",
+                            "downloadable": False,
+                            "_batch_result": True,
+                            "_batch_error": True,
+                        }
+                    row["_batch_index"] = index
+                    row["_batch_count"] = len(target_options)
+                    rows.append(row)
+                    self.ui_queue.put(("batch_info_progress", (request_id, module_id, index, len(target_options), target)))
+            except Exception as exc:  # noqa: BLE001
+                rows.append({
+                    "module_id": module_id,
+                    "source": "批量资料",
+                    "target": "",
+                    "name": "批量资料任务启动失败",
+                    "detail": str(exc) or type(exc).__name__,
+                    "downloadable": False,
+                    "_batch_result": True,
+                    "_batch_error": True,
+                })
+            finally:
+                self.ui_queue.put(("batch_info_done", (request_id, module_id, rows, cancel_event.is_set())))
+
+        try:
+            threading.Thread(target=worker, name=f"{module_id}-batch-info", daemon=True).start()
+        except RuntimeError as exc:
+            self.batch_info_cancel_event = None
+            self.batch_info_button.configure(text="批量获取资料")
+            self.status_var.set(f"无法启动资料获取：{exc}")
+
+    def _cancel_batch_info(self) -> None:
+        event = self.batch_info_cancel_event
+        if event is None or event.is_set():
+            return
+        event.set()
+        self.batch_info_button.configure(text="正在停止…")
+        self.batch_info_button.state(["disabled"])
+        self.status_var.set("已请求停止批量获取；当前网络请求结束后停止")
+
+    @staticmethod
+    def _generic_batch_info_row(target: str, preview) -> dict:
+        metadata = preview.metadata
+        return {
+            "module_id": preview.module_id,
+            "source": "批量资料",
+            "target": preview.normalized_target or target,
+            "name": preview.title or target,
+            "detail": preview.description or preview.status,
+            "profile_url": str(metadata.get("profile_url") or preview.normalized_target or target),
+            "author_name": str(metadata.get("author_name") or metadata.get("author") or ""),
+            "author_id": str(metadata.get("author_id") or ""),
+            "published_at": str(metadata.get("published_at") or ""),
+            "tags": metadata.get("tags") or [],
+            "avatar_url": str(
+                metadata.get("avatar_url") or metadata.get("profile_image_url")
+                or metadata.get("thumbnail_url") or ""
+            ),
+            "input_kind": str(metadata.get("input_kind") or ""),
+            "downloadable": True,
+            "_batch_result": True,
+            "_batch_preview": TargetPreview(
+                module_id=preview.module_id,
+                raw_target=preview.raw_target,
+                normalized_target=preview.normalized_target,
+                title=str(preview.title or "")[:500],
+                description=str(preview.description or "")[:2000],
+                status=str(preview.status or "")[:100],
+                warnings=[str(item)[:300] for item in preview.warnings[:20]],
+                metadata={
+                    key: ([str(item)[:200] for item in value[:20]
+                           if isinstance(item, (str, int, float, bool))]
+                          if key == "tags" and isinstance(value, list)
+                          else [None] * min(len(value), 20)
+                          if key in {"search_results", "chapters"} and isinstance(value, list)
+                          else str(value)[:1000] if isinstance(value, (str, int, float, bool)) else None)
+                    for key, value in metadata.items()
+                    if key in {
+                        "author_id", "author", "input_kind", "target_id", "id", "author_name",
+                        "display_name", "tags", "published_at", "search_results", "chapters",
+                        "avatar_url", "profile_image_url",
+                        "thumbnail_url", "profile_url", "title", "browser_destination",
+                    }
+                },
+            ),
+        }
+
+    @staticmethod
+    def _twitter_batch_info_row(target: str, payload: dict) -> dict:
+        handle = str(payload.get("handle") or "").strip().lstrip("@")
+        compact_payload = {
+            key: ([item[:1000] for item in value[:20] if isinstance(item, str)]
+                  if isinstance(value, list) else str(value or "")[:2000])
+            for key, value in payload.items()
+            if key in {
+                "handle", "display_name", "bio", "profile_url", "avatar_url", "avatar_path",
+                "source", "media_url", "normalized_target", "download_description", "warnings",
+                "links", "skeb_links",
+            }
+        }
+        return {
+            "module_id": "twitter",
+            "source": "批量资料",
+            "target": str(payload.get("profile_url") or target),
+            "handle": handle,
+            "name": str(payload.get("display_name") or handle or target),
+            "bio": str(payload.get("bio") or ""),
+            "profile_url": str(payload.get("profile_url") or target),
+            "avatar_url": str(payload.get("avatar_url") or ""),
+            "detail": str(payload.get("bio") or payload.get("source") or "Twitter 作者资料"),
+            "downloadable": True,
+            "_batch_result": True,
+            "_batch_payload": compact_payload,
+        }
+
+    def _show_batch_info_results(self, module_id: str, rows: list[dict]) -> None:
+        if self.module_var.get() != module_id:
+            return
+        self.target_browser_rows = list(rows)
+        self.selected_target_browser_key = ""
+        self.selected_target_browser_keys.clear()
+        self.module_list.delete(0, tk.END)
+        for row in self.target_browser_rows:
+            index = int(row.get("_batch_index") or 0)
+            name = str(row.get("name") or row.get("target") or "未知目标")
+            target = str(row.get("target") or "")
+            detail = str(row.get("detail") or "")
+            state = "获取失败" if row.get("_batch_error") else "已获取"
+            self.module_list.insert(tk.END, f"{index:02d}. {state} · {name} · {target}")
+        try:
+            adapter = self.manager.get_adapter(module_id)
+            can_download = "download" in adapter.info.capabilities and adapter.info.stage != "planned"
+        except KeyError:
+            can_download = False
+        downloadable = can_download and any(bool(row.get("downloadable")) for row in self.target_browser_rows)
+        self.target_queue_button.state(["!disabled"] if downloadable else ["disabled"])
+        self.target_selection_var.set(f"批量资料共 {len(rows)} 项 · 单击一项查看详情 · 可多选加入队列")
+        self._write_text(
+            self.module_detail,
+            f"批量资料获取完成：成功 {sum(not row.get('_batch_error') for row in rows)} 项，"
+            f"失败 {sum(bool(row.get('_batch_error')) for row in rows)} 项。\n"
+            "单击左侧一项，在资料卡查看详细信息；勾选多项可直接加入下载队列。",
+        )
+        self.profile_target_hint_var.set(f"批量资料共 {len(rows)} 项；左侧资料卡一次显示一项")
+        if self.target_browser_rows:
+            self.module_list.selection_set(0)
+            self._select_target_from_browser()
+
     def _open_target_in_browser(self) -> None:
-        target = self.target_var.get().strip()
+        target = self._single_target_for_action("打开网页")
         if not target:
-            messagebox.showwarning("缺少目标", "请先输入或选择一个目标 URL")
             return
         url = target
         browser_destination = "目标网页"
@@ -1671,9 +2040,8 @@ class SoftwareDesktop(
             self.status_var.set("已在系统浏览器打开目标网页")
 
     def _preview_twitter_page(self) -> None:
-        target = self.target_var.get().strip()
+        target = self._single_target_for_action("在线获取资料")
         if not target:
-            messagebox.showwarning("缺少目标", "请输入推特作者")
             return
         self._select_twitter_module()
         output_dir = self.output_dir_var.get()
@@ -1688,14 +2056,16 @@ class SoftwareDesktop(
             try:
                 local_payload = adapter.load_profile_preview(target, Path(output_dir))
                 local_payload["download_description"] = f"下载类型: {types_text}"
+                local_payload["_requested_target"] = target
                 self.ui_queue.put(("profile_preview_local_loaded", local_payload))
             except Exception as exc:  # noqa: BLE001
-                self.ui_queue.put(("profile_preview_local_error", str(exc)))
+                self.ui_queue.put(("profile_preview_local_error", (target, str(exc))))
             try:
                 payload = adapter.fetch_profile_preview(target, timeout_seconds=60)
             except Exception as exc:  # noqa: BLE001
                 self.ui_queue.put(("profile_preview_error", (target, str(exc))))
                 return
+            payload["_requested_target"] = target
             self.ui_queue.put(("profile_preview_loaded", payload))
 
         threading.Thread(target=worker, name="twitter-profile-preview", daemon=True).start()
@@ -1870,6 +2240,9 @@ class SoftwareDesktop(
     def _block_current_work(self) -> None:
         targets = [self.profile_url_var.get().strip(), self.target_var.get().strip()]
         target = next((value for value in targets if work_from_target(self.module_var.get(), value)), "")
+        input_targets = self._current_input_targets()
+        if len(input_targets) > 1 and (not target or target == self.target_var.get().strip()):
+            target = input_targets[0]
         if not target:
             messagebox.showinfo("屏蔽作品/页面", "请先选中具体作品、帖子或网页；作者主页请使用“屏蔽作者”。")
             return
@@ -2445,6 +2818,8 @@ class SoftwareDesktop(
         lines.append(f"目标：{target}")
         lines.append(f"平台：{self._selected_adapter().display_name}")
         lines.append(f"保存目录：{self.output_dir_var.get()}")
+        total, single, collection = self.manager.get_concurrency_limits(self.module_var.get())
+        lines.append(f"并发上限：总计 {total} 路；作品/单项 {single} 路；作者/范围 {collection} 路")
         lines.append("")
         lines.append("【统一输出格式】")
         lines.append(f"  图片：{self.image_format_var.get()}")
@@ -2493,43 +2868,87 @@ class SoftwareDesktop(
         if not target:
             messagebox.showwarning("缺少目标", "请输入目标")
             return
+        module_id = self.module_var.get()
+        scope = self.content_scope_var.get()
+        prefilled = getattr(self, "_prefilled_task_targets", None)
+        if prefilled and prefilled[0] == module_id and prefilled[1] == target:
+            targets = list(prefilled[2])
+        else:
+            targets = split_task_targets(
+                target,
+                split_slashes=slash_separates_targets(module_id, scope),
+                module_id=module_id,
+            )
+        if not targets:
+            messagebox.showwarning("缺少目标", "没有识别到可加入队列的目标")
+            return
+        if len(targets) > 100:
+            messagebox.showwarning("目标过多", f"一次最多加入 100 个目标；当前识别到 {len(targets)} 个")
+            return
         if "规划" in self.content_scope_var.get():
             messagebox.showinfo(
                 "下载种类尚未迁入",
                 f"{self.content_scope_var.get()} 目前仅列出旧版能力，尚不能启动下载。",
             )
             return
-        options = self._current_target_options(target)
-        requested_scope = str(options.get("requested_content_scope") or "").strip()
-        if self.module_var.get() == "pixiv" and requested_scope:
-            actual_scope = str(options.get("content_scope") or "作品")
+        target_options = [(item, self._current_target_options(item)) for item in targets]
+        scope_mismatches = [
+            (item, options)
+            for item, options in target_options
+            if str(options.get("requested_content_scope") or "").strip()
+        ]
+        if self.module_var.get() == "pixiv" and scope_mismatches:
+            descriptions = []
+            for item, options in scope_mismatches[:10]:
+                actual_scope = str(options.get("content_scope") or "作品")
+                descriptions.append(f"{item} → {actual_scope}")
+            suffix = f"\n……另有 {len(scope_mismatches) - 10} 个" if len(scope_mismatches) > 10 else ""
             if not messagebox.askyesno(
                 "确认 Pixiv 任务类型",
-                f"当前界面选择的是“{requested_scope}”，但输入内容是具体的 Pixiv {actual_scope}目标。\n\n"
-                "“开始任务”会下载目标资源；标题、简介和标签属于搜索及资料字段，并不是只下载文字。\n"
-                f"本任务将按“{actual_scope}”记录并下载。是否继续？",
+                f"以下 Pixiv 目标会按链接识别出的具体类型下载，而不是按当前搜索种类“{self.content_scope_var.get()}”处理：\n\n"
+                + "\n".join(descriptions) + suffix + "\n\n是否继续？",
             ):
                 return
-        if not messagebox.askyesno("确认开始下载", self._build_task_confirm_message(target, options)):
+        if len(targets) == 1:
+            target_description = target
+        else:
+            shown = "\n".join(f"  {index}. {item}" for index, item in enumerate(targets[:12], start=1))
+            if len(targets) > 12:
+                shown += f"\n  ……另有 {len(targets) - 12} 个"
+            target_description = f"{len(targets)} 个独立任务：\n{shown}"
+        if not messagebox.askyesno(
+            "确认开始下载",
+            self._build_task_confirm_message(target_description, target_options[0][1]),
+        ):
             self.status_var.set("已取消任务")
             return
         callbacks = self._task_callbacks()
-        try:
-            task = self.manager.start_task(
-                self.module_var.get(),
-                target,
-                Path(self.output_dir_var.get()),
-                options,
-                callbacks,
-            )
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("启动失败", str(exc))
+        created: list[object] = []
+        failure = ""
+        for item, options in target_options:
+            try:
+                task = self.manager.start_task(
+                    self.module_var.get(),
+                    item,
+                    Path(self.output_dir_var.get()),
+                    options,
+                    callbacks,
+                )
+            except Exception as exc:  # noqa: BLE001
+                failure = f"{item}: {exc}"
+                break
+            created.append(task)
+            self.current_task_id = task.task_id
+            self.current_task_ids.add(task.task_id)
+            self._append_log(f"创建任务: {task.task_id} | {item}")
+        if not created:
+            messagebox.showerror("启动失败", failure or "没有目标成功加入队列")
             return
-        self.current_task_id = task.task_id
-        self.current_task_ids.add(task.task_id)
-        self.status_var.set(f"运行中: {task.task_id}")
-        self._append_log(f"创建任务: {task.task_id}")
+        self.status_var.set(f"已加入 {len(created)} 个任务，平台并发限制将按设置生效")
+        if failure:
+            messagebox.showwarning("部分加入队列", f"成功加入 {len(created)}/{len(targets)} 个任务。\n\n{failure}")
         self._refresh_tasks()
+        self._follow_task_batch([task.task_id for task in created])
 
     def _cancel_task(self) -> None:
         if self.google_search_cancel_event is not None:
@@ -2610,10 +3029,16 @@ class SoftwareDesktop(
                     self.task_progress_var.set(8.0)
                 if event.task_id in self.task_tree.selection():
                     changed_task_detail = True
+                if event.task_id in self._task_follow_order:
+                    self._focus_followed_task()
+                    changed_task_detail = True
             elif event_type == "file":
                 record = payload
                 assert isinstance(record, FileRecord)
                 changed_files = True
+                if record.task_id in self._task_follow_order:
+                    self._focus_followed_task()
+                    changed_task_detail = True
             elif event_type == "library_scan_progress":
                 self.library_status_var.set(f"正在后台扫描：已发现并索引 {int(payload)} 个媒体文件…")
             elif event_type == "library_loaded":
@@ -2712,10 +3137,14 @@ class SoftwareDesktop(
                 changed_files = True
                 changed_tasks = True
                 self._load_twitter_history()
-                if self.module_var.get() == "twitter" and self.target_var.get().strip():
+                if self.module_var.get() == "twitter" and len(self._current_input_targets()) == 1:
                     self._preview_target()
                 if self.module_var.get() != "twitter":
                     self._populate_platform_history(self.module_var.get())
+            elif event_type == "batch_info_progress":
+                request_id, module_id, index, total, target = payload  # type: ignore[misc]
+                if request_id == self.batch_info_request_id and module_id == self.module_var.get():
+                    self.status_var.set(f"正在获取资料 {index}/{total}：{target}")
             elif event_type == "twitter_history_loaded":
                 rows = payload if isinstance(payload, list) else []
                 self._apply_twitter_history(rows)
@@ -2723,14 +3152,28 @@ class SoftwareDesktop(
                 self._append_log(f"读取推特下载历史失败: {payload}")
             elif event_type == "profile_preview_local_loaded":
                 payload_dict = payload if isinstance(payload, dict) else {}
+                if payload_dict.get("_requested_target") and not self._is_current_input_target(
+                    str(payload_dict["_requested_target"]), "twitter"
+                ):
+                    continue
                 self._write_profile_preview(payload_dict)
                 handle = str(payload_dict.get("handle") or "").strip()
                 self.status_var.set(f"已显示本地主页资料: @{handle}" if handle else "已显示本地主页资料")
             elif event_type == "profile_preview_local_error":
-                self._append_log(f"读取本地主页资料失败: {payload}")
+                if isinstance(payload, tuple):
+                    requested_target, raw_message = payload
+                    if not self._is_current_input_target(str(requested_target), "twitter"):
+                        continue
+                else:
+                    raw_message = payload
+                self._append_log(f"读取本地主页资料失败: {raw_message}")
                 self.status_var.set("本地主页资料读取失败")
             elif event_type == "profile_preview_loaded":
                 payload_dict = payload if isinstance(payload, dict) else {}
+                if payload_dict.get("_requested_target") and not self._is_current_input_target(
+                    str(payload_dict["_requested_target"]), "twitter"
+                ):
+                    continue
                 self.online_button.configure(text="在线获取资料")
                 if self.module_var.get() != "google_image":
                     self.online_button.state(["!disabled"])
@@ -2741,6 +3184,8 @@ class SoftwareDesktop(
             elif event_type == "profile_preview_error":
                 if isinstance(payload, tuple):
                     target, raw_message = payload
+                    if not self._is_current_input_target(str(target), "twitter"):
+                        continue
                 else:
                     target, raw_message = self.target_var.get(), payload
                 message = self._friendly_error(raw_message, "在线主页刷新")
@@ -2778,7 +3223,7 @@ class SoftwareDesktop(
                     self._append_log(f"头像加载失败：{str(raw_message).splitlines()[0]}")
             elif event_type == "generic_preview_loaded":
                 request_id, module_id, target, preview = payload  # type: ignore[misc]
-                if request_id != self.generic_preview_request_id or module_id != self.module_var.get() or target != self.target_var.get().strip():
+                if request_id != self.generic_preview_request_id or not self._is_current_input_target(target, module_id):
                     continue
                 self.online_button.configure(text="在线获取资料")
                 self.online_button.state(["!disabled"])
@@ -2789,7 +3234,7 @@ class SoftwareDesktop(
                 self._append_log("在线预览完成")
             elif event_type == "generic_preview_error":
                 request_id, module_id, target, raw_message = payload  # type: ignore[misc]
-                if request_id != self.generic_preview_request_id or module_id != self.module_var.get() or target != self.target_var.get().strip():
+                if request_id != self.generic_preview_request_id or not self._is_current_input_target(target, module_id):
                     continue
                 self.online_button.configure(text="在线获取资料")
                 self.online_button.state(["!disabled"])
@@ -2812,6 +3257,16 @@ class SoftwareDesktop(
                         )
                     else:
                         self.status_var.set(f"目标搜索完成：{len(rows) if isinstance(rows, list) else 0} 个结果")
+            elif event_type == "batch_info_done":
+                request_id, module_id, rows, cancelled = payload  # type: ignore[misc]
+                if request_id == self.batch_info_request_id:
+                    self.batch_info_cancel_event = None
+                    self.batch_info_button.configure(text="批量获取资料")
+                    self.batch_info_button.state(["!disabled"])
+                    if self.module_var.get() == module_id:
+                        self._show_batch_info_results(module_id, rows if isinstance(rows, list) else [])
+                        state = "已停止" if cancelled else "完成"
+                        self.status_var.set(f"批量资料获取{state}：{len(rows) if isinstance(rows, list) else 0} 项")
             elif event_type == "platform_search_error":
                 module_id, message = payload  # type: ignore[misc]
                 if self.module_var.get() == module_id:
@@ -3290,6 +3745,7 @@ class SoftwareDesktop(
         if changed_tasks:
             self._refresh_tasks()
         elif changed_task_detail:
+            self._focus_followed_task()
             self._render_selected_task()
         try:
             self._poll_job = self.after(200, self._poll_queue)

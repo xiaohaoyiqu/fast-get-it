@@ -558,13 +558,18 @@ def download_pic(
     filename_base=None,
     cancel_event=None,
     image_format="png",
+    on_result=None,
 ):
     stats = stats or DownloadStats()
     if not src:
         stats.inc("empty_url")
         print("Image URL is empty, skip")
+        if on_result:
+            on_result("image", "failed", None, "媒体地址为空")
         return
     if record_skip(src, record, stats):
+        if on_result:
+            on_result("image", "skipped", None, "下载记录中已存在")
         return
 
     if cancel_event is not None and cancel_event.wait(0.01):
@@ -585,6 +590,8 @@ def download_pic(
         if image_path.exists():
             print(f"{image_name} already exists.")
             mark_existing(src, record, failure_record, stats, "image", image_path)
+            if on_result:
+                on_result("image", "skipped", image_path, "文件已存在")
             return
 
         print(f"{image_name} is downloading")
@@ -596,6 +603,8 @@ def download_pic(
             if failure_record:
                 failure_record.mark_failed(src, "image", "max retries exceeded")
             print(f"Image download failed, skip: {src}")
+            if on_result:
+                on_result("image", "failed", None, "重试后请求仍失败")
             return
 
         try:
@@ -606,6 +615,8 @@ def download_pic(
                 if failure_record:
                     failure_record.mark_failed(src, "image", f"image conversion failed: {error}")
                 print(f"Image conversion failed, skip: {src} ({error})")
+                if on_result:
+                    on_result("image", "failed", None, f"图片转换失败：{error}")
                 return
 
             with image_path.open("wb") as f:
@@ -615,6 +626,8 @@ def download_pic(
                 record.mark_success(src, "image", image_path)
             if failure_record:
                 failure_record.remove(src)
+            if on_result:
+                on_result("image", "completed", image_path, "")
         finally:
             response.close()
     finally:
@@ -634,6 +647,7 @@ def download_video(
     keep_gif_mp4=False,
     gif_fps=12,
     gif_width=0,
+    on_result=None,
 ):
     stats = stats or DownloadStats()
     if media_type not in {"video", "gif"}:
@@ -641,6 +655,8 @@ def download_video(
     if not src:
         stats.inc("empty_url")
         print("Video URL is empty, skip")
+        if on_result:
+            on_result(media_type, "failed", None, "媒体地址为空")
         return
 
     while not video_sema.acquire(timeout=0.2):
@@ -661,20 +677,28 @@ def download_video(
                 record.mark_success(record_url, media_type, final_path)
                 if failure_record:
                     failure_record.remove(record_url)
+                if on_result:
+                    on_result(media_type, "completed", final_path, "")
                 return
             stats.inc("skipped_record")
             print(f"Already in download record, skip: {src}")
+            if on_result:
+                on_result(media_type, "skipped", None, "下载记录中已存在")
             return
 
         if media_type == "gif" and convert_gif and gif_path and gif_path.exists():
             print(f"{gif_path.name} already exists.")
             mark_existing(record_url, record, failure_record, stats, media_type, gif_path)
+            if on_result:
+                on_result(media_type, "skipped", gif_path, "文件已存在")
             return
 
         if video_path.exists():
             print(f"{video_name} already exists.")
             final_path = finalize_gif_conversion(video_path, stats, convert_gif and media_type == "gif", keep_gif_mp4, gif_fps, gif_width)
             mark_existing(record_url, record, failure_record, stats, media_type, final_path)
+            if on_result:
+                on_result(media_type, "skipped", final_path, "文件已存在")
             return
 
         print(f"{video_name} is downloading")
@@ -686,6 +710,8 @@ def download_video(
             if failure_record:
                 failure_record.mark_failed(record_url, media_type, "max retries exceeded")
             print(f"Video download failed, skip: {src}")
+            if on_result:
+                on_result(media_type, "failed", None, "重试后请求仍失败")
             return
 
         temporary = video_path.with_name(video_path.name + ".part")
@@ -703,6 +729,8 @@ def download_video(
                 record.mark_success(record_url, media_type, final_path)
             if failure_record:
                 failure_record.remove(record_url)
+            if on_result:
+                on_result(media_type, "completed", final_path, "")
         finally:
             response.close()
             if temporary.exists():
@@ -723,16 +751,21 @@ def download_audio(
     filename_base=None,
     audio_format="mp3",
     cancel_event=None,
+    on_result=None,
 ):
     stats = stats or DownloadStats()
     if not src:
         stats.inc("empty_url")
         print("Audio source URL is empty, skip")
+        if on_result:
+            on_result("audio", "failed", None, "媒体地址为空")
         return
 
     audio_format = normalize_audio_format(audio_format)
     record_url = record_identifier(src, "audio")
     if record_skip(record_url, record, stats, display_url=src):
+        if on_result:
+            on_result("audio", "skipped", None, "下载记录中已存在")
         return
 
     while not video_sema.acquire(timeout=0.2):
@@ -748,6 +781,8 @@ def download_audio(
         if audio_path.exists():
             print(f"{audio_name} already exists.")
             mark_existing(record_url, record, failure_record, stats, "audio", audio_path)
+            if on_result:
+                on_result("audio", "skipped", audio_path, "文件已存在")
             return
 
         if temp_path.exists():
@@ -765,6 +800,8 @@ def download_audio(
             if failure_record:
                 failure_record.mark_failed(record_url, "audio", "max retries exceeded")
             print(f"Audio source download failed, skip: {src}")
+            if on_result:
+                on_result("audio", "failed", None, "重试后请求仍失败")
             return
 
         try:
@@ -789,6 +826,8 @@ def download_audio(
             if failure_record:
                 failure_record.mark_failed(record_url, "audio", error or "audio extraction failed")
             print(f"Audio extraction failed, skip: {error}")
+            if on_result:
+                on_result("audio", "failed", None, error or "音频提取失败")
             return
 
         stats.inc("success_audio")
@@ -796,6 +835,8 @@ def download_audio(
             record.mark_success(record_url, "audio", audio_path)
         if failure_record:
             failure_record.remove(record_url)
+        if on_result:
+            on_result("audio", "completed", audio_path, "")
     finally:
         if temp_path and temp_path.exists():
             try:

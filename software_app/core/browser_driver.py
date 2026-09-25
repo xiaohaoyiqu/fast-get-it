@@ -55,7 +55,14 @@ def driver_platform_name() -> str:
 
 def global_driver_path() -> Path:
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent / driver_name()
+        exe_dir = Path(sys.executable).resolve().parent
+        direct = exe_dir / driver_name()
+        if direct.exists():
+            return direct
+        internal = exe_dir / "_internal" / driver_name()
+        if internal.exists():
+            return internal
+        return direct
     ensure_data_dirs()
     return BROWSER_TOOLS_DIR / driver_name()
 

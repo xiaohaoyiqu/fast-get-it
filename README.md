@@ -44,11 +44,11 @@ python .\run_software.py
 使用 PyInstaller 打包，配置文件为项目根目录的 `欲求达.spec`：
 
 ```powershell
-python -m pip install -r .\requirements-build.txt
-pyinstaller .\欲求达.spec --clean
+python -m pip install -r .\requirements-app.txt
+python -m PyInstaller .\欲求达.spec --clean --noconfirm
 ```
 
-打包产物在 `dist/欲求达/`，包含 `欲求达.exe`（GUI 版）和 `欲求达-cli.exe`（命令行版）。
+打包产物在 `dist/欲求达/`，包含 `欲求达.exe`（GUI 版）和 `欲求达-cli.exe`（命令行版）。`--noconfirm` 会替换这个打包输出目录；请先关闭正在运行的软件，并将需要保留的旧版文件移出该目录。
 
 ## 登录资料和本地数据
 

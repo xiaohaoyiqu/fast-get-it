@@ -13,6 +13,17 @@ GOOGLE_BATCH_IMAGE_LIMIT = 20
 LIBRARY_RENDER_LIMIT = 500
 
 
+def select_treeview_row_at_event(tree, event) -> str:
+    """Select only the Treeview row under a pointer event; return its item id."""
+    item_id = str(tree.identify_row(event.y) or "")
+    if not item_id or not tree.exists(item_id):
+        return ""
+    tree.selection_set(item_id)
+    tree.focus(item_id)
+    tree.see(item_id)
+    return item_id
+
+
 def normalized_search_text(*values: object) -> str:
     """Build a Unicode-insensitive search key while preserving original display text."""
     text = " ".join(str(value or "") for value in values)

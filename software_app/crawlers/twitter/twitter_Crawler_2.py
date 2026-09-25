@@ -61,7 +61,7 @@ DEFAULT_CONFIG = {
 CONFIG_FILE = "config.json"
 BOOTSTRAP_URL = "https://x.com/"
 INVALID_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-CRAWLER_VERSION = "2026-09-13-status-post-route-v13"
+CRAWLER_VERSION = "2026-09-25-auto-refresh-v14"
 TWITTER_RESERVED_ROUTES = {"home", "explore", "notifications", "messages", "search", "settings", "compose", "i"}
 HELP_EPILOG = """
 下载类型:
@@ -266,27 +266,89 @@ def print_page_status(driver, label):
     print(f"{label}: title={driver.title!r}, url={driver.current_url}")
 
 
-def wait_for_media_page(driver, timeout=30, cancel_event=None):
+def page_requests_refresh(driver):
+    """Detect X's transient error panel without treating login/rate-limit pages as refreshable."""
+    try:
+        bodies = driver.find_elements(By.TAG_NAME, "body")
+        page_text = str(getattr(bodies[0], "text", "") or "") if bodies else ""
+    except Exception:  # noqa: BLE001 - fall back to the page source when a driver is mid-navigation.
+        page_text = ""
+    if not page_text:
+        try:
+            page_text = re.sub(r"<[^>]*>", " ", str(driver.page_source or ""))
+        except Exception:  # noqa: BLE001 - page may have navigated or closed.
+            return False
+    normalized = re.sub(r"\s+", " ", page_text).casefold()
+    error_markers = (
+        "something went wrong",
+        "this page failed to load",
+        "page failed to load",
+        "出错了",
+        "出了点问题",
+        "页面加载失败",
+        "内容加载失败",
+    )
+    refresh_markers = (
+        "try reloading",
+        "try refreshing",
+        "refresh this page",
+        "please reload",
+        "please refresh",
+        "try again",
+        "重新加载",
+        "刷新页面",
+        "刷新后",
+        "再试一次",
+        "重试",
+    )
+    return any(marker in normalized for marker in error_markers) and any(
+        marker in normalized for marker in refresh_markers
+    )
+
+
+def wait_for_media_page(driver, timeout=30, cancel_event=None, on_status=None):
+    refresh_attempted = False
+    timeout = max(1, float(timeout))
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if cancel_event is not None and cancel_event.is_set():
-            raise RuntimeError("任务已取消")
-        if page_has_login_or_restriction(driver):
-            raise RuntimeError("当前页面仍是登录/限制页面，说明 cookie 未生效或账号仍被 X 限制。")
-
-        cells = driver.find_elements(By.CSS_SELECTOR, "div[data-testid='cellInnerDiv']")
-        if cells:
-            print(f"检测到 {len(cells)} 个页面内容块，开始爬取。")
-            return
-
-        if cancel_event is not None:
-            if cancel_event.wait(1):
+    while True:
+        while time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("任务已取消")
-        else:
-            time.sleep(1)
+            if page_has_login_or_restriction(driver):
+                raise RuntimeError("当前页面仍是登录/限制页面，说明 cookie 未生效或账号仍被 X 限制。")
 
-    print_page_status(driver, "等待媒体页超时")
-    raise RuntimeError("目标页面未加载出媒体列表，已停止，避免程序卡住。")
+            cells = driver.find_elements(By.CSS_SELECTOR, "div[data-testid='cellInnerDiv']")
+            if cells:
+                print(f"检测到 {len(cells)} 个页面内容块，开始爬取。")
+                return
+
+            if not refresh_attempted and page_requests_refresh(driver):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError("任务已取消")
+                refresh_attempted = True
+                message = "检测到 X 页面提示重新加载；自动刷新一次并重新等待媒体列表。"
+                print(message)
+                if on_status is not None:
+                    on_status(message)
+                try:
+                    driver.refresh()
+                except TimeoutException:
+                    print("刷新后页面加载超时，停止继续加载并检查已加载内容。")
+                    try:
+                        driver.execute_script("window.stop()")
+                    except Exception:  # noqa: BLE001 - continue checking the current document.
+                        pass
+                deadline = time.monotonic() + timeout
+                break
+
+            if cancel_event is not None:
+                if cancel_event.wait(1):
+                    raise RuntimeError("任务已取消")
+            else:
+                time.sleep(1)
+        else:
+            print_page_status(driver, "等待媒体页超时")
+            raise RuntimeError("目标页面未加载出媒体列表，已停止，避免程序卡住。")
 
 
 def normalize_target(target):
@@ -573,6 +635,8 @@ def download_one_target(
     record,
     failure_record,
     cancel_event=None,
+    on_status=None,
+    on_media_result=None,
 ):
     print(f"\n开始下载目标: {target_url}")
     page_tasks = build_media_page_tasks(target_url, user_choice)
@@ -596,6 +660,7 @@ def download_one_target(
             driver,
             timeout=int(config.get("media_wait_timeout", 30)),
             cancel_event=cancel_event,
+            on_status=on_status,
         )
 
         if folder is None:
@@ -638,6 +703,7 @@ def download_one_target(
             blocked_handles=set(config.get("blocked_handles") or []),
             desired_tweet_id=desired_tweet_id,
             cancel_event=cancel_event,
+            on_media_result=on_media_result,
         )
         merge_stats(target_stats, stats)
 

@@ -53,6 +53,15 @@ def short_error(error):
     return error.__class__.__name__
 
 
+def emit_media_result(callback, media_type, status, path=None, reason=""):
+    if callback is None:
+        return
+    try:
+        callback(media_type, status, path, reason)
+    except Exception as error:  # UI reporting must never break a download worker.
+        print(f"媒体结果通知失败: {short_error(error)}")
+
+
 def normalize_datetime_text(value):
     if not value:
         return ""
@@ -442,6 +451,7 @@ def download_status_from_syndication(
     failure_record=None,
     config=None,
     cancel_event=None,
+    on_media_result=None,
 ):
     """Download an exact public status without depending on X's rendered DOM."""
     config = config or {}
@@ -469,15 +479,21 @@ def download_status_from_syndication(
         if cancel_event is not None and cancel_event.is_set():
             break
         stats.inc(f"queued_{media_type}")
+        reported = [False]
+        def report(kind, status, path=None, reason=""):
+            reported[0] = True
+            emit_media_result(on_media_result, kind, status, path, reason)
         if media_type == "image":
             download_pic(
                 src, folder, record, stats, failure_record, filename_base,
                 cancel_event=cancel_event, image_format=config.get("image_format", "png"),
+                on_result=report,
             )
         elif media_type == "audio":
             download_audio(
                 src, audio_folder, record, stats, failure_record, filename_base,
                 cancel_event=cancel_event, audio_format=config.get("audio_format", "mp3"),
+                on_result=report,
             )
         else:
             download_video(
@@ -487,7 +503,10 @@ def download_status_from_syndication(
                 keep_gif_mp4=config.get("keep_gif_mp4", True),
                 gif_fps=config.get("gif_fps", 12),
                 gif_width=config.get("gif_width", 0),
+                on_result=report,
             )
+        if not reported[0] and (cancel_event is None or not cancel_event.is_set()):
+            report(media_type, "failed", None, "下载流程未返回结果")
     return stats.snapshot()
 
 
@@ -590,7 +609,7 @@ def url_producer(
             q.put(None)  # 生产者完成后给每个worker放入停止信号
 
 
-def download_worker(worker_id, q, folder, video_folder, audio_folder, record, stats, failure_record, options, cancel_event=None):
+def download_worker(worker_id, q, folder, video_folder, audio_folder, record, stats, failure_record, options, cancel_event=None, on_media_result=None):
     while True:
         item = q.get()
         if item is None:
@@ -602,6 +621,10 @@ def download_worker(worker_id, q, folder, video_folder, audio_folder, record, st
         else:
             src, media_type = item
             filename_base = None
+        reported = [False]
+        def report(kind, status, path=None, reason=""):
+            reported[0] = True
+            emit_media_result(on_media_result, kind, status, path, reason)
         try:
             if cancel_event is not None and cancel_event.is_set():
                 continue
@@ -615,6 +638,7 @@ def download_worker(worker_id, q, folder, video_folder, audio_folder, record, st
                     filename_base,
                     cancel_event=cancel_event,
                     image_format=options.get("image_format", "png"),
+                    on_result=report,
                 )
             elif media_type == "audio":
                 download_audio(
@@ -626,6 +650,7 @@ def download_worker(worker_id, q, folder, video_folder, audio_folder, record, st
                     filename_base,
                     cancel_event=cancel_event,
                     audio_format=options.get("audio_format", "mp3"),
+                    on_result=report,
                 )
             else:
                 download_video(
@@ -641,9 +666,12 @@ def download_worker(worker_id, q, folder, video_folder, audio_folder, record, st
                     keep_gif_mp4=options.get("keep_gif_mp4", True),
                     gif_fps=options.get("gif_fps", 12),
                     gif_width=options.get("gif_width", 0),
+                    on_result=report,
                 )
         except Exception as error:
             print(f"下载worker {worker_id} 失败，跳过: {short_error(error)}")
+            if not reported[0]:
+                report(media_type, "failed", None, short_error(error))
         finally:
             q.task_done()
 
@@ -744,6 +772,7 @@ def download_media(
     blocked_handles=None,
     desired_tweet_id=None,
     cancel_event=None,
+    on_media_result=None,
 ):
     print(f"{folder} | downloader={DOWNLOADER_VERSION}")
     # 下载Twitter页面中的图片和视频
@@ -786,7 +815,7 @@ def download_media(
     worker_threads = [
         threading.Thread(
             target=download_worker,
-            args=(index + 1, q, folder, video_folder, audio_folder, record, stats, failure_record, options, cancel_event),
+            args=(index + 1, q, folder, video_folder, audio_folder, record, stats, failure_record, options, cancel_event, on_media_result),
             name=f"download-worker-{index + 1}",
         )
         for index in range(download_workers)

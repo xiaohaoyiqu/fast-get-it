@@ -14,6 +14,7 @@ from software_app.ui.desktop_support import (
     library_query_tokens,
     library_text_matches,
     normalized_search_text,
+    select_treeview_row_at_event,
     send_path_to_recycle_bin as _send_path_to_recycle_bin,
 )
 
@@ -96,7 +97,7 @@ class LibraryTabMixin:
         self.folder_file_tree.column("size", width=100, stretch=False)
         file_tree_frame.grid(row=1, column=0, sticky="nsew")
         self.folder_file_tree.bind("<<TreeviewSelect>>", lambda _event: self._render_selected_library_file())
-        self.folder_file_tree.bind("<Double-Button-1>", lambda _event: self._open_selected_file())
+        self.folder_file_tree.bind("<Double-Button-1>", self._open_double_clicked_file)
 
         display_frame = ttk.Frame(self.library_tab, style="Panel.TFrame", padding=10)
         display_frame.grid(row=2, column=0, sticky="nsew")
@@ -622,6 +623,11 @@ class LibraryTabMixin:
             messagebox.showerror("文件不存在", str(path))
             return
         os.startfile(str(path))  # type: ignore[attr-defined]
+
+    def _open_double_clicked_file(self, event) -> str:
+        if select_treeview_row_at_event(self.folder_file_tree, event):
+            self._open_selected_file()
+        return "break"
 
 
     def _copy_selected_file_paths(self) -> None:

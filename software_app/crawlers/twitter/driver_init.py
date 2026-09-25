@@ -5,9 +5,10 @@ import sys
 import tempfile
 from pathlib import Path
 from selenium import webdriver
+from selenium.webdriver.chrome.webdriver import WebDriver as ChromeWebDriver
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver import ChromeOptions
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
@@ -47,7 +48,7 @@ def find_skeb_button_extension(user_data_roots: list[Path] | None = None) -> Pat
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
-class TemporaryProfileChrome(webdriver.Chrome):
+class TemporaryProfileChrome(ChromeWebDriver):
     """Chrome session backed by an isolated, disposable user-data directory."""
 
     def __init__(self, *args, profile_dir: Path, skeb_extension_path: Path | None = None, **kwargs):
@@ -143,7 +144,7 @@ def initialize_driver():
         options.add_argument(f"--load-extension={skeb_extension_path}")
 
     driver_path = ensure_chromedriver()
-    service = Service(str(driver_path), log_output=os.devnull) if driver_path else Service(log_output=os.devnull)
+    service = ChromeService(str(driver_path), log_output=os.devnull) if driver_path else ChromeService(log_output=os.devnull)
     driver = TemporaryProfileChrome(
         service=service,
         options=options,
@@ -180,7 +181,6 @@ def get_twitter_name(driver):
     folder = name[0].text.replace('/', '-')  # 防止斜杠视作创建多级文件夹
 
     return folder
-
 
 
 

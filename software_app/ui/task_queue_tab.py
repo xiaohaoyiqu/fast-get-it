@@ -4,7 +4,7 @@ import json
 import os
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from software_app.core.security import redact_sensitive_data
 from software_app.ui.desktop_support import retry_route_for_task
@@ -13,6 +13,10 @@ from software_app.ui.platform_config import PLATFORM_CONTENT_SCOPES, TASK_STATUS
 
 class TaskQueueTabMixin:
     def _build_tasks_tab(self) -> None:
+        self._task_follow_order: list[str] = []
+        self._task_programmatic_selection: set[str] = set()
+        self.task_log_level_var = tk.StringVar(value="全部")
+        self.task_log_search_var = tk.StringVar(value="")
         self.tasks_tab.columnconfigure(0, weight=1)
         self.tasks_tab.rowconfigure(1, weight=1)
         task_header = ttk.Frame(self.tasks_tab, style="FlatPanel.TFrame")
@@ -44,13 +48,13 @@ class TaskQueueTabMixin:
         self.task_tree.tag_configure("failed", background="#fef2f2")
         self.task_tree.tag_configure("cancelled", background="#f5f5f4")
         self.task_tree.tag_configure("completed", background="#f0fdf4")
-        self.task_tree.bind("<<TreeviewSelect>>", lambda _event: self._render_selected_task())
-        self.task_tree.bind("<Double-Button-1>", lambda _event: self._use_selected_task())
+        self.task_tree.bind("<<TreeviewSelect>>", self._task_selection_changed)
+        self.task_tree.bind("<Double-Button-1>", self._use_double_clicked_task)
         task_tree_frame.grid(row=0, column=0, sticky="nsew")
 
         task_detail_panel = ttk.Frame(task_panes, style="Panel.TFrame", padding=(0, 8, 0, 0))
         task_detail_panel.columnconfigure(0, weight=1)
-        task_detail_panel.rowconfigure(1, weight=1)
+        task_detail_panel.rowconfigure(2, weight=1)
         detail_header = ttk.Frame(task_detail_panel, style="FlatPanel.TFrame")
         detail_header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         detail_header.columnconfigure(0, weight=1)
@@ -74,8 +78,27 @@ class TaskQueueTabMixin:
         ):
             button.state(["disabled"])
 
+        log_tools = ttk.Frame(task_detail_panel, style="FlatPanel.TFrame")
+        log_tools.grid(row=1, column=0, sticky="ew", pady=(0, 5))
+        ttk.Label(log_tools, text="日志级别").grid(row=0, column=0, padx=(0, 4))
+        self.task_log_level_combo = ttk.Combobox(
+            log_tools, textvariable=self.task_log_level_var, values=("全部", "INFO", "WARNING", "ERROR"),
+            state="readonly", width=9,
+        )
+        self.task_log_level_combo.grid(row=0, column=1, padx=(0, 8))
+        ttk.Label(log_tools, text="搜索").grid(row=0, column=2, padx=(0, 4))
+        task_log_search = ttk.Entry(log_tools, textvariable=self.task_log_search_var, width=24)
+        task_log_search.grid(row=0, column=3, padx=(0, 6))
+        ttk.Button(log_tools, text="清除", command=lambda: self.task_log_search_var.set("")).grid(row=0, column=4, padx=(0, 6))
+        self.task_log_export_button = ttk.Button(log_tools, text="导出日志", command=self._export_selected_task_logs)
+        self.task_log_export_button.grid(row=0, column=5, padx=(0, 6))
+        self.task_log_count_var = tk.StringVar(value="选择单个任务后可筛选和导出日志")
+        ttk.Label(log_tools, textvariable=self.task_log_count_var, style="Small.TLabel").grid(row=0, column=6, sticky="w")
+        self.task_log_level_combo.bind("<<ComboboxSelected>>", self._task_log_filter_changed)
+        self.task_log_search_var.trace_add("write", lambda *_args: self._task_log_filter_changed())
+
         detail_text_frame = ttk.Frame(task_detail_panel, style="Panel.TFrame")
-        detail_text_frame.grid(row=1, column=0, sticky="nsew")
+        detail_text_frame.grid(row=2, column=0, sticky="nsew")
         detail_text_frame.columnconfigure(0, weight=1)
         detail_text_frame.rowconfigure(0, weight=1)
         self.task_detail_text = tk.Text(
@@ -98,7 +121,7 @@ class TaskQueueTabMixin:
         self.task_detail_text.configure(yscrollcommand=detail_y.set, xscrollcommand=detail_x.set, state="disabled")
         self._task_detail_scroll_grabbed = False
         detail_y.bind("<ButtonPress-1>", lambda _e: setattr(self, "_task_detail_scroll_grabbed", True))
-        detail_y.bind("<ButtonRelease-1>", lambda _e: setattr(self, "_task_detail_scroll_grabbed", False))
+        detail_y.bind("<ButtonRelease-1>", self._resume_task_detail_follow)
         self.task_detail_text.bind("<ButtonPress-1>", lambda _e: setattr(self, "_task_detail_scroll_grabbed", False))
         self._write_text(self.task_detail_text, "选择上方任务后，这里会显示完整参数、错误、日志和本任务文件。")
 
@@ -107,6 +130,13 @@ class TaskQueueTabMixin:
         task_panes.bind("<Configure>", lambda _event: self.after_idle(
             lambda: self._keep_task_detail_visible(task_panes)
         ))
+
+    def _resume_task_detail_follow(self, _event=None) -> None:
+        self._task_detail_scroll_grabbed = False
+        try:
+            self.after_idle(lambda: self.task_detail_text.see(tk.END))
+        except tk.TclError:
+            pass
 
     @staticmethod
     def _keep_task_detail_visible(task_panes: ttk.Panedwindow) -> None:
@@ -161,14 +191,72 @@ class TaskQueueTabMixin:
             restored = [task_id for task_id in selected_task_ids if task_id in self.task_rows]
             if not restored:
                 restored = [str(rows[0]["task_id"])]
+            self._task_programmatic_selection = set(restored)
             self.task_tree.selection_set(*restored)
             self.task_tree.focus(restored[0])
             self.task_tree.yview_moveto(max(0.0, min(scroll_fraction, 1.0)))
         self._render_selected_task()
+        self._focus_followed_task()
+
+    def _task_selection_changed(self, _event=None) -> None:
+        selected = {str(task_id) for task_id in self.task_tree.selection()}
+        if selected == self._task_programmatic_selection:
+            self._task_programmatic_selection.clear()
+        else:
+            # A manual selection means the user wants to inspect a different task.
+            self._task_follow_order.clear()
+        self._render_selected_task()
+
+    def _select_task_for_monitor(self, task_id: str) -> None:
+        if not self.task_tree.exists(task_id):
+            return
+        self._task_programmatic_selection = {str(task_id)}
+        self.task_tree.selection_set(task_id)
+        self.task_tree.focus(task_id)
+
+    def _follow_task_batch(self, task_ids: list[str]) -> None:
+        self._task_follow_order = list(dict.fromkeys(str(task_id) for task_id in task_ids if str(task_id)))
+        self._focus_followed_task()
+
+    def _focus_followed_task(self) -> None:
+        if not self._task_follow_order:
+            return
+        rows = [self.task_rows.get(task_id) for task_id in self._task_follow_order]
+        active = [
+            task_id for task_id, row in zip(self._task_follow_order, rows)
+            if row and str(row.get("status") or "") in {"running", "cancelling"}
+        ]
+        queued = [
+            task_id for task_id, row in zip(self._task_follow_order, rows)
+            if row and str(row.get("status") or "") == "queued"
+        ]
+        if active or queued:
+            task_id = (active or queued)[0]
+        else:
+            # Keep the final task visible after the batch finishes.
+            task_id = next(
+                (task_id for task_id in reversed(self._task_follow_order) if task_id in self.task_rows),
+                "",
+            )
+            self._task_follow_order.clear()
+        if task_id and (set(self.task_tree.selection()) != {task_id}):
+            self._select_task_for_monitor(task_id)
+            self._render_selected_task()
 
     def _selected_task_row(self) -> dict | None:
         rows = self._selected_task_rows()
         return rows[0] if rows else None
+
+    def _use_double_clicked_task(self, event) -> str:
+        """Use the row under the pointer, independent of stale multi-selection state."""
+        task_id = str(self.task_tree.identify_row(event.y) or "")
+        if task_id not in self.task_rows:
+            return "break"
+        self.task_tree.selection_set(task_id)
+        self.task_tree.focus(task_id)
+        self._render_selected_task()
+        self._use_selected_task()
+        return "break"
 
     def _selected_task_rows(self) -> list[dict]:
         return [
@@ -209,19 +297,25 @@ class TaskQueueTabMixin:
                 self.task_folder_button,
             ):
                 button.state(["disabled"])
+            self.task_log_export_button.state(["disabled"])
+            self.task_log_count_var.set("选择单个任务后可筛选和导出日志")
             return
 
         retryable = [row for row in rows if self._task_can_retry(row)]
         cancellable = [row for row in rows if str(row.get("status")) in {"queued", "running", "cancelling"}]
+        selected_modules = {str(row.get("module_id") or "") for row in rows}
         self.task_retry_button.state(["!disabled"] if retryable else ["disabled"])
         self.task_cancel_button.state(["!disabled"] if cancellable else ["disabled"])
         self.task_delete_button.state(["!disabled"])
         if len(rows) > 1:
-            self.task_use_button.state(["disabled"])
+            self.task_log_export_button.state(["disabled"])
+            self.task_log_count_var.set("多选时显示任务摘要；选择单个任务查看日志")
+            self.task_use_button.state(["!disabled"] if len(selected_modules) == 1 else ["disabled"])
             self.task_folder_button.state(["disabled"])
-            self.task_detail_var.set(
-                f"已选 {len(rows)} 项 · 可重试 {len(retryable)} · 可取消 {len(cancellable)} · 可删除 {len(rows)}"
-            )
+            summary = f"已选 {len(rows)} 项 · 可重试 {len(retryable)} · 可取消 {len(cancellable)} · 可删除 {len(rows)}"
+            if len(selected_modules) > 1:
+                summary += " · 平台不一致，填入工作台请改为单平台选择"
+            self.task_detail_var.set(summary)
             self._write_text(
                 self.task_detail_text,
                 "\n".join(
@@ -238,6 +332,9 @@ class TaskQueueTabMixin:
         status = str(row["status"])
         options = self._decode_task_options(row.get("options_json"))
         logs = list(reversed(self.storage.list_logs(task_id, limit=500)))
+        filtered_logs = self._filter_task_logs(logs)
+        self.task_log_export_button.state(["!disabled"] if logs else ["disabled"])
+        self.task_log_count_var.set(f"显示 {len(filtered_logs)} / {len(logs)} 条")
         files = self.storage.list_files(task_id=task_id, limit=500)
         target = str(row.get("normalized_target") or row.get("target") or "-")
         self.task_detail_var.set(
@@ -258,15 +355,19 @@ class TaskQueueTabMixin:
         error = str(row.get("error") or "").strip()
         if error:
             lines.extend(("", "错误:", error))
-        lines.extend(("", "参数:", json.dumps(redact_sensitive_data(options), ensure_ascii=False, indent=2)))
-        lines.extend(("", f"日志（{len(logs)}）:"))
-        if logs:
+        visible_options = {
+            key: value for key, value in options.items()
+            if not str(key).startswith("_task_concurrency_")
+        }
+        lines.extend(("", "参数:", json.dumps(redact_sensitive_data(visible_options), ensure_ascii=False, indent=2)))
+        lines.extend(("", f"日志（显示 {len(filtered_logs)} / {len(logs)}）:"))
+        if filtered_logs:
             lines.extend(
                 f"[{log['created_at']}] [{str(log['level']).upper()}] {log['message']}"
-                for log in logs
+                for log in filtered_logs
             )
         else:
-            lines.append("（暂无日志）")
+            lines.append("（没有符合当前筛选的日志）" if logs else "（暂无日志）")
         lines.extend(("", f"本任务文件（{len(files)}）:"))
         if files:
             lines.extend(f"[{file['media_type']}] {file['path']}" for file in files)
@@ -281,10 +382,85 @@ class TaskQueueTabMixin:
         else:
             self.task_folder_button.state(["disabled"])
 
+    def _filter_task_logs(self, logs: list[dict]) -> list[dict]:
+        level = self.task_log_level_var.get().strip().upper()
+        query = self.task_log_search_var.get().strip().casefold()
+        return [
+            log for log in logs
+            if (level in {"", "全部"} or str(log.get("level") or "").upper() == level)
+            and (not query or query in str(log.get("message") or "").casefold())
+        ]
+
+    def _task_log_filter_changed(self, _event=None) -> None:
+        self._render_selected_task()
+
+    def _export_selected_task_logs(self) -> None:
+        rows = self._selected_task_rows()
+        if len(rows) != 1:
+            return
+        task_id = str(rows[0].get("task_id") or "")
+        logs = self._filter_task_logs(list(reversed(self.storage.list_logs(task_id, limit=500))))
+        if not logs:
+            messagebox.showinfo("没有日志", "当前筛选条件下没有可导出的日志")
+            return
+        selected = filedialog.asksaveasfilename(
+            title="导出任务日志", defaultextension=".txt",
+            initialfile=f"task-{task_id[:8]}-logs.txt", filetypes=[("文本文件", "*.txt"), ("JSON", "*.json")],
+        )
+        if not selected:
+            return
+        path = Path(selected)
+        try:
+            safe_logs = [
+                {key: redact_sensitive_data(value) for key, value in log.items()}
+                for log in logs
+            ]
+            if path.suffix.casefold() == ".json":
+                path.write_text(json.dumps(safe_logs, ensure_ascii=False, indent=2), encoding="utf-8")
+            else:
+                path.write_text(
+                    "\n".join(f"[{log.get('created_at', '')}] [{str(log.get('level', '')).upper()}] {log.get('message', '')}" for log in safe_logs),
+                    encoding="utf-8",
+                )
+        except OSError as exc:
+            messagebox.showerror("导出失败", str(exc))
+            return
+        self.status_var.set(f"已导出 {len(safe_logs)} 条日志：{path}")
+        self._append_log(f"任务日志已导出：task={task_id}, count={len(safe_logs)}")
+
     def _retry_selected_task(self) -> None:
         rows = [row for row in self._selected_task_rows() if self._task_can_retry(row)]
         if not rows:
             messagebox.showwarning("未选择任务", "请先选择失败、已取消，或旧版零文件完成的相似图片任务")
+            return
+        module_counts: dict[str, int] = {}
+        for row in rows:
+            module_id = str(row.get("module_id") or "未知平台")
+            module_counts[module_id] = module_counts.get(module_id, 0) + 1
+        module_labels = {
+            str(module_id): str(getattr(self.manager.get_adapter(str(module_id)), "display_name", module_id))
+            for module_id in module_counts
+            if str(module_id) in self.manager.adapters
+        }
+        summary = "\n".join(
+            f"{module_labels.get(module_id, module_id)}：{count} 项"
+            for module_id, count in sorted(module_counts.items())
+        )
+        target_lines = [
+            f"  {index}. [{module_labels.get(str(row.get('module_id') or ''), str(row.get('module_id') or '未知平台'))}] "
+            f"{row.get('normalized_target') or row.get('target') or '-'}"
+            for index, row in enumerate(rows[:10], start=1)
+        ]
+        if len(rows) > 10:
+            target_lines.append(f"  ……另有 {len(rows) - 10} 项")
+        if not messagebox.askyesno(
+            "确认批量重试",
+            f"将为 {len(rows)} 个可重试任务新建下载任务：\n\n{summary}\n\n"
+            f"目标：\n{chr(10).join(target_lines)}\n\n"
+            "任务会重新进入队列，并按各平台并发设置运行。可能再次下载已有文件；是否继续？",
+            parent=self,
+        ):
+            self.status_var.set("已取消批量重试")
             return
         created: list[str] = []
         failures: list[str] = []
@@ -383,11 +559,7 @@ class TaskQueueTabMixin:
         self.task_progress_var.set(3.0)
         self.status_var.set(f"已重新创建 {len(created)} 个任务")
         self._refresh_tasks()
-        selected = [task_id for task_id in created if self.task_tree.exists(task_id)]
-        if selected:
-            self.task_tree.selection_set(*selected)
-            self.task_tree.focus(selected[0])
-            self._render_selected_task()
+        self._follow_task_batch(created)
         if failures:
             self._append_log(f"另有 {len(failures)} 个任务重试失败：{failures[0]}")
 
@@ -429,10 +601,24 @@ class TaskQueueTabMixin:
         self._append_log(f"删除任务记录: tasks={len(inactive)}, pending={len(active)}, db={counts}")
 
     def _use_selected_task(self) -> None:
-        row = self._selected_task_row()
-        if not row:
+        rows = self._selected_task_rows()
+        if not rows:
             messagebox.showwarning("未选择任务", "请先选择一个任务")
             return
+        module_ids = {str(row.get("module_id") or "") for row in rows}
+        if len(module_ids) > 1:
+            module_names = sorted(
+                str(getattr(self.manager.adapters.get(module_id), "display_name", module_id))
+                for module_id in module_ids
+            )
+            messagebox.showwarning(
+                "平台不一致",
+                "工作台一次只能使用一个平台。请只选择同一平台的任务，再填入目标。\n\n"
+                + "、".join(module_names),
+                parent=self,
+            )
+            return
+        row = rows[0]
         module_id = str(row.get("module_id") or "")
         try:
             self.manager.get_adapter(module_id)
@@ -440,19 +626,44 @@ class TaskQueueTabMixin:
             messagebox.showerror("模块不可用", f"当前版本没有注册任务模块: {module_id}")
             return
         self._select_module(module_id)
-        self.target_var.set(str(row.get("target") or row.get("normalized_target") or ""))
-        output_dir = str(row.get("output_dir") or "").strip()
-        if output_dir:
-            self.output_dir_var.set(output_dir)
-        options = self._decode_task_options(row.get("options_json"))
-        types = str(options.get("types") or "").strip()
-        if types:
-            self.types_var.set(types)
-        scope = str(options.get("content_scope") or options.get("search_mode") or "").strip()
-        if scope in PLATFORM_CONTENT_SCOPES.get(module_id, ()):
-            self.content_scope_var.set(scope)
-            self._content_scope_changed()
-        self.status_var.set(f"已把任务 {row['task_id']} 填入工作台")
+        targets: list[str] = []
+        seen_targets: set[str] = set()
+        for item in rows:
+            target = str(item.get("target") or item.get("normalized_target") or "").strip()
+            key = target.casefold()
+            if target and key not in seen_targets:
+                seen_targets.add(key)
+                targets.append(target)
+        if not targets:
+            messagebox.showwarning("目标为空", "选中的任务没有可填入的目标")
+            return
+        joined_targets = "/".join(targets)
+        self.target_var.set(joined_targets)
+        # Keep the exact selected targets as structured state. Some platform search
+        # queries may themselves contain '/', so reparsing the displayed separator
+        # text would be ambiguous. If the user edits the field, normal parsing resumes.
+        self._prefilled_task_targets = (module_id, joined_targets, targets)
+        if len(rows) == 1:
+            output_dir = str(row.get("output_dir") or "").strip()
+            if output_dir:
+                self.output_dir_var.set(output_dir)
+        option_rows = [self._decode_task_options(item.get("options_json")) for item in rows]
+        types_values = {str(item.get("types") or "").strip() for item in option_rows}
+        if len(types_values) == 1 and next(iter(types_values)):
+            self.types_var.set(next(iter(types_values)))
+        scopes = {
+            str(item.get("content_scope") or item.get("search_mode") or "").strip()
+            for item in option_rows
+        }
+        if len(scopes) == 1:
+            scope = next(iter(scopes))
+            if scope in PLATFORM_CONTENT_SCOPES.get(module_id, ()):
+                self.content_scope_var.set(scope)
+                self._content_scope_changed()
+        self.status_var.set(
+            f"已把 {len(targets)} 个 {self.manager.get_adapter(module_id).display_name} 目标填入工作台；"
+            "请检查下载类型和其他设置"
+        )
 
     def _open_selected_task_folder(self) -> None:
         row = self._selected_task_row()
