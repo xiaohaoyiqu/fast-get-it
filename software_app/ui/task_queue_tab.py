@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tkinter as tk
+import time
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -15,6 +16,8 @@ class TaskQueueTabMixin:
     def _build_tasks_tab(self) -> None:
         self._task_follow_order: list[str] = []
         self._task_programmatic_selection: set[str] = set()
+        self._task_detail_refresh_pending = False
+        self._last_task_detail_render_at = 0.0
         self.task_log_level_var = tk.StringVar(value="全部")
         self.task_log_search_var = tk.StringVar(value="")
         self.tasks_tab.columnconfigure(0, weight=1)
@@ -197,6 +200,49 @@ class TaskQueueTabMixin:
             self.task_tree.yview_moveto(max(0.0, min(scroll_fraction, 1.0)))
         self._render_selected_task()
         self._focus_followed_task()
+
+    def _refresh_task_statuses(self) -> None:
+        """Refresh task rows in place; rebuild the tree only when ordering changes."""
+        rows = self.storage.list_tasks(limit=200)
+        task_ids = [str(row["task_id"]) for row in rows]
+        if task_ids != [str(task_id) for task_id in self.task_tree.get_children()]:
+            self._refresh_tasks()
+            return
+
+        selected_before = {str(task_id) for task_id in self.task_tree.selection()}
+        selected_status_changed = False
+        counts: dict[str, int] = {}
+        for row in rows:
+            row_data = dict(row)
+            task_id = str(row_data["task_id"])
+            status = str(row_data.get("status") or "")
+            counts[status] = counts.get(status, 0) + 1
+            previous = self.task_rows.get(task_id, {})
+            if task_id in selected_before and str(previous.get("status") or "") != status:
+                selected_status_changed = True
+            self.task_rows[task_id] = row_data
+            values = (
+                TASK_STATUS_LABELS.get(status, status),
+                row_data.get("module_id") or "-",
+                row_data.get("normalized_target") or row_data.get("target") or "-",
+                row_data.get("updated_at") or "",
+            )
+            if self.task_tree.exists(task_id):
+                self.task_tree.item(task_id, values=values, tags=(status,))
+
+        active = counts.get("queued", 0) + counts.get("running", 0) + counts.get("cancelling", 0)
+        if not rows:
+            self.task_summary_var.set("暂无任务")
+        else:
+            self.task_summary_var.set(
+                f"共 {len(rows)} · 进行中 {active} · 完成 {counts.get('completed', 0)} · "
+                f"失败 {counts.get('failed', 0)} · 已取消 {counts.get('cancelled', 0)}"
+            )
+
+        self._focus_followed_task()
+        selected_after = {str(task_id) for task_id in self.task_tree.selection()}
+        if selected_status_changed and selected_after == selected_before:
+            self._task_detail_refresh_pending = True
 
     def _task_selection_changed(self, _event=None) -> None:
         selected = {str(task_id) for task_id in self.task_tree.selection()}

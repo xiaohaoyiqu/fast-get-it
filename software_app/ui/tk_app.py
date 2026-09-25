@@ -3001,15 +3001,23 @@ class SoftwareDesktop(
         changed_files = False
         changed_tasks = False
         changed_task_detail = False
-        while True:
+        progress_log_lines: list[str] = []
+        processed_events = 0
+        poll_started = time.monotonic()
+        max_events_per_poll = 160
+        max_poll_seconds = 0.04
+        while processed_events < max_events_per_poll and (
+            processed_events == 0 or time.monotonic() - poll_started < max_poll_seconds
+        ):
             try:
                 event_type, payload = self.ui_queue.get_nowait()
             except queue.Empty:
                 break
+            processed_events += 1
             if event_type == "progress":
                 event = payload
                 assert isinstance(event, ProgressEvent)
-                self._append_log(f"[{event.level}] {event.message}")
+                progress_log_lines.append(f"[{event.level}] {event.message}")
                 if self.task_tree.exists(event.task_id):
                     if event.task_id in self.task_rows:
                         self.task_rows[event.task_id]["status"] = event.status
@@ -3737,19 +3745,28 @@ class SoftwareDesktop(
                 else:
                     self.status_var.set("关注列表暂时没有取得结果")
                     self._append_log(message)
+        if progress_log_lines:
+            self._append_log_batch(progress_log_lines)
         if changed_files:
             self._refresh_library(scan=False)
         now = time.monotonic()
         if self.manager.active_task_ids() and now - self._last_task_status_refresh >= 1.0:
-            changed_tasks = True
             self._last_task_status_refresh = now
+            self._refresh_task_statuses()
         if changed_tasks:
             self._refresh_tasks()
+            self._task_detail_refresh_pending = False
+            self._last_task_detail_render_at = now
         elif changed_task_detail:
+            self._task_detail_refresh_pending = True
+        if self._task_detail_refresh_pending and now - self._last_task_detail_render_at >= 0.4:
             self._focus_followed_task()
             self._render_selected_task()
+            self._task_detail_refresh_pending = False
+            self._last_task_detail_render_at = now
         try:
-            self._poll_job = self.after(200, self._poll_queue)
+            poll_delay = 10 if not self.ui_queue.empty() else 200
+            self._poll_job = self.after(poll_delay, self._poll_queue)
         except tk.TclError:
             self._poll_job = None
 
@@ -3774,8 +3791,13 @@ class SoftwareDesktop(
         return f"{size} B"
 
     def _append_log(self, text: str) -> None:
+        self._append_log_batch([text])
+
+    def _append_log_batch(self, lines: list[str]) -> None:
+        if not lines:
+            return
         self.log_text.configure(state="normal")
-        self.log_text.insert(tk.END, text + "\n")
+        self.log_text.insert(tk.END, "\n".join(lines) + "\n")
         self.log_text.see(tk.END)
         self.log_text.configure(state="disabled")
 
