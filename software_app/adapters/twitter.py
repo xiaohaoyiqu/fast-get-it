@@ -20,8 +20,8 @@ from software_app.crawlers.common import safe_component
 from software_app.crawlers.twitter import TwitterCrawlerService
 from software_app.crawlers.twitter.download_method import configure_downloads, request_with_retries
 from software_app.crawlers.twitter.following_collector import collect_following
-from software_app.crawlers.twitter.profile_preview import collect_profile_preview
-from software_app.crawlers.twitter.twitter_Crawler_2 import DEFAULT_CONFIG, config_bool, load_config
+from software_app.crawlers.twitter.profile_preview import collect_profile_preview, target_to_handle
+from software_app.crawlers.twitter.twitter_Crawler_2 import DEFAULT_CONFIG, config_bool, load_config, safe_path_name
 
 
 DOWNLOAD_TYPE_LABELS = {
@@ -183,6 +183,26 @@ class TwitterNativeAdapter(CrawlerAdapter):
             or "x.com/" in value
             or (value and "/" not in value and "\\" not in value)
         )
+
+    def fallback_scan_root(self, task: DownloadTask) -> Path:
+        target = str(task.target or "")
+        handle = target_to_handle(target)
+        if not handle:
+            return task.output_dir
+        root = task.output_dir.expanduser().resolve()
+        preview_root = (self.runtime_data_dir / "profile_previews").resolve()
+        preview_path = (preview_root / f"{safe_path_name(handle)}.json").resolve()
+        if preview_path.parent != preview_root:
+            return root
+        folder_name = handle
+        try:
+            profile = json.loads(preview_path.read_text(encoding="utf-8"))
+            if isinstance(profile, dict):
+                folder_name = str(profile.get("display_name") or handle).strip() or handle
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+        candidate = (root / safe_path_name(folder_name)).resolve()
+        return candidate if candidate.parent == root else root
 
     def _default_runtime_file(self, name: str) -> Path:
         data_file = self.runtime_data_dir / name

@@ -198,6 +198,15 @@ class TwitterCrawlerService:
             with self._lock:
                 self._drivers.pop(task.task_id, None)
             try:
+                callbacks.on_progress(
+                    ProgressEvent(
+                        task.task_id, task.module_id, "info", "媒体任务已结束，正在关闭 Twitter 浏览器",
+                        status="running", metadata={"phase": "cleanup"},
+                    )
+                )
+            except Exception:
+                pass
+            try:
                 driver.quit()
             except Exception:
                 pass

@@ -303,8 +303,9 @@ class TaskManager:
             # of emitting FileRecord events. Discover those files before common postprocessing
             # so archive behavior remains platform-independent.
             if not emitted_records:
+                scan_root = adapter.fallback_scan_root(task)
                 scanned_records = self.storage.scan_media_files(
-                    task.output_dir,
+                    scan_root,
                     task.module_id,
                     task.task_id,
                     modified_after=scan_started_at,
@@ -400,8 +401,9 @@ class TaskManager:
         finally:
             if status != "completed" and scan_started_at is not None:
                 try:
+                    scan_root = adapter.fallback_scan_root(task)
                     partial_records = self.storage.scan_media_files(
-                        task.output_dir,
+                        scan_root,
                         task.module_id,
                         task.task_id,
                         modified_after=scan_started_at,

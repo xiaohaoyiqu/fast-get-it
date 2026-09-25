@@ -3104,6 +3104,7 @@ class SoftwareDesktop(
                         )
             elif event_type == "done":
                 task_id, status = payload  # type: ignore[misc]
+                batch_task = task_id in self._task_follow_order
                 pending_delete = task_id in self.pending_task_deletions
                 if pending_delete:
                     self.storage.delete_task_records([task_id])
@@ -3114,7 +3115,7 @@ class SoftwareDesktop(
                     label = TASK_STATUS_LABELS.get(str(status), str(status))
                     self.status_var.set(f"任务 {task_id}：{label}")
                     self._append_log(f"任务结束: {task_id} {label}")
-                    if str(status) == "completed":
+                    if str(status) == "completed" and not batch_task:
                         try:
                             task_files = list(self.storage.list_files(task_id=task_id, limit=100000))
                             file_count = len(task_files)
@@ -3125,7 +3126,7 @@ class SoftwareDesktop(
                         except Exception:
                             detail = f"任务ID：{task_id}\n保存目录：{self.output_dir_var.get()}\n\n可在“下载库”页面查看和管理文件。"
                         messagebox.showinfo("下载完成", detail)
-                    elif str(status) in {"failed", "error"}:
+                    elif str(status) in {"failed", "error"} and not batch_task:
                         messagebox.showwarning("下载结束", f"任务 {task_id} 未能完成，请查看任务日志了解原因。")
                 self.current_task_ids.discard(task_id)
                 if task_id == self.current_task_id:

@@ -45,5 +45,9 @@ class CrawlerAdapter(ABC):
     def cancel(self, task_id: str) -> None:
         return None
 
+    def fallback_scan_root(self, task: DownloadTask) -> Path:
+        """Return the narrowest safe output root for fallback file discovery."""
+        return task.output_dir
+
     def search_targets(self, query: str, limit: int = 20, options: dict | None = None) -> list[dict]:
         raise NotImplementedError(f"{self.display_name} 不支持搜索")
