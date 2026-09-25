@@ -50,8 +50,9 @@ common_kwargs = dict(
 gui_exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
     name="欲求达",
     console=False,
     **common_kwargs,
@@ -60,20 +61,10 @@ gui_exe = EXE(
 cli_exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
     name="欲求达-cli",
     console=True,
     **common_kwargs,
-)
-
-coll = COLLECT(
-    gui_exe,
-    cli_exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name="欲求达",
 )

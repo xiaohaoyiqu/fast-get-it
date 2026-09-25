@@ -62,6 +62,10 @@ def global_driver_path() -> Path:
         internal = exe_dir / "_internal" / driver_name()
         if internal.exists():
             return internal
+        bundle_root = Path(getattr(sys, "_MEIPASS", exe_dir)).resolve()
+        bundled = bundle_root / driver_name()
+        if bundled.exists():
+            return bundled
         return direct
     ensure_data_dirs()
     return BROWSER_TOOLS_DIR / driver_name()

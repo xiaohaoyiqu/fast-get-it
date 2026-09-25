@@ -48,9 +48,9 @@ python -m pip install -r .\requirements-app.txt
 python -m PyInstaller .\欲求达.spec --clean --noconfirm
 ```
 
-打包产物在 `dist/欲求达/`，包含 `欲求达.exe`（GUI 版）和 `欲求达-cli.exe`（命令行版）。`--noconfirm` 会替换这个打包输出目录；请先关闭正在运行的软件，并将需要保留的旧版文件移出该目录。
+打包产物在 `dist/`，包含独立运行的 `欲求达.exe`（GUI 版）和 `欲求达-cli.exe`（命令行版）。两个程序均为单文件包，不依赖 exe 旁边的 `_internal` 目录；可以将 exe 移到其他有写入权限的文件夹运行。`--noconfirm` 会替换打包输出；请先关闭正在运行的软件，并将需要保留的旧版文件移出 `dist/`。
 
-更新绿色便携版时，请关闭程序后整体替换旧版 `_internal` 目录，再放入新版 exe；保留 exe 旁的 `data/` 和下载目录。打包器会强制 Requests 使用 Python 标准库 JSON，避免旧版残留的半安装 `simplejson` 目录导致启动时报 `cannot import name 'JSONDecodeError'`。
+运行时会将程序文件解压到系统临时目录，用户数据继续保存在 exe 所在目录的 `data/`，下载目录仍可在设置中修改。更新时只需关闭程序并替换 exe，保留原来的 `data/` 和下载目录。打包器会强制 Requests 使用 Python 标准库 JSON，避免旧版残留的半安装 `simplejson` 目录导致启动时报 `cannot import name 'JSONDecodeError'`。
 
 ## 登录资料和本地数据
 
