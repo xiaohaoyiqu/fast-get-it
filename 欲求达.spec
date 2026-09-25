@@ -25,7 +25,7 @@ a = Analysis(
     ],
     hookspath=["pyinstaller_hooks"],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=["pyinstaller_hooks/rthook_force_stdlib_json.py"],
     excludes=["torch", "torchvision", "torchaudio", "pandas", "scipy", "matplotlib"],
     noarchive=False,
     optimize=0,

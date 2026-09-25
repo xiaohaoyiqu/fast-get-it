@@ -50,6 +50,8 @@ python -m PyInstaller .\欲求达.spec --clean --noconfirm
 
 打包产物在 `dist/欲求达/`，包含 `欲求达.exe`（GUI 版）和 `欲求达-cli.exe`（命令行版）。`--noconfirm` 会替换这个打包输出目录；请先关闭正在运行的软件，并将需要保留的旧版文件移出该目录。
 
+更新绿色便携版时，请关闭程序后整体替换旧版 `_internal` 目录，再放入新版 exe；保留 exe 旁的 `data/` 和下载目录。打包器会强制 Requests 使用 Python 标准库 JSON，避免旧版残留的半安装 `simplejson` 目录导致启动时报 `cannot import name 'JSONDecodeError'`。
+
 ## 登录资料和本地数据
 
 源码运行时数据保存在项目目录的 `data/software_app/`；打包版（exe）运行时数据保存在 exe 所在目录的 `data/software_app/`，可绿色便携使用。下载目录可以在设置中修改。
