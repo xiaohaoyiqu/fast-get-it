@@ -12,6 +12,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = ("software_app", "tests", "run_software.py", "pyinstaller_hooks", "scripts")
 AUDIT_TARGETS = (
+    "software_app/ui/layout.py",
+    "tests/manual/verify_layout_smoke.py",
     "scripts/check_documentation.py",
     "tests/manual/verify_daily_acceptance.py",
     "tests/manual/verify_daily_platform_live.py",
@@ -117,6 +119,8 @@ AUDIT_TARGETS = (
     "scripts/check_quality.py",
 )
 FORMAT_TARGETS = (
+    "software_app/ui/layout.py",
+    "tests/manual/verify_layout_smoke.py",
     "scripts/check_documentation.py",
     "tests/manual/verify_daily_acceptance.py",
     "tests/manual/verify_daily_platform_live.py",

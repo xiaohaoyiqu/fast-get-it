@@ -7,6 +7,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
 
+from software_app.ui.layout import ResponsiveToolbar, wrap_label
 from software_app.core.models import IMAGE_EXTENSIONS
 from software_app.core.library_service import plan_library_paths, rename_library_file, execute_library_cleanup
 from software_app.crawlers.common import normalized_path_component, path_component_error
@@ -47,14 +48,15 @@ class LibraryTabMixin:
         ttk.Label(folder_header, text="搜索", style="Panel.TLabel").grid(row=0, column=1, sticky="e", padx=(12, 4))
         self.library_search_entry = ttk.Entry(folder_header, textvariable=self.library_search_var)
         self.library_search_entry.grid(row=0, column=2, sticky="ew", padx=(0, 4))
-        ttk.Button(folder_header, text="清除搜索", command=lambda: self.library_search_var.set("")).grid(
+        ttk.Button(folder_header, width=0, text="清除搜索", command=lambda: self.library_search_var.set("")).grid(
             row=0, column=3, padx=(2, 6)
         )
-        ttk.Button(folder_header, text="刷新 / 扫描", command=self._scan_output_dir).grid(row=0, column=4, padx=(6, 0))
-        ttk.Button(folder_header, text="打开所选文件夹", command=self._open_selected_folder).grid(row=0, column=5, padx=(6, 0))
-        ttk.Button(folder_header, text="筛选 / 导出 / 清理", command=self._open_library_tools).grid(row=1, column=5, padx=(6, 0), pady=(5, 0))
+        ttk.Button(folder_header, width=0, text="刷新 / 扫描", command=self._scan_output_dir).grid(row=0, column=4, padx=(6, 0))
+        ttk.Button(folder_header, width=0, text="打开所选文件夹", command=self._open_selected_folder).grid(row=0, column=5, padx=(6, 0))
+        ttk.Button(folder_header, width=0, text="筛选 / 导出 / 清理", command=self._open_library_tools).grid(row=1, column=5, padx=(6, 0), pady=(5, 0))
         self.library_status_label = ttk.Label(folder_header, textvariable=self.library_status_var, style="Small.TLabel")
         self.library_status_label.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(5, 0))
+        wrap_label(self.library_status_label, folder_header, padding=140)
         self.library_search_var.trace_add("write", self._schedule_library_filter)
         folder_tree_frame, self.folder_tree = self._create_scrollable_tree(top_frame, columns, height=1)
         self.folder_tree.heading("module", text="平台")
@@ -77,16 +79,18 @@ class LibraryTabMixin:
         file_header = ttk.Frame(file_frame, style="Panel.TFrame")
         file_header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         file_header.columnconfigure(1, weight=1)
+        file_actions = ResponsiveToolbar(file_header, style="Panel.TFrame", max_columns=5)
+        file_actions.grid(row=0, column=1, sticky="ew", padx=(8, 0))
         ttk.Label(file_header, text="文件列表", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(file_header, textvariable=self.library_file_status_var, style="Small.TLabel").grid(
-            row=0, column=1, sticky="e", padx=(8, 4)
-        )
-        ttk.Button(file_header, text="打开", command=self._open_selected_file).grid(row=0, column=2, padx=(6, 0))
-        ttk.Button(file_header, text="复制路径", command=self._copy_selected_file_paths).grid(row=0, column=3, padx=(6, 0))
-        ttk.Button(file_header, text="重命名", command=self._rename_selected_file).grid(row=0, column=4, padx=(6, 0))
-        ttk.Button(file_header, text="移到回收站", command=self._recycle_selected_files).grid(row=0, column=5, padx=(6, 0))
+        file_status = ttk.Label(file_header, textvariable=self.library_file_status_var, style="Small.TLabel")
+        file_status.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        wrap_label(file_status, file_header)
+        ttk.Button(file_actions, width=0, text="打开", command=self._open_selected_file).grid(row=0, column=2, padx=(6, 0))
+        ttk.Button(file_actions, width=0, text="复制路径", command=self._copy_selected_file_paths).grid(row=0, column=3, padx=(6, 0))
+        ttk.Button(file_actions, width=0, text="重命名", command=self._rename_selected_file).grid(row=0, column=4, padx=(6, 0))
+        ttk.Button(file_actions, width=0, text="移到回收站", command=self._recycle_selected_files).grid(row=0, column=5, padx=(6, 0))
         self._library_preview_override: bool | None = None
-        self.library_preview_toggle = ttk.Button(file_header, text="显示预览", command=self._toggle_library_preview)
+        self.library_preview_toggle = ttk.Button(file_actions, width=0, text="显示预览", command=self._toggle_library_preview)
         self.library_preview_toggle.grid(row=0, column=6, padx=(6, 0))
         file_columns = ("type", "name", "size")
         file_tree_frame, self.folder_file_tree = self._create_scrollable_tree(file_frame, file_columns, height=2)

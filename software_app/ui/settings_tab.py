@@ -151,9 +151,11 @@ class SettingsTabMixin:
             background="#ffffff",
         )
         settings_scrollbar = ttk.Scrollbar(scroll_host, orient="vertical", command=self.settings_canvas.yview)
-        self.settings_canvas.configure(yscrollcommand=settings_scrollbar.set)
+        settings_horizontal = ttk.Scrollbar(scroll_host, orient="horizontal", command=self.settings_canvas.xview)
+        self.settings_canvas.configure(yscrollcommand=settings_scrollbar.set, xscrollcommand=settings_horizontal.set)
         self.settings_canvas.grid(row=0, column=0, sticky="nsew")
         settings_scrollbar.grid(row=0, column=1, sticky="ns")
+        settings_horizontal.grid(row=1, column=0, sticky="ew")
 
         body = ttk.Frame(self.settings_canvas, style="Panel.TFrame", padding=12)
         self._settings_canvas_window = self.settings_canvas.create_window((0, 0), window=body, anchor="nw")
@@ -164,7 +166,7 @@ class SettingsTabMixin:
         )
         self.settings_canvas.bind(
             "<Configure>",
-            lambda event: self.settings_canvas.itemconfigure(self._settings_canvas_window, width=max(1, event.width)),
+            lambda event: self.settings_canvas.itemconfigure(self._settings_canvas_window, width=max(body.winfo_reqwidth(), event.width)),
         )
         ttk.Label(body, text="默认保存目录", style="Panel.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10))
         output_entry = ttk.Entry(body, textvariable=self.output_dir_var)
@@ -675,8 +677,8 @@ class SettingsTabMixin:
         )
         self._refresh_plugin_tree()
 
-        actions = ttk.Frame(body, style="FlatPanel.TFrame")
-        actions.grid(row=11, column=0, columnspan=3, sticky="ew", pady=(16, 0))
+        actions = ttk.Frame(self.settings_tab, style="FlatPanel.TFrame")
+        actions.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         actions.columnconfigure(0, weight=1)
         ttk.Button(actions, text="保存设置", style="Accent.TButton", command=self._save_settings).grid(row=0, column=0, sticky="w")
         self.driver_check_button = ttk.Button(actions, text="检测浏览器驱动", command=lambda: self._check_browser_driver(False))
@@ -684,12 +686,13 @@ class SettingsTabMixin:
         self.driver_download_button = ttk.Button(actions, text="安装 / 更新驱动", command=lambda: self._check_browser_driver(True))
         self.driver_download_button.grid(row=0, column=2, padx=(8, 0))
         self.driver_status_label = ttk.Label(
-            body,
+            self.settings_tab,
             textvariable=self.browser_driver_status_var,
             style="Section.TLabel",
             wraplength=760,
         )
-        self.driver_status_label.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        self.driver_status_label.grid(row=3, column=0, sticky="ew", pady=(5, 0))
+        self.settings_tab.bind("<Configure>", lambda event: self.driver_status_label.configure(wraplength=max(100, event.width - 10)), add="+")
         ttk.Label(
             body,
             text="设置影响之后创建的任务；默认按原任务设置重试，只有选择“按当前设置重试”才更新配置。Cookie 独立保存，不进入人物配置。",

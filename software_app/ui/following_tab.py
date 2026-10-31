@@ -19,6 +19,7 @@ from software_app.ui.desktop_support import (
     select_treeview_row_at_event,
 )
 from software_app.ui.platform_config import PLATFORM_CONTENT_SCOPES, TASK_STATUS_LABELS
+from software_app.ui.layout import ResponsiveToolbar, wrap_label
 from software_app.ui.scrolling import bind_canvas_mousewheel
 
 
@@ -48,44 +49,38 @@ class FollowingTabMixin:
         button_row.bind("<Configure>", lambda _event: controls_canvas.configure(scrollregion=controls_canvas.bbox("all")), add="+")
         controls_canvas.bind("<Configure>", lambda event: controls_canvas.itemconfigure(controls_window, width=event.width))
         button_row.columnconfigure(6, weight=1)
+        candidate_actions = ResponsiveToolbar(button_row, style="Panel.TFrame", max_columns=6)
+        candidate_actions.grid(row=0, column=0, columnspan=7, sticky="ew")
         self.candidate_refresh_var = tk.StringVar(value="更新新的")
-        self.candidate_refresh_button = ttk.Button(
-            button_row, textvariable=self.candidate_refresh_var, command=self._refresh_platform_candidates
+        self.candidate_refresh_button = ttk.Button(candidate_actions, width=0, textvariable=self.candidate_refresh_var, command=self._refresh_platform_candidates
         )
         self.candidate_refresh_button.grid(row=0, column=0, padx=(0, 6))
-        self.following_full_refresh_button = ttk.Button(
-            button_row, text="更新全部", command=self._refresh_all_platform_following
+        self.following_full_refresh_button = ttk.Button(candidate_actions, width=0, text="更新全部", command=self._refresh_all_platform_following
         )
         self.following_full_refresh_button.grid(row=0, column=1, padx=(0, 6))
-        self.candidate_local_button = ttk.Button(
-            button_row, text="读取本地", command=self._load_platform_candidates
+        self.candidate_local_button = ttk.Button(candidate_actions, width=0, text="读取本地", command=self._load_platform_candidates
         )
         self.candidate_local_button.grid(row=0, column=2, padx=(0, 6))
-        self.candidate_use_button = ttk.Button(
-            button_row, text="填入目标", command=self._use_selected_platform_candidate
+        self.candidate_use_button = ttk.Button(candidate_actions, width=0, text="填入目标", command=self._use_selected_platform_candidate
         )
         self.candidate_use_button.grid(row=1, column=0, padx=(0, 6), pady=(7, 0))
-        self.candidate_preview_button = ttk.Button(
-            button_row, text="获取资料", command=self._preview_selected_platform_candidate
+        self.candidate_preview_button = ttk.Button(candidate_actions, width=0, text="获取资料", command=self._preview_selected_platform_candidate
         )
         self.candidate_preview_button.grid(row=1, column=1, padx=(0, 6), pady=(7, 0))
-        self.candidate_download_button = ttk.Button(
-            button_row, text="加入队列", command=self._download_selected_platform_candidate
+        self.candidate_download_button = ttk.Button(candidate_actions, width=0, text="加入队列", command=self._download_selected_platform_candidate
         )
         self.candidate_download_button.grid(row=1, column=2, pady=(7, 0))
-        self.candidate_fill_batch_button = ttk.Button(
-            button_row, text="批量填入工作台", command=self._fill_selected_candidates
+        self.candidate_fill_batch_button = ttk.Button(candidate_actions, width=0, text="批量填入工作台", command=self._fill_selected_candidates
         )
         self.candidate_fill_batch_button.grid(row=7, column=0, padx=(0, 6), pady=(7, 0), sticky="w")
-        self.candidate_batch_info_button = ttk.Button(
-            button_row, text="批量获取资料", command=self._fetch_selected_candidate_info
+        self.candidate_batch_info_button = ttk.Button(candidate_actions, width=0, text="批量获取资料", command=self._fetch_selected_candidate_info
         )
         self.candidate_batch_info_button.grid(row=7, column=1, padx=(0, 6), pady=(7, 0), sticky="w")
         self.candidate_fill_batch_button.state(["disabled"])
         self.candidate_batch_info_button.state(["disabled"])
-        self.candidate_block_author_button = ttk.Button(button_row, text="屏蔽选中作者", command=self._block_selected_candidate_authors)
+        self.candidate_block_author_button = ttk.Button(candidate_actions, width=0, text="屏蔽选中作者", command=self._block_selected_candidate_authors)
         self.candidate_block_author_button.grid(row=1, column=3, padx=(6, 0), pady=(7, 0))
-        self.candidate_block_work_button = ttk.Button(button_row, text="屏蔽选中作品", command=self._block_selected_candidate_works)
+        self.candidate_block_work_button = ttk.Button(candidate_actions, width=0, text="屏蔽选中作品", command=self._block_selected_candidate_works)
         self.candidate_block_work_button.grid(row=1, column=4, padx=(6, 0), pady=(7, 0))
         ttk.Label(button_row, text="搜索种类", style="Panel.TLabel").grid(row=2, column=0, sticky="w", pady=(8, 0))
         self.content_scope_combo = ttk.Combobox(
@@ -101,42 +96,38 @@ class FollowingTabMixin:
             button_row, textvariable=self.content_scope_help_var, style="Small.TLabel", wraplength=620
         )
         self.content_scope_help_label.grid(row=3, column=0, columnspan=7, sticky="ew", pady=(5, 0))
-        ttk.Label(button_row, textvariable=self.candidate_selection_var, style="Section.TLabel").grid(
-            row=4, column=0, columnspan=7, sticky="ew", pady=(7, 0)
-        )
-        self.candidate_select_all_button = ttk.Button(button_row, text="全选当前页", command=self._select_all_platform_candidates)
+        candidate_selection = ttk.Label(button_row, textvariable=self.candidate_selection_var, style="Section.TLabel")
+        candidate_selection.grid(row=4, column=0, columnspan=7, sticky="ew", pady=(7, 0))
+        wrap_label(candidate_selection, button_row)
+        self.candidate_select_all_button = ttk.Button(candidate_actions, width=0, text="全选当前页", command=self._select_all_platform_candidates)
         self.candidate_select_all_button.grid(row=5, column=0, padx=(0, 6), pady=(7, 0))
-        self.candidate_clear_button = ttk.Button(button_row, text="取消选择", command=self._clear_platform_candidate_selection)
+        self.candidate_clear_button = ttk.Button(candidate_actions, width=0, text="取消选择", command=self._clear_platform_candidate_selection)
         self.candidate_clear_button.grid(row=5, column=1, padx=(0, 6), pady=(7, 0))
-        self.following_import_button = ttk.Button(button_row, text="从文件更新", command=self._import_following_accounts)
+        self.following_import_button = ttk.Button(candidate_actions, width=0, text="从文件更新", command=self._import_following_accounts)
         self.following_import_button.grid(row=5, column=2, padx=(0, 6), pady=(7, 0))
-        self.following_export_button = ttk.Button(button_row, text="导出关注", command=self._export_following_accounts)
+        self.following_export_button = ttk.Button(candidate_actions, width=0, text="导出关注", command=self._export_following_accounts)
         self.following_export_button.grid(row=5, column=3, pady=(7, 0))
-        self.candidate_list_import_button = ttk.Button(button_row, text="导入名单", command=self._import_candidate_list)
+        self.candidate_list_import_button = ttk.Button(candidate_actions, width=0, text="导入名单", command=self._import_candidate_list)
         self.candidate_list_import_button.grid(row=5, column=4, padx=(6, 6), pady=(7, 0))
-        self.candidate_list_export_button = ttk.Button(button_row, text="导出候选", command=self._export_candidate_list)
+        self.candidate_list_export_button = ttk.Button(candidate_actions, width=0, text="导出候选", command=self._export_candidate_list)
         self.candidate_list_export_button.grid(row=5, column=5, pady=(7, 0))
-        self.jm_candidate_tags_button = ttk.Button(button_row, text="编辑 JM 标签", command=self._edit_selected_jm_candidate_tags)
+        self.jm_candidate_tags_button = ttk.Button(candidate_actions, width=0, text="编辑 JM 标签", command=self._edit_selected_jm_candidate_tags)
         self.jm_candidate_tags_button.grid(row=6, column=0, columnspan=2, sticky="w", pady=(7, 0))
-        self.jm_candidate_remove_button = ttk.Button(button_row, text="移除 JM 候选", command=self._remove_selected_jm_candidates)
+        self.jm_candidate_remove_button = ttk.Button(candidate_actions, width=0, text="移除 JM 候选", command=self._remove_selected_jm_candidates)
         self.jm_candidate_remove_button.grid(row=6, column=2, columnspan=2, sticky="w", pady=(7, 0))
-        self.bluesky_follow_button = ttk.Button(
-            button_row, text="关注 Bluesky 账号", command=lambda: self._manage_bluesky_following(True)
+        self.bluesky_follow_button = ttk.Button(candidate_actions, width=0, text="关注 Bluesky 账号", command=lambda: self._manage_bluesky_following(True)
         )
         self.bluesky_follow_button.grid(row=0, column=3, sticky="w", padx=(0, 6))
         self.bluesky_follow_button.grid_remove()
-        self.bluesky_unfollow_button = ttk.Button(
-            button_row, text="取消关注", command=lambda: self._manage_bluesky_following(False)
+        self.bluesky_unfollow_button = ttk.Button(candidate_actions, width=0, text="取消关注", command=lambda: self._manage_bluesky_following(False)
         )
         self.bluesky_unfollow_button.grid(row=0, column=4, sticky="w")
         self.bluesky_unfollow_button.grid_remove()
-        self.eh_favorite_button = ttk.Button(
-            button_row, text="加入 EH 收藏", command=lambda: self._manage_eh_favorite(True)
+        self.eh_favorite_button = ttk.Button(candidate_actions, width=0, text="加入 EH 收藏", command=lambda: self._manage_eh_favorite(True)
         )
         self.eh_favorite_button.grid(row=0, column=3, sticky="w", padx=(0, 6))
         self.eh_favorite_button.grid_remove()
-        self.eh_unfavorite_button = ttk.Button(
-            button_row, text="移出 EH 收藏", command=lambda: self._manage_eh_favorite(False)
+        self.eh_unfavorite_button = ttk.Button(candidate_actions, width=0, text="移出 EH 收藏", command=lambda: self._manage_eh_favorite(False)
         )
         self.eh_unfavorite_button.grid(row=0, column=4, sticky="w")
         self.eh_unfavorite_button.grid_remove()
@@ -225,25 +216,26 @@ class FollowingTabMixin:
         self.twitter_history_tab.rowconfigure(1, weight=1)
         button_row = ttk.Frame(self.twitter_history_tab, style="Panel.TFrame")
         button_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        button_row.columnconfigure(6, weight=1)
-        ttk.Button(button_row, text="刷新", command=self._load_platform_history).grid(row=0, column=0, padx=(0, 6))
-        self.history_use_button = ttk.Button(button_row, text="填入目标", command=self._use_selected_platform_history)
+        button_row.columnconfigure(0, weight=1)
+        history_actions = ResponsiveToolbar(button_row, style="Panel.TFrame", max_columns=6)
+        history_actions.grid(row=0, column=0, sticky="ew")
+        ttk.Button(history_actions, width=0, text="刷新", command=self._load_platform_history).grid(row=0, column=0, padx=(0, 6))
+        self.history_use_button = ttk.Button(history_actions, width=0, text="填入目标", command=self._use_selected_platform_history)
         self.history_use_button.grid(row=0, column=1, padx=(0, 6))
-        self.history_preview_button = ttk.Button(button_row, text="在线获取资料", command=self._preview_selected_platform_history)
+        self.history_preview_button = ttk.Button(history_actions, width=0, text="在线获取资料", command=self._preview_selected_platform_history)
         self.history_preview_button.grid(row=0, column=2, padx=(0, 6))
-        self.history_clear_selected_button = ttk.Button(button_row, text="清理选中", command=self._clear_selected_platform_history)
+        self.history_clear_selected_button = ttk.Button(history_actions, width=0, text="清理选中", command=self._clear_selected_platform_history)
         self.history_clear_selected_button.grid(row=0, column=3, padx=(0, 6))
-        self.history_fill_batch_button = ttk.Button(button_row, text="批量填入工作台", command=self._fill_selected_histories)
+        self.history_fill_batch_button = ttk.Button(history_actions, width=0, text="批量填入工作台", command=self._fill_selected_histories)
         self.history_fill_batch_button.grid(row=0, column=5, padx=(6, 0))
         self.history_fill_batch_button.state(["disabled"])
         self.clear_history_var = tk.StringVar(value="清理本平台全部")
-        self.history_clear_all_button = ttk.Button(
-            button_row, textvariable=self.clear_history_var, command=self._clear_platform_history
+        self.history_clear_all_button = ttk.Button(history_actions, width=0, textvariable=self.clear_history_var, command=self._clear_platform_history
         )
         self.history_clear_all_button.grid(row=0, column=4)
-        ttk.Label(button_row, textvariable=self.history_selection_var, style="Small.TLabel").grid(
-            row=1, column=0, columnspan=7, sticky="w", pady=(6, 0)
-        )
+        history_selection = ttk.Label(button_row, textvariable=self.history_selection_var, style="Small.TLabel")
+        history_selection.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        wrap_label(history_selection, button_row)
         for button in (self.history_use_button, self.history_preview_button, self.history_clear_selected_button):
             button.state(["disabled"])
 

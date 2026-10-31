@@ -23,6 +23,7 @@ from software_app.ui.desktop_support import (
     select_treeview_row_at_event,
 )
 from software_app.ui.scrolling import bind_canvas_mousewheel
+from software_app.ui.layout import ResponsiveToolbar, ScrollableControls
 
 try:
     from PIL import Image, ImageOps, ImageTk
@@ -131,9 +132,12 @@ class GoogleSearchTabMixin:
 
         result_panel = ttk.Frame(workspace, style="Panel.TFrame", padding=12)
         result_panel.columnconfigure(0, weight=1)
-        result_panel.rowconfigure(4, weight=1)
+        result_panel.rowconfigure(1, weight=1)
         workspace.add(result_panel, weight=1)
-        result_header = ttk.Frame(result_panel, style="FlatPanel.TFrame")
+        result_controls_scroll = ScrollableControls(result_panel, style="Panel.TFrame")
+        result_controls_scroll.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        result_meta = result_controls_scroll.content
+        result_header = ttk.Frame(result_meta, style="FlatPanel.TFrame")
         result_header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         result_header.columnconfigure(1, weight=1)
         ttk.Label(result_header, text="候选页面", style="Title.TLabel").grid(row=0, column=0, sticky="w")
@@ -149,14 +153,15 @@ class GoogleSearchTabMixin:
         )
         self.google_search_progress.grid(row=1, column=1, sticky="ew", pady=(7, 0))
         result_hint = ttk.Label(
-            result_panel,
+            result_meta,
             text="这里只列出来源候选，AI 概览不代表图片匹配。请先打开网页核对；Pixiv、X 帖子可交给对应下载器。",
             style="Small.TLabel",
             wraplength=700,
             justify="left",
         )
         result_hint.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        result_panel.bind("<Configure>", lambda event: result_hint.configure(wraplength=max(280, event.width - 24)))
+        result_panel.bind("<Configure>", lambda event: result_controls_scroll.set_height_limit(max(90, event.height - 130)))
+        result_meta.bind("<Configure>", lambda event: result_hint.configure(wraplength=max(100, event.width)), add="+")
 
         columns = ("index", "source", "status", "site", "url")
         result_frame, self.google_result_tree = self._create_scrollable_tree(result_panel, columns)
@@ -171,7 +176,7 @@ class GoogleSearchTabMixin:
         self.google_result_tree.column("status", width=112, stretch=False, anchor="center")
         self.google_result_tree.column("site", width=140, stretch=False)
         self.google_result_tree.column("url", width=430)
-        result_frame.grid(row=4, column=0, sticky="nsew")
+        result_frame.grid(row=1, column=0, sticky="nsew")
         self.google_result_tree.tag_configure("even", background="#f8fafc")
         self.google_result_tree.tag_configure("odd", background=self.palette["panel"])
         self.google_result_tree.tag_configure("missing", background="#fff0f0", foreground="#a22929")
@@ -183,14 +188,16 @@ class GoogleSearchTabMixin:
         self.google_result_tree.bind("<Control-a>", lambda _event: self._select_all_google_results())
 
         self.google_selection_detail_var = tk.StringVar(value="选中候选可查看跳转地址和黑名单状态。")
-        self.google_detail_label = ttk.Label(result_panel, textvariable=self.google_selection_detail_var,
+        self.google_detail_label = ttk.Label(result_meta, textvariable=self.google_selection_detail_var,
                                              style="Small.TLabel", wraplength=700, justify="left")
         self.google_detail_label.grid(row=3, column=0, sticky="ew", pady=(5, 0))
         self.google_detail_label.grid_remove()
-        result_panel.bind("<Configure>", lambda event: self.google_detail_label.configure(wraplength=max(280, event.width - 24)), add="+")
-        action_row = ttk.Frame(result_panel, style="FlatPanel.TFrame")
-        action_row.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        action_row.columnconfigure(4, weight=1)
+        result_meta.bind("<Configure>", lambda event: self.google_detail_label.configure(wraplength=max(100, event.width)), add="+")
+        result_controls = ttk.Frame(result_meta, style="FlatPanel.TFrame")
+        result_controls.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        result_controls.columnconfigure(0, weight=1)
+        action_row = ResponsiveToolbar(result_controls, style="FlatPanel.TFrame", max_columns=5)
+        action_row.grid(row=0, column=0, sticky="ew")
         self.google_select_all_button = ttk.Button(action_row, text="全选", style="Compact.TButton", command=self._select_all_google_results)
         self.google_select_all_button.grid(row=0, column=0, padx=(0, 6))
         self.google_clear_button = ttk.Button(action_row, text="取消选择", style="Compact.TButton", command=self._clear_google_selection)
@@ -222,8 +229,10 @@ class GoogleSearchTabMixin:
         self.google_more_button.grid(row=0, column=4, sticky="e", padx=(6, 0))
         self.google_check_button.grid_remove()
         self.google_mark_missing_button.grid_remove()
-        ttk.Label(action_row, text="每页最多文件", style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 0), padx=(0, 6))
-        ttk.Spinbox(action_row, from_=1, to=200, textvariable=self.google_max_files_var, width=7).grid(row=1, column=1, sticky="w", pady=(8, 0))
+        download_options = ttk.Frame(result_controls, style="FlatPanel.TFrame")
+        download_options.grid(row=1, column=0, sticky="ew", pady=(5, 0))
+        ttk.Label(download_options, text="每页最多文件", style="Panel.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Spinbox(download_options, from_=1, to=200, textvariable=self.google_max_files_var, width=7).grid(row=0, column=1, sticky="w")
         self.google_pixiv_button = ttk.Button(
             action_row, text="交给 Pixiv 下载", style="Compact.TButton", command=self._queue_selected_google_as_pixiv
         )
@@ -243,6 +252,9 @@ class GoogleSearchTabMixin:
         self.google_block_button.grid_remove()
         self.google_pixiv_inspect_button.grid_remove()
         self.google_unblock_button.grid_remove()
+        for control in action_row.winfo_children():
+            if isinstance(control, (ttk.Button, ttk.Menubutton)):
+                control.configure(width=0)
         self.google_pixiv_inspecting = False
         self.google_results_generation = 0
         for button in (

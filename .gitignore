@@ -51,3 +51,15 @@ data/software_app/browser/*_profile/
 
 # Local screenshots not used by repository documentation
 /图片/
+
+# Local maintenance and planning documents
+/文档/更新日志.md
+/文档/测试报告*.md
+/文档/项目整理记录.md
+/文档/开源下载器对比.md
+/文档/参考源码评估.md
+/文档/仓库与目录说明.md
+/文档/QQBot接入注意事项.txt
+/文档/开发暂停与接续.md
+/文档/功能路线图.md
+/文档/设计/

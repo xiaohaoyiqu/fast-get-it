@@ -24,7 +24,10 @@ def headings(path):
 
 ROOT = Path(__file__).resolve().parents[1]
 paths = [ROOT / "README.md", ROOT / "tests/README.md"]
-paths.extend(sorted((ROOT / "文档").rglob("*.md")))
+paths.extend(
+    ROOT / "文档" / name for name in ("README.md", "用户手册.md", "开发与架构说明.md", "插件开发.md", "鸣谢.md")
+)
+paths.extend(sorted((ROOT / "文档/平台").glob("*.md")))
 paths.extend(sorted((ROOT / "software_app/crawlers/twitter").glob("*.md")))
 errors = []
 link_count = 0

@@ -12,12 +12,13 @@
 .\.venv\Scripts\python.exe -X utf8 scripts/check_documentation.py
 ```
 
-自动回归主要使用生成样本、临时目录和本机服务，不代表真实平台账号功能已通过。Windows 临时目录及用户输出锁可能受执行环境权限限制，需区分环境错误和产品故障。最新验收数字、实站边界和日志位置见 测试报告（本地记录，不随仓库上传）。
+自动回归主要使用生成样本、临时目录和本机服务，不代表真实平台账号功能已通过。Windows 临时目录及用户输出锁可能受执行环境权限限制，需区分环境错误和产品故障。运行时生成的验收证据保存在开发环境中。
 
 ## 手动验收
 
 | 入口 | 用途与条件 |
 | --- | --- |
+| `verify_layout_smoke.py` | 主界面按钮可达性、不同尺寸与字体缩放；使用隔离数据 |
 | `verify_daily_acceptance.py` | 编排 16 组本机验收，可通过 `--only` 选择组；会启动真实窗口、浏览器和本机工具 |
 | `verify_desktop_smoke.py`、`verify_person_config_smoke.py`、`verify_eh_manual_smoke.py` | 桌面、人物配置和 EH 表单 |
 | `verify_transfer_cache_smoke.py`、`verify_library_integrity_smoke.py` | 传输缓存维护和成品清单核验 |
@@ -35,7 +36,7 @@
 ```powershell
 .\.venv\Scripts\python.exe -X utf8 tests/manual/verify_daily_acceptance.py --root data/software_app/verification/local-check
 .\.venv\Scripts\python.exe -X utf8 tests/manual/verify_daily_acceptance.py --root data/software_app/verification/local-check --only http_checkpoint http_redirect
-.\.venv\Scripts\python.exe -X utf8 tests/manual/verify_package_smoke.py data/software_app/verification/daily-acceptance-20261031/package/dist
+.\.venv\Scripts\python.exe -X utf8 tests/manual/verify_package_smoke.py dist
 ```
 
 `verify_runtime_smoke.py database` 是数据库迁移验收入口，会备份并在验证中访问当前用户数据库，不属于日常默认烟测。不要因为整理文档而运行它。实站脚本也不包含在本机日常编排中；Pixiv 账号继续按用户要求跳过。
@@ -46,4 +47,4 @@
 - 保留：最终及失败报告、必要日志、代表性截图、当前独立验收包和一个回退包。
 - 用户 Cookie、长期浏览器资料、运行数据库、真实下载目录、固定输出锁及参考项目不按测试垃圾处理。
 
-测试源码是否仍有用，应按覆盖的行为和调用关系判断，不能因为文件名包含 test 或 manual 就删除。本轮整理未发现可明确废弃的现有测试源码。
+测试源码是否仍有用，应按覆盖的行为和调用关系判断，不能因为文件名包含 test 或 manual 就删除。

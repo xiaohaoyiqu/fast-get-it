@@ -392,9 +392,9 @@ def main():
             # Native mixed-batch actions use generated local samples, never platform accounts.
             for module_id in ("twitter", "website"):
                 app.manager.register_adapter(BatchSmokeAdapter(module_id))
-            mixed_button = button(app, "混合平台批量任务")
-            check("mixed_batch_entry", mixed_button is not None)
-            mixed_button.invoke()
+            mixed_menu = app.workbench_more_menu
+            check("mixed_batch_entry", mixed_menu.entrycget(0, "label") == "混合平台批量任务")
+            mixed_menu.invoke(0)
             mixed = app._mixed_batch_dialog
             mixed.input.insert("1.0", "https://x.com/example/status/123\nhttps://example.com/a\n"
                                "https://twitter.com/another/status/123\n@example\nhttps://pixiv.net/tags/example")

@@ -13,6 +13,7 @@ from software_app.core.collection_plan import collection_label
 from software_app.core.person_config import settings_source
 from software_app.ui.desktop_support import retry_route_for_task, bounded_int as _bounded_int
 from software_app.ui.platform_config import PLATFORM_CONTENT_SCOPES, TASK_STATUS_LABELS
+from software_app.ui.layout import ResponsiveToolbar, ScrollableControls, wrap_label
 
 
 class TaskQueueTabMixin:
@@ -35,8 +36,8 @@ class TaskQueueTabMixin:
         task_header.columnconfigure(0, weight=1)
         ttk.Label(task_header, text="下载任务", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(task_header, textvariable=self.task_summary_var, style="Small.TLabel").grid(row=0, column=1, sticky="e", padx=(8, 8))
-        ttk.Button(task_header, text="刷新", command=self._refresh_tasks).grid(row=0, column=2, sticky="e")
-        ttk.Button(task_header, text="恢复中断任务", command=self._restore_interrupted_tasks).grid(row=0, column=3, padx=(6, 0))
+        ttk.Button(task_header, text="刷新", width=0, style="Compact.TButton", command=self._refresh_tasks).grid(row=0, column=2, sticky="e")
+        ttk.Button(task_header, text="恢复中断任务", width=0, style="Compact.TButton", command=self._restore_interrupted_tasks).grid(row=0, column=3, padx=(6, 0))
         ttk.Progressbar(task_header, variable=self.task_progress_var, maximum=100, mode="determinate").grid(row=1, column=0, columnspan=3, sticky="ew", pady=(7, 0))
 
         task_panes = ttk.Panedwindow(self.tasks_tab, orient=tk.VERTICAL)
@@ -70,34 +71,43 @@ class TaskQueueTabMixin:
 
         task_detail_panel = ttk.Frame(task_panes, style="Panel.TFrame", padding=(0, 8, 0, 0))
         task_detail_panel.columnconfigure(0, weight=1)
-        task_detail_panel.rowconfigure(2, weight=1)
-        detail_header = ttk.Frame(task_detail_panel, style="FlatPanel.TFrame")
+        task_detail_panel.rowconfigure(1, weight=1)
+        detail_controls = ScrollableControls(task_detail_panel, style="Panel.TFrame")
+        detail_controls.grid(row=0, column=0, sticky="ew")
+        task_detail_panel.controls = detail_controls
+        task_detail_panel.bind("<Configure>", lambda event: detail_controls.set_height_limit(max(50, event.height - 100)), add="+")
+        detail_controls.content.bind("<Configure>", lambda _event: self.after_idle(lambda: self._keep_task_detail_visible(task_panes)), add="+")
+        detail_header = ttk.Frame(detail_controls.content, style="FlatPanel.TFrame")
         detail_header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         detail_header.columnconfigure(0, weight=1)
-        ttk.Label(detail_header, textvariable=self.task_detail_var, style="Small.TLabel").grid(row=0, column=0, sticky="w")
-        self.task_retry_button = ttk.Button(detail_header, text="按原设置重试", style="Compact.TButton", command=self._retry_selected_task)
+        task_selection = ttk.Label(detail_header, textvariable=self.task_detail_var, style="Small.TLabel")
+        task_selection.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        wrap_label(task_selection, detail_header)
+        detail_actions = ResponsiveToolbar(detail_header, style="FlatPanel.TFrame", max_columns=6)
+        detail_actions.grid(row=1, column=0, sticky="ew")
+        self.task_retry_button = ttk.Button(detail_actions, text="按原设置重试", width=0, style="Compact.TButton", command=self._retry_selected_task)
         self.task_retry_button.grid(row=0, column=1, padx=(6, 0))
-        self.task_cancel_button = ttk.Button(detail_header, text="批量取消", style="Compact.TButton", command=self._cancel_selected_task)
+        self.task_cancel_button = ttk.Button(detail_actions, text="批量取消", width=0, style="Compact.TButton", command=self._cancel_selected_task)
         self.task_cancel_button.grid(row=0, column=2, padx=(6, 0))
-        self.task_delete_button = ttk.Button(detail_header, text="删除任务记录", style="Compact.TButton", command=self._delete_selected_tasks)
+        self.task_delete_button = ttk.Button(detail_actions, text="删除任务记录", width=0, style="Compact.TButton", command=self._delete_selected_tasks)
         self.task_delete_button.grid(row=0, column=3, padx=(6, 0))
-        self.task_use_button = ttk.Button(detail_header, text="填入工作台", style="Compact.TButton", command=self._use_selected_task)
+        self.task_use_button = ttk.Button(detail_actions, text="填入工作台", width=0, style="Compact.TButton", command=self._use_selected_task)
         self.task_use_button.grid(row=0, column=4, padx=(6, 0))
-        self.task_folder_button = ttk.Button(detail_header, text="打开输出目录", style="Compact.TButton", command=self._open_selected_task_folder)
+        self.task_folder_button = ttk.Button(detail_actions, text="打开输出目录", width=0, style="Compact.TButton", command=self._open_selected_task_folder)
         self.task_folder_button.grid(row=0, column=5, padx=(6, 0))
-        self.task_pause_button = ttk.Button(detail_header, text="批量暂停", style="Compact.TButton", command=self._pause_selected_tasks)
+        self.task_pause_button = ttk.Button(detail_actions, text="批量暂停", width=0, style="Compact.TButton", command=self._pause_selected_tasks)
         self.task_pause_button.grid(row=1, column=1, padx=(6, 0), pady=(5, 0))
-        self.task_resume_button = ttk.Button(detail_header, text="批量恢复", style="Compact.TButton", command=self._resume_selected_tasks)
+        self.task_resume_button = ttk.Button(detail_actions, text="批量恢复", width=0, style="Compact.TButton", command=self._resume_selected_tasks)
         self.task_resume_button.grid(row=1, column=2, padx=(6, 0), pady=(5, 0))
-        ttk.Button(detail_header, text="按当前设置重试", style="Compact.TButton",
+        ttk.Button(detail_actions, text="按当前设置重试", width=0, style="Compact.TButton",
                    command=lambda: self._retry_selected_task(use_current_settings=True)).grid(
                        row=2, column=1, columnspan=2, sticky="w", padx=(6, 0), pady=(5, 0))
-        ttk.Button(detail_header, text="仅补未完成媒体", style="Compact.TButton",
+        ttk.Button(detail_actions, text="仅补未完成媒体", width=0, style="Compact.TButton",
                    command=self._retry_unfinished_media).grid(row=1, column=3, padx=(6, 0), pady=(5, 0))
-        self.media_export_button = ttk.Button(detail_header, text="导出失败清单", style="Compact.TButton",
+        self.media_export_button = ttk.Button(detail_actions, text="导出失败清单", width=0, style="Compact.TButton",
                                              command=self._export_unfinished_media)
         self.media_export_button.grid(row=1, column=4, padx=(6, 0), pady=(5, 0))
-        ttk.Button(detail_header, text="查看逐媒体结果", style="Compact.TButton",
+        ttk.Button(detail_actions, text="查看逐媒体结果", width=0, style="Compact.TButton",
                    command=self._open_media_results).grid(row=1, column=5, padx=(6, 0), pady=(5, 0))
         for button in (
             self.task_retry_button,
@@ -110,32 +120,35 @@ class TaskQueueTabMixin:
         ):
             button.state(["disabled"])
 
-        log_tools = ttk.Frame(task_detail_panel, style="FlatPanel.TFrame")
+        log_tools = ttk.Frame(detail_controls.content, style="FlatPanel.TFrame")
         log_tools.grid(row=1, column=0, sticky="ew", pady=(0, 5))
-        ttk.Label(log_tools, text="日志级别").grid(row=0, column=0, padx=(0, 4))
+        log_tools.columnconfigure(3, weight=1)
+        ttk.Label(log_tools, text="日志").grid(row=0, column=0, padx=(0, 4))
         self.task_log_level_combo = ttk.Combobox(
             log_tools, textvariable=self.task_log_level_var, values=("全部", "INFO", "WARNING", "ERROR"),
-            state="readonly", width=9,
+            state="readonly", width=6,
         )
         self.task_log_level_combo.grid(row=0, column=1, padx=(0, 8))
         ttk.Label(log_tools, text="搜索").grid(row=0, column=2, padx=(0, 4))
-        task_log_search = ttk.Entry(log_tools, textvariable=self.task_log_search_var, width=24)
-        task_log_search.grid(row=0, column=3, padx=(0, 6))
-        ttk.Button(log_tools, text="清除", command=lambda: self.task_log_search_var.set("")).grid(row=0, column=4, padx=(0, 6))
-        self.task_log_export_button = ttk.Button(log_tools, text="导出日志", command=self._export_selected_task_logs)
+        task_log_search = ttk.Entry(log_tools, textvariable=self.task_log_search_var, width=10)
+        task_log_search.grid(row=0, column=3, sticky="ew", padx=(0, 6))
+        ttk.Button(log_tools, text="清除", width=0, style="Compact.TButton", command=lambda: self.task_log_search_var.set("")).grid(row=0, column=4, padx=(0, 6))
+        self.task_log_export_button = ttk.Button(log_tools, text="导出日志", width=0, style="Compact.TButton", command=self._export_selected_task_logs)
         self.task_log_export_button.grid(row=0, column=5, padx=(0, 6))
-        self.task_log_clear_button = ttk.Button(log_tools, text="清理日志", command=self._clear_selected_task_logs)
+        self.task_log_clear_button = ttk.Button(log_tools, text="清理日志", width=0, style="Compact.TButton", command=self._clear_selected_task_logs)
         self.task_log_clear_button.grid(row=0, column=6, padx=(0, 6))
         self.task_log_count_var = tk.StringVar(value="选择单个任务后可筛选和导出日志")
-        ttk.Label(log_tools, textvariable=self.task_log_count_var, style="Small.TLabel").grid(row=0, column=7, sticky="w")
-        ttk.Label(log_tools, textvariable=self.task_activity_var, style="Small.TLabel", anchor="w").grid(
-            row=1, column=0, columnspan=8, sticky="ew", pady=(3, 0)
-        )
+        log_count = ttk.Label(log_tools, textvariable=self.task_log_count_var, style="Small.TLabel")
+        log_count.grid(row=1, column=0, columnspan=7, sticky="ew", pady=(3, 0))
+        wrap_label(log_count, log_tools)
+        activity_label = ttk.Label(log_tools, textvariable=self.task_activity_var, style="Small.TLabel", anchor="w")
+        activity_label.grid(row=2, column=0, columnspan=7, sticky="ew", pady=(3, 0))
+        wrap_label(activity_label, log_tools)
         self.task_log_level_combo.bind("<<ComboboxSelected>>", self._task_log_filter_changed)
         self.task_log_search_var.trace_add("write", lambda *_args: self._task_log_filter_changed())
 
         detail_text_frame = ttk.Frame(task_detail_panel, style="Panel.TFrame")
-        detail_text_frame.grid(row=2, column=0, sticky="nsew")
+        detail_text_frame.grid(row=1, column=0, sticky="nsew")
         detail_text_frame.columnconfigure(0, weight=1)
         detail_text_frame.rowconfigure(0, weight=1)
         self.task_detail_text = tk.Text(
@@ -184,7 +197,9 @@ class TaskQueueTabMixin:
                 return
             sash = task_panes.sashpos(0)
             minimum_list = 65
-            minimum_detail = min(205, max(125, height - minimum_list))
+            detail_panel = task_panes.nametowidget(task_panes.panes()[1])
+            controls = detail_panel.controls
+            minimum_detail = min(controls.content.winfo_reqheight() + 106, max(125, height - minimum_list))
             maximum_list = max(minimum_list, height - minimum_detail)
             if sash > maximum_list:
                 task_panes.sashpos(0, maximum_list)

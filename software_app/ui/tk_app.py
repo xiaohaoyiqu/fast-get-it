@@ -47,6 +47,7 @@ from software_app.ui.platform_config import (
 )
 from software_app.ui.preview_renderer import TargetPreviewRenderer
 from software_app.ui.scrolling import bind_canvas_mousewheel
+from software_app.ui.layout import ResponsiveToolbar, wrap_label
 from software_app.ui.settings_tab import (
     ANIMATION_FORMAT_LABELS,
     ARCHIVE_MODE_LABELS,
@@ -151,7 +152,7 @@ class SoftwareDesktop(
         super().__init__()
         self.title("欲求达")
         self.geometry("1240x780")
-        self.minsize(1080, 680)
+        self.minsize(1000, 640)
         self.configure(background="#f3f5f8")
 
         self.context = create_app_context()
@@ -530,16 +531,16 @@ class SoftwareDesktop(
         self.palette = apply_desktop_theme(self)
 
     def _build_layout(self) -> None:
-        self.columnconfigure(0, weight=0, minsize=330)
+        self.columnconfigure(0, weight=0, minsize=300)
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
 
-        left = ttk.Frame(self, style="Sidebar.TFrame", padding=16, width=330)
+        left = ttk.Frame(self, style="Sidebar.TFrame", padding=12, width=300)
         left.grid(row=0, column=0, sticky="nsew")
         left.grid_propagate(False)
         left.columnconfigure(0, weight=1)
-        left.rowconfigure(4, weight=2, minsize=95)
-        left.rowconfigure(5, weight=2, minsize=175)
+        left.rowconfigure(4, weight=2, minsize=130)
+        left.rowconfigure(5, weight=2, minsize=160)
         left.rowconfigure(7, weight=1, minsize=70)
         ttk.Label(left, text="欲求达", style="SidebarTitle.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(left, text="跨平台查找 · 相似搜索 · 黑名单", style="SidebarText.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 18))
@@ -565,9 +566,9 @@ class SoftwareDesktop(
             command=self._search_platform_targets,
         )
         self.platform_search_button.grid(row=1, column=1)
-        ttk.Label(target_search, textvariable=self.platform_search_hint_var, style="SidebarText.TLabel").grid(
-            row=2, column=0, columnspan=2, sticky="w", pady=(3, 0)
-        )
+        search_hint = ttk.Label(target_search, textvariable=self.platform_search_hint_var, style="SidebarText.TLabel")
+        search_hint.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(3, 0))
+        wrap_label(search_hint, target_search)
 
         target_list_frame = ttk.Frame(left, style="Panel.TFrame")
         target_list_frame.grid(row=4, column=0, sticky="nsew", pady=(0, 10))
@@ -595,18 +596,18 @@ class SoftwareDesktop(
             target_list_frame,
             textvariable=self.target_selection_var,
             style="Small.TLabel",
-            wraplength=285,
+            wraplength=260,
         ).grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(4, 4))
         target_actions = ttk.Frame(target_list_frame, style="FlatPanel.TFrame")
         target_actions.grid(row=2, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
         target_actions.columnconfigure(0, weight=1)
         self.target_queue_button = ttk.Button(
             target_actions,
-            text="加入选中到下载队列",
+            text="加入下载队列", width=0,
             command=self._download_selected_target_browser,
         )
         self.target_queue_button.grid(row=0, column=0, sticky="ew")
-        ttk.Button(target_actions, text="取消多选", command=self._clear_target_browser_selection).grid(
+        ttk.Button(target_actions, text="取消多选", width=0, command=self._clear_target_browser_selection).grid(
             row=0, column=1, padx=(6, 0)
         )
         self.target_queue_button.state(["disabled"])
@@ -697,7 +698,7 @@ class SoftwareDesktop(
         ttk.Label(link_panel, textvariable=self.blocklist_status_var, style="Small.TLabel").grid(
             row=4, column=0, columnspan=3, sticky="w", pady=(4, 0)
         )
-        target_card.bind("<Configure>", self._update_target_card_wrap)
+        target_card.bind("<Configure>", self._update_target_card_wrap, add="+")
         self.preview_text = TargetPreviewRenderer(target_card)
         self.preview_text.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.module_detail = self.preview_text
@@ -727,80 +728,82 @@ class SoftwareDesktop(
         log_scrollbar.grid(row=0, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=log_scrollbar.set, state="disabled")
         main = ttk.Frame(self, style="App.TFrame")
-        main.grid(row=0, column=1, sticky="nsew", padx=16, pady=14)
+        main.grid(row=0, column=1, sticky="nsew", padx=12, pady=10)
         main.columnconfigure(0, weight=1)
         main.rowconfigure(2, weight=1)
 
         page_header = ttk.Frame(main, style="App.TFrame")
         page_header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         page_header.columnconfigure(0, weight=1)
-        ttk.Label(page_header, text="欲求达", style="HeaderTitle.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(page_header, text="查找目标、识别相似图片、管理屏蔽规则，按需保存到本地", style="HeaderSub.TLabel").grid(
-            row=1, column=0, columnspan=2, sticky="ew", pady=(2, 0)
-        )
+        ttk.Label(page_header, text="下载工作台", style="HeaderTitle.TLabel").grid(row=0, column=0, sticky="w")
+        more_button = ttk.Menubutton(page_header, text="更多操作", width=10)
+        more_button.grid(row=0, column=1, sticky="e")
+        more_menu = tk.Menu(more_button, tearoff=False)
+        more_menu.add_command(label="混合平台批量任务", command=self._open_mixed_batch)
+        more_menu.add_command(label="单次设置下载", command=lambda: self._start_download(override_settings=True))
+        more_menu.add_separator()
+        more_menu.add_command(label="人物配置", command=self._open_person_config)
+        more_menu.add_command(label="执行前检查", command=self._open_preflight)
+        more_menu.add_command(label="配置总览", command=self._open_person_config_overview)
+        more_menu.add_separator()
+        more_menu.add_command(label="目标输入说明", command=lambda: messagebox.showinfo(
+            "目标输入说明", "多目标可用顿号、反斜杠或换行分隔；URL 和搜索词内的 / 会保留。\n选择平台和范围后，可以先预览资料，再加入下载队列。", parent=self))
+        more_button.configure(menu=more_menu)
+        self.workbench_more_menu = more_menu
         self.page_subtitle_label = ttk.Label(
             page_header,
             textvariable=self.page_subtitle_var,
             style="HeaderSub.TLabel",
         )
-        self.page_subtitle_label.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        ttk.Label(page_header, textvariable=self.status_var, style="Status.TLabel").grid(row=0, column=1, sticky="e")
-        header_actions = ttk.Frame(page_header, style="App.TFrame")
-        header_actions.grid(row=3, column=0, columnspan=2, sticky="e", pady=(8, 0))
-        page_header.bind(
-            "<Configure>",
-            lambda event: self.page_subtitle_label.configure(wraplength=max(280, event.width - 12)),
-        )
-        self.start_button = ttk.Button(header_actions, text="开始任务", style="Accent.TButton", command=self._start_download)
+        self.page_subtitle_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(3, 5))
+        wrap_label(self.page_subtitle_label, page_header)
+        header_actions = ResponsiveToolbar(page_header, style="App.TFrame", max_columns=6)
+        header_actions.grid(row=2, column=0, columnspan=2, sticky="ew")
+        self.start_button = ttk.Button(header_actions, text="开始任务", width=0, style="Accent.TButton", command=self._start_download)
         self.start_button.grid(row=0, column=0, padx=(0, 6))
-        self.preview_button = ttk.Button(header_actions, text="本地预览", command=self._preview_target)
+        self.preview_button = ttk.Button(header_actions, text="本地预览", width=0, command=self._preview_target)
         self.preview_button.grid(row=0, column=1, padx=(0, 6))
-        self.online_button = ttk.Button(header_actions, text="在线获取资料", command=self._preview_online)
+        self.online_button = ttk.Button(header_actions, text="在线获取资料", width=0, command=self._preview_online)
         self.online_button.grid(row=0, column=2, padx=(0, 6))
-        self.batch_info_button = ttk.Button(header_actions, text="批量获取资料", command=self._batch_fetch_target_info)
+        self.batch_info_button = ttk.Button(header_actions, text="批量获取资料", width=0, command=self._batch_fetch_target_info)
         self.batch_info_button.grid(row=0, column=3, padx=(0, 6))
-        self.browser_button = ttk.Button(header_actions, text="打开网页", command=self._open_target_in_browser)
+        self.browser_button = ttk.Button(header_actions, text="打开网页", width=0, command=self._open_target_in_browser)
         self.browser_button.grid(row=0, column=4, padx=(0, 6))
-        ttk.Button(header_actions, text="取消", command=self._cancel_task).grid(row=0, column=5)
-        ttk.Button(header_actions, text="混合平台批量任务", command=self._open_mixed_batch).grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        ttk.Button(header_actions, text="人物配置", command=self._open_person_config).grid(row=1, column=2, pady=(6, 0))
-        ttk.Button(header_actions, text="执行前检查", command=self._open_preflight).grid(row=1, column=3, pady=(6, 0))
-        ttk.Button(header_actions, text="配置总览", command=self._open_person_config_overview).grid(row=1, column=4, pady=(6, 0))
-        ttk.Button(header_actions, text="单次设置下载", command=lambda: self._start_download(override_settings=True)).grid(
-            row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Button(header_actions, text="取消", width=0, command=self._cancel_task).grid(row=0, column=5)
 
         top = ttk.Frame(main, style="Panel.TFrame", padding=9)
         top.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        top.columnconfigure(3, weight=1)
+        top.columnconfigure(0, weight=1)
+        destination_row = ttk.Frame(top, style="FlatPanel.TFrame")
+        destination_row.grid(row=0, column=0, sticky="ew")
+        destination_row.columnconfigure(3, weight=1)
+        target_row = ttk.Frame(top, style="FlatPanel.TFrame")
+        target_row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        target_row.columnconfigure(1, weight=1)
 
-        ttk.Label(top, text="平台", style="Panel.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        self.module_combo = ttk.Combobox(top, textvariable=self.module_label_var, state="readonly", width=16)
+        ttk.Label(destination_row, text="平台", style="Panel.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.module_combo = ttk.Combobox(destination_row, textvariable=self.module_label_var, state="readonly", width=16)
         self.module_combo.grid(row=0, column=1, sticky="w", padx=(0, 10))
         self.module_combo.bind("<<ComboboxSelected>>", lambda _event: self._select_module_from_combo())
-        ttk.Label(top, text="保存到", style="Panel.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 8))
-        self.output_dir_entry = ttk.Entry(top, textvariable=self.output_dir_var)
+        ttk.Label(destination_row, text="保存到", style="Panel.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 8))
+        self.output_dir_entry = ttk.Entry(destination_row, textvariable=self.output_dir_var, width=12)
         self.output_dir_entry.bind("<FocusOut>", self._remember_output_dir)
         self.output_dir_entry.grid(row=0, column=3, sticky="ew", padx=(0, 10))
-        self.output_browse_button = ttk.Button(top, text="浏览", command=self._choose_output_dir)
+        self.output_browse_button = ttk.Button(destination_row, text="浏览", width=0, command=self._choose_output_dir)
         self.output_browse_button.grid(row=0, column=4, sticky="ew")
-        self._create_recent_output_menu(top).grid(row=0, column=5, padx=(5, 0), sticky="ew")
-        ttk.Label(top, textvariable=self.target_label_var, style="Panel.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(10, 0))
-        self.target_entry = ttk.Entry(top, textvariable=self.target_var)
-        self.target_entry.grid(row=1, column=1, columnspan=3, sticky="ew", padx=(0, 10), pady=(10, 0))
-        type_label_frame = ttk.Frame(top, style="Panel.TFrame")
-        type_label_frame.grid(row=1, column=4, sticky="w", padx=(0, 8), pady=(10, 0))
+        self._create_recent_output_menu(destination_row).grid(row=0, column=5, padx=(5, 0), sticky="ew")
+        ttk.Label(target_row, textvariable=self.target_label_var, style="Panel.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.target_entry = ttk.Entry(target_row, textvariable=self.target_var, width=12)
+        self.target_entry.grid(row=0, column=1, sticky="ew", padx=(0, 10))
+        type_label_frame = ttk.Frame(target_row, style="Panel.TFrame")
+        type_label_frame.grid(row=0, column=2, sticky="w", padx=(0, 8))
         ttk.Label(type_label_frame, text="下载类型", style="Panel.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Button(type_label_frame, text="说明", width=4, command=self._show_download_type_help).grid(row=0, column=1, padx=(5, 0))
-        self.types_entry = ttk.Entry(top, textvariable=self.types_var, width=14)
-        self.types_entry.grid(row=1, column=5, sticky="ew", pady=(10, 0))
-        ttk.Label(
-            top,
-            text="多目标用 /、反斜杠或顿号分隔；开始任务可批量下载，批量获取资料可逐项查看；URL 和搜索词内的 / 会保留。",
-            style="Small.TLabel",
-        ).grid(row=2, column=1, columnspan=5, sticky="w", pady=(3, 0))
-        ttk.Label(top, textvariable=self.person_config_hint_var, style="Small.TLabel").grid(
-            row=3, column=1, columnspan=5, sticky="ew", pady=(3, 0))
+        self.types_entry = ttk.Entry(target_row, textvariable=self.types_var, width=8)
+        self.types_entry.grid(row=0, column=3, sticky="ew")
+        person_hint = ttk.Label(top, textvariable=self.person_config_hint_var, style="Small.TLabel")
+        person_hint.grid(row=2, column=0, sticky="ew", pady=(3, 0))
+        wrap_label(person_hint, top, padding=18)
         self.notebook = ttk.Notebook(main)
         self.notebook.grid(row=2, column=0, sticky="nsew")
         self.google_search_tab = ttk.Frame(self.notebook, style="Panel.TFrame", padding=10)
@@ -826,8 +829,10 @@ class SoftwareDesktop(
         footer = ttk.Frame(main, style="App.TFrame")
         footer.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         footer.columnconfigure(0, weight=1)
-        ttk.Label(footer, text="提示：双击候选页面可先进行安全静态预览", style="HeaderSub.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(footer, text="本地处理 · 任务可取消", style="HeaderSub.TLabel").grid(row=0, column=1, sticky="e")
+        status_label = ttk.Label(footer, textvariable=self.status_var, style="HeaderSub.TLabel")
+        status_label.grid(row=0, column=0, sticky="ew")
+        wrap_label(status_label, footer, padding=150)
+        ttk.Label(footer, text="任务可暂停 / 取消", style="HeaderSub.TLabel").grid(row=0, column=1, sticky="e")
 
     def _create_scrollable_tree(self, parent: tk.Widget, columns: tuple[str, ...], height: int | None = None):
         frame = ttk.Frame(parent, style="Panel.TFrame")
