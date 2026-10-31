@@ -17,7 +17,8 @@ try:
     from .driver_init import cookies_web, initialize_driver
     from .following_collector import discover_current_handle, normalize_handle, page_has_login_or_restriction, safe_get, short_error
 except ImportError:  # Direct script execution used by the desktop subprocess.
-    import sys, os
+    import sys
+    import os
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from driver_init import cookies_web, initialize_driver
     from following_collector import discover_current_handle, normalize_handle, page_has_login_or_restriction, safe_get, short_error
@@ -377,8 +378,10 @@ def collect_profile_preview_with_driver(
     return payload
 
 
-def collect_profile_preview(cookie_file: Path, output_file: Path, target: str, page_load_timeout: int = 30) -> dict:
-    driver = initialize_driver()
+def collect_profile_preview(
+    cookie_file: Path, output_file: Path, target: str, page_load_timeout: int = 30, proxy_url: str = ""
+) -> dict:
+    driver = initialize_driver(proxy_url=proxy_url)
     try:
         safe_get(driver, BOOTSTRAP_URL, timeout=page_load_timeout)
         cookies_web(driver, str(cookie_file))

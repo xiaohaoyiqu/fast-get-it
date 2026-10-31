@@ -10,17 +10,20 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
-from software_app.core.adapter import CrawlerAdapter, TaskCancelled
+from software_app.core.adapter import CrawlerAdapter
 from software_app.core.browser_driver import chromedriver_status
 from software_app.core.events import CallbackSet
 from software_app.core.exports import safe_csv_cell
 from software_app.core.models import DownloadTask, ModuleInfo, ProgressEvent, TargetPreview
+from software_app.core.output_lock import output_path_lock, output_paths_lock
 from software_app.core.settings import TWITTER_DATA_DIR, TWITTER_ROOT
-from software_app.crawlers.common import safe_component
+from software_app.crawlers.common import safe_component, write_text_atomic
 from software_app.crawlers.twitter import TwitterCrawlerService
-from software_app.crawlers.twitter.download_method import configure_downloads, request_with_retries
+from software_app.crawlers.twitter.download_method import (
+    JsonDownloadRecord, JsonListRecord, RECORD_LOCK_TIMEOUT, configure_downloads, request_with_retries,
+)
 from software_app.crawlers.twitter.following_collector import collect_following
-from software_app.crawlers.twitter.profile_preview import collect_profile_preview, target_to_handle
+from software_app.crawlers.twitter.profile_preview import collect_profile_preview
 from software_app.crawlers.twitter.twitter_Crawler_2 import DEFAULT_CONFIG, config_bool, load_config, safe_path_name
 
 
@@ -37,17 +40,12 @@ TWITTER_RESERVED_ROUTES = {"home", "explore", "notifications", "messages", "sear
 def _read_json_file(path: Path, default: object) -> object:
     try:
         return json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return default
 
 
 def _write_empty_record(path: Path) -> int:
-    payload = _read_json_file(path, {})
-    items = payload.get("items", payload) if isinstance(payload, dict) else {}
-    count = len(items) if isinstance(items, dict) else 0
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"version": 1, "items": {}}, ensure_ascii=False, indent=2), encoding="utf-8")
-    return count
+    return JsonDownloadRecord(path).clear()
 
 
 def _latest_time(left: str, right: str) -> str:
@@ -215,16 +213,13 @@ class TwitterNativeAdapter(CrawlerAdapter):
         for name in ("config.json", "X_cookie.json", "downloaded_urls.json", "failed_urls.json"):
             target = self.runtime_data_dir / name
             source = self.twitter_root / name
-            if not target.exists() and source.exists():
-                shutil.copy2(source, target)
+            with output_path_lock(target, timeout=RECORD_LOCK_TIMEOUT):
+                if not target.exists() and source.exists():
+                    write_text_atomic(target, source.read_text(encoding="utf-8-sig"))
         config = self.runtime_data_dir / "config.json"
-        if not config.exists():
-            try:
-                with config.open("x", encoding="utf-8") as file:
-                    json.dump(DEFAULT_CONFIG, file, ensure_ascii=False, indent=2)
-                    file.write("\n")
-            except FileExistsError:
-                pass
+        with output_path_lock(config, timeout=RECORD_LOCK_TIMEOUT):
+            if not config.exists():
+                write_text_atomic(config, json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2) + "\n")
 
     def preview_target(self, raw_target: str, options: dict | None = None) -> TargetPreview:
         options = options or {}
@@ -277,46 +272,27 @@ class TwitterNativeAdapter(CrawlerAdapter):
         return self.runtime_data_dir / "hidden_history.json"
 
     def _hidden_history_keys(self) -> set[str]:
-        payload = _read_json_file(self._hidden_history_file(), {"items": []})
-        items = payload.get("items", []) if isinstance(payload, dict) else []
-        return {str(item).strip().casefold() for item in items if str(item).strip()} if isinstance(items, list) else set()
+        items = JsonListRecord(self._hidden_history_file()).snapshot()
+        return {str(item).strip().casefold() for item in items if str(item).strip()}
 
-    def _write_hidden_history_keys(self, keys: set[str]) -> None:
-        path = self._hidden_history_file()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps({"version": 1, "items": sorted(keys)}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+    def _update_hidden_history_keys(self, *, add=(), remove=()) -> int:
+        additions = {str(value).strip().casefold() for value in add if str(value).strip()}
+        removals = {str(value).strip().casefold() for value in remove if str(value).strip()}
+
+        def mutate(items):
+            before = {str(value).strip().casefold() for value in items if str(value).strip()}
+            after = (before | additions) - removals
+            items[:] = sorted(after)
+            return len(after - before)
+
+        return JsonListRecord(self._hidden_history_file()).update(mutate)
 
     def _mark_downloaded_user(self, raw_target: str, normalized_target: str, output_dir: Path) -> None:
         handle = target_to_handle(raw_target) or target_to_handle(normalized_target)
         if not handle:
             return
         history_file = self.downloaded_users_file()
-        payload = _read_json_file(history_file, {"version": 1, "items": {}})
-        if not isinstance(payload, dict):
-            payload = {"version": 1, "items": {}}
-        items = payload.get("items")
-        if not isinstance(items, dict):
-            items = {}
         key = handle.lower()
-        item = items.get(key, {}) if isinstance(items.get(key), dict) else {}
-        item.update(
-            {
-                "handle": handle,
-                "target": raw_target,
-                "profile_url": f"https://x.com/{handle}",
-                "media_url": normalize_target(raw_target),
-                "output_dir": str(output_dir),
-                "last_downloaded_at": __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        )
-        item["downloads"] = int(item.get("downloads", 0) or 0) + 1
-        items[key] = item
-        history_file.parent.mkdir(parents=True, exist_ok=True)
-        history_file.write_text(json.dumps({"version": 1, "items": items}, ensure_ascii=False, indent=2), encoding="utf-8")
-        hidden = self._hidden_history_keys()
         unhide = {key.casefold()}
         for account in self.load_following_accounts():
             if str(account.get("handle") or "").strip().lstrip("@").casefold() == key.casefold():
@@ -325,9 +301,22 @@ class TwitterNativeAdapter(CrawlerAdapter):
         cached_profile = _read_json_file(self.profile_preview_file(handle), {})
         if isinstance(cached_profile, dict):
             unhide.add(str(cached_profile.get("display_name") or "").strip().casefold())
-        remaining = hidden - {value for value in unhide if value}
-        if remaining != hidden:
-            self._write_hidden_history_keys(remaining)
+
+        def mutate(items):
+            item = items.get(key, {}) if isinstance(items.get(key), dict) else {}
+            item.update({
+                "handle": handle, "target": raw_target, "profile_url": f"https://x.com/{handle}",
+                "media_url": normalize_target(raw_target), "output_dir": str(output_dir),
+                "last_downloaded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            item["downloads"] = int(item.get("downloads", 0) or 0) + 1
+            items[key] = item
+
+        with output_paths_lock((history_file, self._hidden_history_file()), timeout=RECORD_LOCK_TIMEOUT):
+            JsonDownloadRecord(history_file).validate()
+            JsonListRecord(self._hidden_history_file()).validate()
+            JsonDownloadRecord(history_file).update(mutate)
+            self._update_hidden_history_keys(remove=unhide)
 
     def downloaded_users(self, output_dir: Path | str | None = None) -> list[dict]:
         self._ensure_runtime_files()
@@ -526,12 +515,15 @@ class TwitterNativeAdapter(CrawlerAdapter):
         return list(rows.values())[: max(1, min(int(limit), 20))]
     def clear_download_records(self) -> dict[str, int]:
         self._ensure_runtime_files()
-        counts = {
-            "downloaded_urls": _write_empty_record(self._download_record_file()),
-            "failed_urls": _write_empty_record(self._failed_record_file()),
-        }
         history_file = self.downloaded_users_file()
-        counts["downloaded_users"] = _write_empty_record(history_file) if history_file.exists() else 0
+        with output_paths_lock((self._download_record_file(), self._failed_record_file(), history_file), timeout=RECORD_LOCK_TIMEOUT):
+            for path in (self._download_record_file(), self._failed_record_file(), history_file):
+                JsonDownloadRecord(path).validate()
+            counts = {
+                "downloaded_urls": _write_empty_record(self._download_record_file()),
+                "failed_urls": _write_empty_record(self._failed_record_file()),
+                "downloaded_users": _write_empty_record(history_file) if history_file.exists() else 0,
+            }
         return counts
 
     def clear_selected_download_records(self, rows: list[dict]) -> dict[str, int]:
@@ -550,47 +542,41 @@ class TwitterNativeAdapter(CrawlerAdapter):
         if not identities:
             return {"downloaded_users": 0, "downloaded_urls": 0, "hidden": 0}
 
-        hidden = self._hidden_history_keys()
-        before_hidden = len(hidden)
-        hidden.update(identities)
-        self._write_hidden_history_keys(hidden)
-
         history_path = self.downloaded_users_file()
-        history_payload = _read_json_file(history_path, {"version": 1, "items": {}})
-        history_items = history_payload.get("items", {}) if isinstance(history_payload, dict) else {}
-        removed_users = 0
-        if isinstance(history_items, dict):
-            kept_users = {}
-            for key, value in history_items.items():
+        record_path = self._download_record_file()
+
+        def remove_users(items):
+            removed = []
+            for key, value in items.items():
                 handle = str(value.get("handle") or key).strip().lstrip("@").casefold() if isinstance(value, dict) else str(key).casefold()
                 if handle in handles:
-                    removed_users += 1
-                else:
-                    kept_users[key] = value
-            history_path.write_text(
-                json.dumps({"version": 1, "items": kept_users}, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+                    removed.append(key)
+            for key in removed:
+                del items[key]
+            return len(removed)
 
-        record_path = self._download_record_file()
-        record_payload = _read_json_file(record_path, {"version": 1, "items": {}})
-        record_items = record_payload.get("items", {}) if isinstance(record_payload, dict) else {}
-        removed_urls = 0
-        if isinstance(record_items, dict):
-            kept_urls = {}
-            for key, value in record_items.items():
+        def remove_urls(items):
+            removed = []
+            for key, value in items.items():
                 file_value = str(value.get("file") or "") if isinstance(value, dict) else ""
                 parent_name = Path(file_value).parent.name.strip().casefold() if file_value else ""
                 if parent_name and parent_name in identities:
-                    removed_urls += 1
-                else:
-                    kept_urls[key] = value
-            record_path.write_text(
-                json.dumps({"version": 1, "items": kept_urls}, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+                    removed.append(key)
+            for key in removed:
+                del items[key]
+            return len(removed)
+
+        with output_paths_lock((history_path, record_path, self._hidden_history_file()), timeout=RECORD_LOCK_TIMEOUT):
+            JsonDownloadRecord(history_path).validate()
+            JsonDownloadRecord(record_path).validate()
+            JsonListRecord(self._hidden_history_file()).validate()
+            hidden_count = self._update_hidden_history_keys(add=identities)
+            removed_users = JsonDownloadRecord(history_path).update(remove_users)
+            removed_urls = JsonDownloadRecord(record_path).update(remove_urls)
         return {
             "downloaded_users": removed_users,
             "downloaded_urls": removed_urls,
-            "hidden": len(hidden) - before_hidden,
+            "hidden": hidden_count,
         }
     def following_output_file(self) -> Path:
         return self.runtime_data_dir / "following_accounts.json"
@@ -891,6 +877,7 @@ class TwitterNativeAdapter(CrawlerAdapter):
         cancel_event: threading.Event | None = None,
         on_status=None,
         on_accounts=None,
+        proxy_url: str = "",
     ) -> dict:
         self._ensure_runtime_files()
         output = self.following_output_file()
@@ -911,6 +898,7 @@ class TwitterNativeAdapter(CrawlerAdapter):
             cancel_event=cancel_event,
             on_status=on_status,
             on_accounts=on_accounts,
+            proxy_url=proxy_url,
         )
     def profile_preview_file(self, target: str) -> Path:
         handle = target_to_handle(target) or "profile"
@@ -920,7 +908,7 @@ class TwitterNativeAdapter(CrawlerAdapter):
         handle = target_to_handle(target) or "profile"
         return self.runtime_data_dir / "profile_previews" / f"{_safe_profile_name(handle)}-avatar-cdn.img"
 
-    def cache_profile_avatar(self, target: str, avatar_url: str) -> str:
+    def cache_profile_avatar(self, target: str, avatar_url: str, *, proxy_url: str | None = None) -> str:
         """Cache an already-discovered Twitter CDN avatar without opening a profile browser."""
         parsed = urlparse(str(avatar_url or "").strip())
         if parsed.scheme != "https" or (parsed.hostname or "").lower() != "pbs.twimg.com":
@@ -930,7 +918,9 @@ class TwitterNativeAdapter(CrawlerAdapter):
             return str(output.resolve())
         config_file = self.runtime_data_dir / "config.json"
         config = load_config(str(config_file)) if config_file.is_file() else dict(DEFAULT_CONFIG)
-        configure_downloads(
+        if proxy_url is not None:
+            config["proxy_url"] = proxy_url
+        network_config = configure_downloads(
             max_retries=config.get("max_retries", 5),
             connect_timeout=config.get("request_connect_timeout", 10),
             read_timeout=config.get("request_read_timeout", 60),
@@ -939,7 +929,7 @@ class TwitterNativeAdapter(CrawlerAdapter):
             retry_backoff_base=config.get("retry_backoff_base", 1.0),
             retry_backoff_max=config.get("retry_backoff_max", 15.0),
         )
-        response = request_with_retries(avatar_url)
+        response = request_with_retries(avatar_url, network_config=network_config)
         if response is None:
             raise OSError("Twitter 头像 CDN 请求重试后仍未成功")
         try:
@@ -1022,7 +1012,7 @@ class TwitterNativeAdapter(CrawlerAdapter):
             payload["profile_url"] = f"https://x.com/{payload['handle']}"
         return payload
 
-    def fetch_profile_preview(self, target: str, timeout_seconds: int = 60) -> dict:
+    def fetch_profile_preview(self, target: str, timeout_seconds: int = 60, *, proxy_url: str = "") -> dict:
         self._ensure_runtime_files()
         output = self.profile_preview_file(target)
         cookie = self.runtime_data_dir / "X_cookie.json"
@@ -1031,6 +1021,7 @@ class TwitterNativeAdapter(CrawlerAdapter):
             output_file=output,
             target=target,
             page_load_timeout=max(10, min(int(timeout_seconds or 60), 30)),
+            proxy_url=proxy_url,
         )
         payload["source"] = "live_profile"
         return payload

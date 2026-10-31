@@ -5,7 +5,6 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from software_app.adapters import create_default_adapters
@@ -72,6 +71,9 @@ class SocialTargetTests(unittest.TestCase):
         class Response:
             status_code = 403
 
+            def close(self):
+                pass
+
         class Session:
             def get(self, *_args, **_kwargs):
                 return Response()
@@ -108,6 +110,28 @@ class SocialTargetTests(unittest.TestCase):
         self.assertEqual(calls[0].options["_output_platform"], "instagram")
         self.assertEqual(calls[0].options["max_files"], 2)
         self.assertIn("cdninstagram.com", calls[0].options["_allowed_media_hosts"])
+
+    def test_instagram_cancellation_does_not_start_browser_fallback(self):
+        from software_app.core.adapter import TaskCancelled
+
+        adapter = InstagramNativeAdapter()
+        task = DownloadTask("cancelled", "instagram", "https://www.instagram.com/p/ABC/", Path.cwd())
+        with patch.object(adapter, "_client") as client, patch.object(adapter._browser_fallback, "download") as fallback:
+            client.return_value.download.side_effect = TaskCancelled("cancelled")
+            with self.assertRaises(TaskCancelled):
+                adapter.download(task, CallbackSet(), threading.Event())
+            fallback.assert_not_called()
+
+    def test_instagram_browser_cancellation_keeps_cancelled_exception(self):
+        from software_app.core.adapter import TaskCancelled
+
+        adapter = InstagramNativeAdapter()
+        task = DownloadTask("cancelled", "instagram", "https://www.instagram.com/p/ABC/", Path.cwd())
+        with patch.object(adapter, "_client") as client, patch.object(adapter._browser_fallback, "download") as fallback:
+            client.return_value.download.side_effect = RuntimeError("dynamic shell")
+            fallback.side_effect = TaskCancelled("cancelled")
+            with self.assertRaises(TaskCancelled):
+                adapter.download(task, CallbackSet(), threading.Event())
 
 
 if __name__ == "__main__":

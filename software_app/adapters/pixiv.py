@@ -1,22 +1,26 @@
 from __future__ import annotations
 
 import csv
+from contextlib import contextmanager
 import json
 import re
 import threading
 import uuid
-from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
 from software_app.core.adapter import CrawlerAdapter
 from software_app.core.events import CallbackSet
+from software_app.core.preview_http import read_preview_image
+from software_app.core.redirect_policy import anonymous_session
+from software_app.core.output_lock import output_path_lock
 from software_app.core.models import DownloadTask, ModuleInfo, TargetPreview
 from software_app.core.settings import PIXIV_DATA_DIR, PIXIV_ROOT
-from software_app.crawlers.common import load_cookie_file
+from software_app.crawlers.common import load_cookie_file, request_get
 from software_app.crawlers.pixiv import PixivCrawler, collect_following_pages, parse_pixiv_target
 from software_app.crawlers.pixiv.external import FanboxClient
 from software_app.crawlers.pixiv.catalog import filter_bookmark_candidates
+from software_app.crawlers.pixiv.bookmark_discovery import merge_bookmark_cache
 from software_app.crawlers.pixiv.following import merge_following_users, normalize_following_user
 
 
@@ -26,16 +30,21 @@ def _is_pixiv_asset_host(host: str) -> bool:
 
 
 def _validated_preview_image(response) -> bytes:
-    content_type = str(getattr(response, "headers", {}).get("Content-Type") or "").split(";", 1)[0].strip().casefold()
-    if not content_type.startswith("image/"):
-        raise ValueError("Pixiv 头像地址没有返回图片；可能是登录页、拦截页或失效链接")
-    content = response.content
-    if not content or len(content) > 5 * 1024 * 1024:
-        raise ValueError("Pixiv 预览图为空或超过 5 MiB")
-    return content
+    return read_preview_image(response, 5 * 1024 * 1024)
 
 
 class PixivNativeAdapter(CrawlerAdapter):
+    @contextmanager
+    def _open_client(self, options=None):
+        client = self._client(options)
+        try:
+            yield client
+        finally:
+            client.session.close()
+
+    supports_media_retry = True
+    supports_collection_plan = True
+    reports_files = True
     max_concurrency = 2
 
     def __init__(self) -> None:
@@ -110,18 +119,19 @@ class PixivNativeAdapter(CrawlerAdapter):
                 metadata={**cached, "input_kind": target.kind, "target_id": target.value, "cached": True},
             )
         else:
-            client = self._client(options)
-            preview = client.preview(raw_target, options)
-            if bool(options.get("live", False)) and target.kind in {"user", "user_novels"}:
-                preview = self._cache_profile_preview(client, target.value, preview)
-            elif bool(options.get("live", False)) and target.kind == "history":
-                rows = preview.metadata.get("search_results")
-                if isinstance(rows, list):
-                    self._write_account_history([row for row in rows if isinstance(row, dict)])
+            with self._open_client(options) as client:
+                preview = client.preview(raw_target, options)
+                if bool(options.get("live", False)) and target.kind in {"user", "user_novels"}:
+                    preview = self._cache_profile_preview(client, target.value, preview)
+                elif bool(options.get("live", False)) and target.kind == "history":
+                    rows = preview.metadata.get("search_results")
+                    if isinstance(rows, list):
+                        self._write_account_history([row for row in rows if isinstance(row, dict)])
         return TargetPreview(**{**preview.__dict__, "warnings": [*preview.warnings, *self.validate()]})
 
     def download(self, task: DownloadTask, callbacks: CallbackSet, cancel_event: threading.Event) -> None:
-        self._client(task.options).download(task, callbacks, cancel_event)
+        with self._open_client(task.options) as client:
+            client.download(task, callbacks, cancel_event)
 
     def inspect_artwork(self, url: str, *, proxy_url: str = "") -> dict:
         """Read one work's author for a reviewed similarity-search candidate."""
@@ -147,12 +157,8 @@ class PixivNativeAdapter(CrawlerAdapter):
             if not cookies.get("PHPSESSID"):
                 raise ValueError("R-18 搜索需要有效 PHPSESSID，并在 Pixiv 浏览设置中开启年龄限制作品")
         options = {**options, "account_id": options.get("account_id") or self.cookie_account_id()}
-        rows = self._client(options).search(
-            query,
-            limit=limit,
-            search_mode=str(options.get("search_mode") or ""),
-            options=options,
-        )
+        with self._open_client(options) as client:
+            rows = client.search(query, limit=limit, search_mode=str(options.get("search_mode") or ""), options=options)
         if str(options.get("search_mode") or "") == "浏览历史（Premium）":
             self._write_account_history(rows)
         return rows
@@ -190,11 +196,9 @@ class PixivNativeAdapter(CrawlerAdapter):
         if avatar_url.startswith(("http://", "https://")):
             avatar_path = cache_dir / f"{user_id}.avatar"
             try:
-                response = client.session.get(avatar_url, timeout=(5, 20), headers={"Referer": "https://www.pixiv.net/"})
-                response.raise_for_status()
-                content = response.content
-                if not content:
-                    raise ValueError("头像响应为空")
+                response = request_get(anonymous_session(client.session), avatar_url,
+                                       timeout=(5, 20), headers={"Referer": "https://www.pixiv.net/"})
+                content = _validated_preview_image(response)
                 temporary_avatar = avatar_path.with_name(f".{avatar_path.name}.{uuid.uuid4().hex}.tmp")
                 temporary_avatar.write_bytes(content)
                 temporary_avatar.replace(avatar_path)
@@ -269,7 +273,7 @@ class PixivNativeAdapter(CrawlerAdapter):
         payload = self.load_bookmark_payload(kind)
         cached_account = str(payload.get("account") or "")
         current_account = self.cookie_account_id()
-        if cached_account and current_account and cached_account != current_account:
+        if cached_account and cached_account != current_account:
             return []
         rows = [
             item
@@ -288,6 +292,10 @@ class PixivNativeAdapter(CrawlerAdapter):
         limit: int = 10000,
         options: dict | None = None,
     ) -> list[dict]:
+        with output_path_lock(self.bookmark_output_file(kind), timeout=0):
+            return self._refresh_own_bookmarks(kind, limit=limit, options=options)
+
+    def _refresh_own_bookmarks(self, kind, *, limit, options):
         bookmark_kind = "novel" if kind == "novel" else "work"
         account_id = self.cookie_account_id()
         if not account_id:
@@ -296,62 +304,58 @@ class PixivNativeAdapter(CrawlerAdapter):
         # A saved collection must not be replaced by a filtered search subset.
         request_options.update({"bookmark_tag": "", "start_date": "", "end_date": ""})
         search_mode = "小说收藏" if bookmark_kind == "novel" else "作品收藏"
-        client = self._client(request_options)
-        rows = client.search(
-            account_id,
-            limit=max(1, min(int(limit), 10000)),
-            search_mode=search_mode,
-            options=request_options,
-        )
-        status = getattr(client, "last_bookmark_status", {})
-        complete = bool(status.get("complete", len(rows) < limit))
-        previous = self.load_bookmark_payload(bookmark_kind)
-        if rows == [] and previous.get("items") and previous.get("account") == account_id:
-            complete = False
-        cached_rows = list(rows)
-        if not complete and previous.get("account") == account_id:
-            seen = {str(item.get("url") or "") for item in cached_rows if isinstance(item, dict)}
-            cached_rows.extend(
-                item for item in previous.get("items", [])
-                if isinstance(item, dict) and str(item.get("url") or "") not in seen
+        with self._open_client(request_options) as client:
+            try:
+                rows = client.search(account_id, limit=max(1, min(int(limit), 10000)),
+                                     search_mode=search_mode, options=request_options)
+            except Exception as exc:
+                status = getattr(client, "last_bookmark_status", {})
+                if status:
+                    self._save_bookmark_discovery(
+                        bookmark_kind, account_id, request_options,
+                        getattr(client, "last_bookmark_rows", []), status, error=str(exc),
+                    )
+                raise
+            return self._save_bookmark_discovery(
+                bookmark_kind, account_id, request_options, rows,
+                getattr(client, "last_bookmark_status", {}),
             )
-        payload = {
-            "version": 1,
-            "platform": "pixiv",
-            "kind": bookmark_kind,
-            "account": account_id,
-            "count": len(cached_rows),
-            "fetched_count": len(rows),
-            "complete": complete,
-            "partial": not complete,
-            "scopes": status.get("scopes", []),
-            "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "items": cached_rows,
-        }
-        self._write_json_payload(self.bookmark_output_file(bookmark_kind), payload)
-        return cached_rows
+
+    def _save_bookmark_discovery(self, kind, account_id, options, rows, status, *, error=""):
+        if self.cookie_account_id() != account_id:
+            raise ValueError("读取期间 Pixiv 账号已变化，未写入其他账号的收藏缓存")
+        previous = self.load_bookmark_payload(kind)
+        if error and not rows and previous.get("account") not in {None, "", account_id}:
+            return []
+        payload = merge_bookmark_cache(
+            previous, rows, status, account_id=account_id, kind=kind,
+            visibility=str(options.get("pixiv_visibility") or "show"), error=error,
+        )
+        self._write_json_payload(self.bookmark_output_file(kind), payload)
+        return payload["items"]
 
     def fanbox_supporting_status(self, options: dict | None = None) -> dict:
-        return FanboxClient(self._client(options).session).supporting_status()
+        with self._open_client(options) as client, FanboxClient(client.session) as fanbox:
+            return fanbox.supporting_status()
 
     def fetch_preview_image_bytes(self, url: str, options: dict | None = None) -> bytes:
         image_url = str(url or "").strip()
         host = str(urlparse(image_url).hostname or "").casefold()
         if not image_url.startswith("https://") or not _is_pixiv_asset_host(host):
             raise ValueError("Pixiv 预览图必须来自 pixiv.net 或 pximg.net")
-        response = self._client(options).session.get(
-            image_url,
-            timeout=(5, 25),
-            headers={"Referer": "https://www.pixiv.net/"},
-        )
-        response.raise_for_status()
-        return _validated_preview_image(response)
+        with self._open_client(options) as client:
+            response = request_get(anonymous_session(client.session), image_url, timeout=(5, 25),
+                                   headers={"Referer": "https://www.pixiv.net/"})
+            return _validated_preview_image(response)
 
     def connection_status(self, options: dict | None = None) -> dict:
         account_id = self.cookie_account_id()
         if not account_id:
             raise ValueError("无法从 PHPSESSID 识别当前 Pixiv 账号")
-        client = self._client(options)
+        with self._open_client(options) as client:
+            return self._connection_status(client, account_id)
+
+    def _connection_status(self, client, account_id):
         body = client._body(f"/ajax/user/{account_id}?full=1", timeout=(5, 15))
         if not isinstance(body, dict):
             raise ValueError("Pixiv 作者接口没有返回有效资料")
@@ -361,12 +365,11 @@ class PixivNativeAdapter(CrawlerAdapter):
             avatar_host = str(urlparse(avatar_url).hostname or "").casefold()
             if not str(avatar_url).startswith("https://") or not _is_pixiv_asset_host(avatar_host):
                 raise ValueError("Pixiv 资料返回了不受信任的头像地址")
-            response = client.session.get(
+            response = request_get(anonymous_session(client.session),
                 avatar_url,
                 timeout=(5, 20),
                 headers={"Referer": "https://www.pixiv.net/"},
             )
-            response.raise_for_status()
             avatar_ok = bool(_validated_preview_image(response))
         return {
             "account_id": account_id,
@@ -388,16 +391,12 @@ class PixivNativeAdapter(CrawlerAdapter):
             raise ValueError("没有从所选 JSON 中读取到 Cookie")
         if "PHPSESSID" not in cookies and "FANBOXSESSID" not in cookies:
             raise ValueError("所选 Cookie 缺少 PHPSESSID 和 FANBOXSESSID；请从已登录的 Pixiv/FANBOX 浏览器重新导出")
-        output = self.runtime_data_dir / "cookies.json"
-        output.parent.mkdir(parents=True, exist_ok=True)
-        temporary = output.with_name(f".{output.name}.{uuid.uuid4().hex}.tmp")
-        try:
-            temporary.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
-            temporary.replace(output)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
-        return len(cookies)
+        from dataclasses import replace
+        from software_app.core.browser_cookie_capture import cookie_capture_spec, import_cookie_file
+
+        spec = cookie_capture_spec("Pixiv" if "PHPSESSID" in cookies else "FANBOX")
+        spec = replace(spec, destination=self.runtime_data_dir / "cookies.json", merge_existing=False)
+        return import_cookie_file(spec, source_path).cookie_count
 
     def load_following_payload(self) -> dict:
         path = self.following_output_file()
@@ -527,98 +526,101 @@ class PixivNativeAdapter(CrawlerAdapter):
         if not owner_id:
             raise ValueError("请输入要读取关注列表的 Pixiv 用户 ID 或用户网址")
         client = self._client(options)
-        existing = self.load_following_accounts()
-        source_url = f"https://www.pixiv.net/users/{owner_id}/following"
+        try:
+            existing = self.load_following_accounts()
+            source_url = f"https://www.pixiv.net/users/{owner_id}/following"
 
-        def publish_partial(payload: dict) -> None:
-            partial = {
-                **payload,
-                "version": 1,
-                "platform": "pixiv",
-                "account": owner_id,
-                "source_url": source_url,
-                "partial": True,
-                "complete": False,
-            }
-            partial["count"] = len(partial.get("items") or [])
-            self._write_following_payload(partial)
-            if on_accounts:
-                on_accounts(partial)
+            def publish_partial(payload: dict) -> None:
+                partial = {
+                    **payload,
+                    "version": 1,
+                    "platform": "pixiv",
+                    "account": owner_id,
+                    "source_url": source_url,
+                    "partial": True,
+                    "complete": False,
+                }
+                partial["count"] = len(partial.get("items") or [])
+                self._write_following_payload(partial)
+                if on_accounts:
+                    on_accounts(partial)
 
-        if visibility == "both":
-            collected: list[dict] = []
-            parts: list[dict] = []
-            for rest in ("show", "hide"):
-                if cancel_event is not None and cancel_event.is_set():
-                    break
-                old_part = [row for row in existing if str(row.get("visibility") or "show") == rest]
-                part = collect_following_pages(
-                    lambda page, current_rest=rest: client.fetch_following_page(
-                        owner_id, page=page, visibility=current_rest
+            if visibility == "both":
+                collected: list[dict] = []
+                parts: list[dict] = []
+                for rest in ("show", "hide"):
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+                    old_part = [row for row in existing if str(row.get("visibility") or "show") == rest]
+                    part = collect_following_pages(
+                        lambda page, current_rest=rest: client.fetch_following_page(
+                            owner_id, page=page, visibility=current_rest
+                        ),
+                        old_part,
+                        update_mode=update_mode,
+                        cancel_event=cancel_event,
+                        on_status=(lambda message, current_rest=rest: on_status(
+                            f"{'私密' if current_rest == 'hide' else '公开'}关注：{message}"
+                        )) if on_status else None,
+                        on_accounts=(lambda payload, current_rest=rest: publish_partial({
+                            **payload,
+                            "visibility": "both",
+                            "items": merge_following_users(
+                                existing,
+                                [*collected, *(payload.get("items") or [])],
+                                replace=False,
+                            ),
+                        })),
+                    )
+                    parts.append(part)
+                    collected.extend(part.get("items", []))
+                complete = len(parts) == 2 and all(bool(part.get("complete")) for part in parts)
+                # “公开 + 私密”只要有一侧未完整读取，就不能据此删除旧缓存中的账号。
+                # 完整更新成功时则不追加旧数据，以便正确反映已经取关的账号。
+                if not complete:
+                    collected.extend(existing)
+                seen: set[str] = set()
+                items: list[dict] = []
+                for row in collected:
+                    user_id = str(row.get("user_id") or "")
+                    if not user_id or user_id in seen:
+                        continue
+                    seen.add(user_id)
+                    items.append(row)
+                result = {
+                    "version": 1,
+                    "platform": "pixiv",
+                    "items": items,
+                    "count": len(items),
+                    "partial": not complete,
+                    "complete": complete,
+                    "update_mode": update_mode,
+                    "visibility": "both",
+                    "new_count": sum(int(part.get("new_count") or 0) for part in parts),
+                    "removed_count": sum(int(part.get("removed_count") or 0) for part in parts),
+                    "stopped_reason": "+".join(
+                        reason
+                        for reason in (str(part.get("stopped_reason") or "") for part in parts)
+                        if reason
                     ),
-                    old_part,
+                }
+            else:
+                result = collect_following_pages(
+                    lambda page: client.fetch_following_page(owner_id, page=page, visibility=visibility),
+                    existing,
                     update_mode=update_mode,
                     cancel_event=cancel_event,
-                    on_status=(lambda message, current_rest=rest: on_status(
-                        f"{'私密' if current_rest == 'hide' else '公开'}关注：{message}"
-                    )) if on_status else None,
-                    on_accounts=(lambda payload, current_rest=rest: publish_partial({
-                        **payload,
-                        "visibility": "both",
-                        "items": merge_following_users(
-                            existing,
-                            [*collected, *(payload.get("items") or [])],
-                            replace=False,
-                        ),
-                    })),
+                    on_status=on_status,
+                    on_accounts=publish_partial,
                 )
-                parts.append(part)
-                collected.extend(part.get("items", []))
-            complete = len(parts) == 2 and all(bool(part.get("complete")) for part in parts)
-            # “公开 + 私密”只要有一侧未完整读取，就不能据此删除旧缓存中的账号。
-            # 完整更新成功时则不追加旧数据，以便正确反映已经取关的账号。
-            if not complete:
-                collected.extend(existing)
-            seen: set[str] = set()
-            items: list[dict] = []
-            for row in collected:
-                user_id = str(row.get("user_id") or "")
-                if not user_id or user_id in seen:
-                    continue
-                seen.add(user_id)
-                items.append(row)
-            result = {
-                "version": 1,
-                "platform": "pixiv",
-                "items": items,
-                "count": len(items),
-                "partial": not complete,
-                "complete": complete,
-                "update_mode": update_mode,
-                "visibility": "both",
-                "new_count": sum(int(part.get("new_count") or 0) for part in parts),
-                "removed_count": sum(int(part.get("removed_count") or 0) for part in parts),
-                "stopped_reason": "+".join(
-                    reason
-                    for reason in (str(part.get("stopped_reason") or "") for part in parts)
-                    if reason
-                ),
-            }
-        else:
-            result = collect_following_pages(
-                lambda page: client.fetch_following_page(owner_id, page=page, visibility=visibility),
-                existing,
-                update_mode=update_mode,
-                cancel_event=cancel_event,
-                on_status=on_status,
-                on_accounts=publish_partial,
-            )
-        result["account"] = owner_id
-        result["source_url"] = source_url
-        self._write_following_payload(result)
-        if visibility == "both" and on_accounts:
-            on_accounts(result)
-        return result
+            result["account"] = owner_id
+            result["source_url"] = source_url
+            self._write_following_payload(result)
+            if visibility == "both" and on_accounts:
+                on_accounts(result)
+            return result
+        finally:
+            client.session.close()
 
     def _write_following_payload(self, payload: dict) -> None:
         self._write_json_payload(self.following_output_file(), payload)

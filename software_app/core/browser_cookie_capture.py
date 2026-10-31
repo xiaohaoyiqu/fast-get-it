@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from software_app.crawlers.common import load_cookie_file
+from software_app.core.cookie_store import load_cookie_records, normalize_record, merge_cookie_records
 from software_app.core.browser_driver import ensure_chromedriver
 from software_app.core.settings import (
     BROWSER_TOOLS_DIR,
@@ -136,8 +137,6 @@ def cookie_capture_spec(
             required_names=frozenset({"ipb_member_id", "ipb_pass_hash", "igneous"}),
             allowed_hosts=("e-hentai.org", "exhentai.org"),
             destination=Path(EHENTAI_DATA_DIR) / "exhentai-cookies.json",
-            validation_kind="exhentai_page",
-            validation_url="https://exhentai.org/",
         ),
     }
     if label == "JMComic":
@@ -170,7 +169,7 @@ def host_is_allowed(host: str, allowed_hosts: tuple[str, ...]) -> bool:
 
 def _cookie_records(cookies: list[dict]) -> list[dict]:
     records: list[dict] = []
-    allowed_fields = {"name", "value", "path", "domain", "secure", "httpOnly", "expiry", "sameSite"}
+    allowed_fields = {"name", "value", "path", "domain", "secure", "httpOnly", "expiry", "sameSite", "hostOnly"}
     for item in cookies:
         if not isinstance(item, dict):
             continue
@@ -185,8 +184,22 @@ def _cookie_records(cookies: list[dict]) -> list[dict]:
 
 
 def save_captured_cookies(spec: CookieCaptureSpec, cookies: list[dict]) -> CookieCaptureResult:
-    records = _cookie_records(cookies)
-    names = {str(item["name"]) for item in records}
+    defaults = {"twitter": ".x.com", "pixiv": ".pixiv.net", "fanbox": ".fanbox.cc",
+                "instagram": ".instagram.com", "ehentai": ".e-hentai.org", "exhentai": ".exhentai.org"}
+    default_domain = defaults.get(spec.key, str(urlparse(spec.login_url).hostname or ""))
+    records = []
+    for item in _cookie_records(cookies):
+        record = normalize_record(item)
+        if not record["domain"]:
+            domain = {"PHPSESSID": ".pixiv.net", "FANBOXSESSID": ".fanbox.cc"}.get(record["name"], default_domain)
+            record.update(domain=domain, hostOnly=not domain.startswith("."),
+                          secure=urlparse(spec.login_url).scheme == "https")
+        allowed = (*spec.allowed_hosts, "fanbox.cc") if spec.key == "pixiv" else spec.allowed_hosts
+        if not host_is_allowed(record["domain"].lstrip("."), allowed):
+            raise ValueError("Cookie 域不属于所选平台；请仅导出该平台的登录资料")
+        records.append(record)
+    names = {str(item["name"]) for item in records
+             if item["value"] and ("expiry" not in item or item["expiry"] > time.time())}
     missing = sorted(spec.required_names - names)
     if missing:
         raise ValueError(f"{spec.label} 登录尚未完成，缺少 Cookie：{', '.join(missing)}")
@@ -194,13 +207,12 @@ def save_captured_cookies(spec: CookieCaptureSpec, cookies: list[dict]) -> Cooki
     destination = Path(spec.destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     if spec.storage_format == "selenium_list":
-        payload: object = records
+        payload: object = [{key: value for key, value in record.items() if key != "hostOnly"} for record in records]
     else:
-        values = {str(item["name"]): str(item["value"]) for item in records}
         if spec.merge_existing:
-            payload = {**load_cookie_file(destination), **values}
+            payload = merge_cookie_records(load_cookie_records(destination), records)
         else:
-            payload = values
+            payload = records
 
     temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -217,18 +229,9 @@ def save_captured_cookies(spec: CookieCaptureSpec, cookies: list[dict]) -> Cooki
 
 
 def import_cookie_file(spec: CookieCaptureSpec, source: Path | str) -> CookieCaptureResult:
-    values = load_cookie_file(source)
-    if not values:
+    records = load_cookie_records(source, strict=True)
+    if not records:
         raise ValueError("Cookie 文件为空或格式无效；支持 JSON、Netscape cookies.txt 或 Cookie 请求头文本")
-    default_domain = ".x.com" if spec.key == "twitter" else ""
-    records = [
-        {
-            "name": name,
-            "value": value,
-            **({"domain": default_domain, "path": "/", "secure": True} if default_domain else {}),
-        }
-        for name, value in values.items()
-    ]
     return save_captured_cookies(spec, records)
 
 
@@ -292,16 +295,6 @@ def _browser_session_is_valid(driver, spec: CookieCaptureSpec, current_url: str)
         return False
     if any(marker in path for marker in ("/login", "/challenge", "/checkpoint")):
         return False
-    if spec.validation_kind == "exhentai_page":
-        host = str(parsed.hostname or "").casefold()
-        if host not in {"exhentai.org", "www.exhentai.org"}:
-            return False
-        try:
-            page = str(driver.page_source or "")
-        except Exception:
-            return False
-        body = re.search(r"<body[^>]*>(.*?)</body>", page, flags=re.IGNORECASE | re.DOTALL)
-        return bool(body and body.group(1).strip())
     if spec.validation_kind == "cookie_only" or not spec.validation_url:
         return True
 
@@ -351,10 +344,12 @@ def capture_browser_cookies(
     timeout_seconds: int = 600,
 ) -> CookieCaptureResult:
     """Open a disposable visible Chrome profile and save a completed login session."""
+    if spec.key in {"ehentai", "exhentai"}:
+        raise ValueError("EH 仅支持手动填写或导入 Cookie，请在设置页选择对应入口")
     from selenium import webdriver
     from selenium.common.exceptions import TimeoutException, WebDriverException
     from selenium.webdriver import ChromeOptions
-    from selenium.webdriver.chrome.service import Service
+    from .browser_process import ManagedChromeService as Service
 
     ensure_data_dirs()
     driver_path = ensure_chromedriver(auto_download=True)
@@ -387,7 +382,6 @@ def capture_browser_cookies(
 
         last_host = ""
         last_validation_at = 0.0
-        exhentai_navigation_attempted = False
         while time.monotonic() < deadline:
             if stop_event.is_set():
                 raise CookieCaptureCancelled("已停止获取 Cookie")
@@ -400,18 +394,6 @@ def capture_browser_cookies(
                     raise CookieCaptureCancelled("已停止获取 Cookie") from exc
                 raise CookieCaptureCancelled("登录浏览器已关闭，未保存 Cookie") from exc
             names = {str(item.get("name") or "") for item in cookies if isinstance(item, dict)}
-            if (
-                spec.key == "exhentai"
-                and not exhentai_navigation_attempted
-                and {"ipb_member_id", "ipb_pass_hash"}.issubset(names)
-                and not host_is_allowed(last_host, ("exhentai.org",))
-            ):
-                exhentai_navigation_attempted = True
-                try:
-                    driver.get(spec.validation_url)
-                except TimeoutException:
-                    pass
-                continue
             ready = spec.required_names.issubset(names) and host_is_allowed(last_host, spec.allowed_hosts)
             now = time.monotonic()
             if ready and now - last_validation_at >= 3.0:

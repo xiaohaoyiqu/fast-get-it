@@ -8,6 +8,7 @@ from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
 
 from software_app.core.models import IMAGE_EXTENSIONS
+from software_app.core.library_service import plan_library_paths, rename_library_file, execute_library_cleanup
 from software_app.crawlers.common import normalized_path_component, path_component_error
 from software_app.ui.desktop_support import (
     LIBRARY_RENDER_LIMIT,
@@ -51,8 +52,9 @@ class LibraryTabMixin:
         )
         ttk.Button(folder_header, text="刷新 / 扫描", command=self._scan_output_dir).grid(row=0, column=4, padx=(6, 0))
         ttk.Button(folder_header, text="打开所选文件夹", command=self._open_selected_folder).grid(row=0, column=5, padx=(6, 0))
+        ttk.Button(folder_header, text="筛选 / 导出 / 清理", command=self._open_library_tools).grid(row=1, column=5, padx=(6, 0), pady=(5, 0))
         self.library_status_label = ttk.Label(folder_header, textvariable=self.library_status_var, style="Small.TLabel")
-        self.library_status_label.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(5, 0))
+        self.library_status_label.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(5, 0))
         self.library_search_var.trace_add("write", self._schedule_library_filter)
         folder_tree_frame, self.folder_tree = self._create_scrollable_tree(top_frame, columns, height=1)
         self.folder_tree.heading("module", text="平台")
@@ -130,6 +132,16 @@ class LibraryTabMixin:
         self.file_preview.grid(row=1, column=0, sticky="nsew")
         self.library_preview_frame.bind("<Configure>", self._handle_preview_resize)
         self.library_tab.bind("<Configure>", self._adapt_library_height, add="+")
+
+    def _open_library_tools(self) -> None:
+        from .library_tools import LibraryToolsDialog
+
+        dialog = getattr(self, "_library_tools_dialog", None)
+        if dialog is not None and dialog.winfo_exists():
+            dialog.lift()
+            dialog.focus_set()
+            return
+        self._library_tools_dialog = LibraryToolsDialog(self)
 
     def _adapt_library_height(self, event: tk.Event | None = None) -> None:
         """Give the file list priority; preview can be opened on demand."""
@@ -650,6 +662,11 @@ class LibraryTabMixin:
         if not source.is_file():
             messagebox.showerror("文件不存在", str(source))
             return
+        try:
+            entry = plan_library_paths(self.storage, paths).entries[0]
+        except Exception as exc:
+            messagebox.showerror("暂时不能重命名", str(exc))
+            return
         new_name = simpledialog.askstring("重命名文件", "输入新文件名（包含扩展名）：", initialvalue=source.name)
         if new_name is None:
             return
@@ -663,12 +680,7 @@ class LibraryTabMixin:
             messagebox.showerror("文件已存在", str(destination))
             return
         try:
-            source.rename(destination)
-            try:
-                self.storage.rename_file_record(source, destination)
-            except Exception:
-                destination.rename(source)
-                raise
+            rename_library_file(self.manager, entry, destination)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("重命名失败", str(exc))
             return
@@ -685,6 +697,11 @@ class LibraryTabMixin:
         if not existing:
             messagebox.showerror("文件不存在", "所选文件已经不存在")
             return
+        try:
+            plan = plan_library_paths(self.storage, existing)
+        except Exception as exc:
+            messagebox.showerror("暂时不能回收", str(exc))
+            return
         preview_names = "\n".join(f"• {path.name}" for path in existing[:8])
         if len(existing) > 8:
             preview_names += f"\n……另有 {len(existing) - 8} 个文件"
@@ -693,15 +710,15 @@ class LibraryTabMixin:
             f"将以下 {len(existing)} 个文件移到 Windows 回收站？\n\n{preview_names}\n\n下载任务和历史记录不会被清空。",
         ):
             return
-        moved = 0
-        errors: list[str] = []
-        for path in existing:
-            try:
-                _send_path_to_recycle_bin(path)
-                self.storage.delete_file_record(path)
-                moved += 1
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{path.name}: {exc}")
+        try:
+            result = execute_library_cleanup(self.manager, plan, mode="recycle", recycle=_send_path_to_recycle_bin)
+        except Exception as exc:
+            messagebox.showerror("回收失败", str(exc))
+            return
+        moved = result.recycled
+        errors = result.errors
+        if result.skipped:
+            errors = [f"已跳过 {result.skipped} 个发生变化或被占用的项目", *errors]
         self._refresh_library(scan=False)
         self.status_var.set(f"已将 {moved} 个文件移到回收站")
         if errors:

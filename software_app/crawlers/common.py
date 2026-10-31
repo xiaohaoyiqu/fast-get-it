@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-import json
+from software_app.core.task_control import task_cancelled, task_wait
+
+import ipaddress
 import os
 import re
-import shutil
-import subprocess
+import socket
 import threading
 import time
 import unicodedata
+import uuid
+from contextlib import contextmanager, nullcontext
 from datetime import date
 from pathlib import Path
 from typing import Iterable
@@ -17,8 +20,16 @@ import requests
 from PIL import Image
 
 from software_app.core.external_tools import find_ffmpeg
+from software_app.core.http_transfer import download_http_file
+from software_app.core.media_process import run_media_process
+from software_app.core.output_lock import output_paths_lock
+from software_app.core.file_conflict import reuse_existing, media_output
+from software_app.core.network_policy import HTTP_BACKOFF, retry_after_seconds
+from software_app.core.error_policy import InvalidMediaError
 
 from software_app.core.adapter import TaskCancelled
+from software_app.core.cookie_store import CookieSession, cookie_jar, load_cookie_records
+from software_app.core.response_read import read_response_json
 
 
 INVALID_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -30,6 +41,81 @@ WINDOWS_RESERVED_NAMES = {
     *(f"COM{index}" for index in range(1, 10)),
     *(f"LPT{index}" for index in range(1, 10)),
 }
+
+# Successful resolutions expire; failed lookups must never become permission
+# to fetch an unvalidated destination.
+DNS_CACHE_TTL = 60.0
+DNS_CACHE_MAX_ENTRIES = 1024
+_dns_cache: dict[str, tuple[float, tuple[str, ...]]] = {}
+_dns_cache_lock = threading.Lock()
+
+
+def _resolve_host_ips(hostname: str) -> list[str]:
+    """Resolve hostname to IPs with a small in-memory cache."""
+    hostname = hostname.rstrip(".").casefold()
+    with _dns_cache_lock:
+        cached = _dns_cache.get(hostname)
+        if cached and cached[0] > time.monotonic():
+            return list(cached[1])
+        _dns_cache.pop(hostname, None)
+    try:
+        infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+        ips = list({info[4][0] for info in infos})
+    except (socket.gaierror, socket.herror, OSError):
+        ips = []
+    if ips:
+        with _dns_cache_lock:
+            now = time.monotonic()
+            expired = [key for key, (deadline, _) in _dns_cache.items() if deadline <= now]
+            for key in expired:
+                del _dns_cache[key]
+            if hostname not in _dns_cache and len(_dns_cache) >= DNS_CACHE_MAX_ENTRIES:
+                del _dns_cache[next(iter(_dns_cache))]
+            _dns_cache[hostname] = (now + DNS_CACHE_TTL, tuple(ips))
+    return ips
+
+
+def validate_external_url(url: str) -> str:
+    """Validate that a URL is safe to fetch from this desktop app.
+
+    Checks:
+    - scheme must be http or https
+    - host must not resolve to a loopback, link-local, private, or reserved IP
+      (SSRF defence against crawler-supplied or user-injected URLs)
+
+    Returns the URL unchanged if valid, raises ValueError otherwise.
+    """
+    if not url or not isinstance(url, str):
+        raise ValueError("下载地址为空")
+    try:
+        parsed = urlparse(url)
+    except ValueError as exc:
+        raise ValueError(f"下载地址无法解析: {exc}") from exc
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise ValueError(f"不支持的下载协议: {parsed.scheme or '（空）'}")
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("下载地址缺少主机名")
+    # If the host is already an IP literal, check it directly.
+    try:
+        ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        pass  # Not an IP literal; resolve via DNS below.
+    else:
+        if not ip.is_global or ip.is_multicast:
+            raise ValueError(f"下载地址指向受限网络: {hostname}")
+        return url
+    ips = _resolve_host_ips(hostname)
+    if not ips:
+        raise ValueError(f"无法安全解析下载地址: {hostname}")
+    for ip_text in ips:
+        try:
+            ip = ipaddress.ip_address(ip_text)
+        except ValueError as exc:
+            raise ValueError(f"下载地址返回无效解析结果: {hostname}") from exc
+        if not ip.is_global or ip.is_multicast:
+            raise ValueError(f"下载地址解析到受限网络: {hostname} -> {ip_text}")
+    return url
 
 
 def _filesystem_text(value: object) -> str:
@@ -91,28 +177,8 @@ def platform_output_root(output_dir: Path | str, platform: str) -> Path:
 
 
 def load_cookie_file(path: Path | str | None) -> dict[str, str]:
-    if not path:
-        return {}
-    cookie_path = Path(path).expanduser()
-    if not cookie_path.exists():
-        return {}
-    try:
-        raw = cookie_path.read_text(encoding="utf-8-sig")
-    except OSError:
-        return {}
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        return _parse_cookie_text(raw)
-    if isinstance(payload, dict):
-        return {str(key): str(value) for key, value in payload.items() if value is not None}
-    if isinstance(payload, list):
-        result: dict[str, str] = {}
-        for item in payload:
-            if isinstance(item, dict) and item.get("name") and item.get("value") is not None:
-                result[str(item["name"])] = str(item["value"])
-        return result
-    return {}
+    # Compatibility view for name checks only; HTTP sessions use full records.
+    return {row["name"]: row["value"] for row in load_cookie_records(path)}
 
 
 def _parse_cookie_text(raw: str) -> dict[str, str]:
@@ -168,6 +234,8 @@ def load_request_header_profile(path: Path | str | None) -> dict[str, str]:
         "sec-ch-ua", "sec-ch-ua-arch", "sec-ch-ua-bitness", "sec-ch-ua-full-version",
         "sec-ch-ua-full-version-list", "sec-ch-ua-mobile", "sec-ch-ua-model", "sec-ch-ua-platform",
         "sec-ch-ua-platform-version",
+        "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "sec-fetch-user",
+        "upgrade-insecure-requests", "priority",
     }
     lines = raw.splitlines()
     result: dict[str, str] = {}
@@ -202,8 +270,9 @@ def make_session(
     cookie_file: Path | str | None = None,
     proxy_url: str = "",
     extra_headers: dict[str, str] | None = None,
+    cookie_domains: dict[str, str] | None = None,
 ) -> requests.Session:
-    session = requests.Session()
+    session = CookieSession()
     # Network routing is controlled by the app's explicit proxy setting.  In
     # particular, an empty setting must mean a real direct connection instead
     # of silently inheriting stale HTTP(S)_PROXY values from the launcher.
@@ -221,9 +290,9 @@ def make_session(
         session.headers["Referer"] = referer
     if extra_headers:
         session.headers.update(extra_headers)
-    cookies = load_cookie_file(cookie_file)
-    if cookies:
-        session.cookies.update(cookies)
+    default_domain = str(urlparse(referer).hostname or "") if referer else ""
+    session.cookies = cookie_jar(load_cookie_records(cookie_file), default_domain=default_domain,
+                                 cookie_domains=cookie_domains, default_secure=urlparse(referer).scheme != "http")
     proxy_url = str(proxy_url or "").strip()
     if proxy_url:
         endpoint = proxy_url if "://" in proxy_url else f"http://{proxy_url}"
@@ -231,15 +300,30 @@ def make_session(
     return session
 
 
-def request_json(session: requests.Session, url: str, timeout: tuple[int, int] = (10, 45)) -> dict:
-    response = session.get(url, timeout=timeout)
-    response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise ValueError(f"接口未返回对象: {url}")
-    if payload.get("error") is True:
-        raise RuntimeError(str(payload.get("message") or "远程接口返回错误"))
-    return payload
+def request_get(session, url: str, *, timeout=(10, 45), headers=None, params=None, cancel_event=None):
+    from software_app.core.redirect_policy import get_with_redirects
+
+    return get_with_redirects(session, url, timeout=timeout, headers=headers, params=params,
+                              cancel_event=cancel_event, validate_url=validate_external_url)
+
+
+def request_json(session: requests.Session, url: str, timeout: tuple[int, int] = (10, 45), *, cancel_event=None) -> dict:
+    response = request_get(session, url, timeout=timeout, cancel_event=cancel_event)
+    try:
+        if getattr(response, "status_code", 0) in {429, 503}:
+            delay = retry_after_seconds(response.headers.get("Retry-After"), 1.0)
+            HTTP_BACKOFF.defer(url, delay)
+            if isinstance(getattr(response, "url", None), str):
+                HTTP_BACKOFF.defer(response.url, delay)
+        response.raise_for_status()
+        payload = read_response_json(response, cancel_event=cancel_event)
+        if not isinstance(payload, dict):
+            raise ValueError(f"接口未返回对象: {url}")
+        if payload.get("error") is True:
+            raise RuntimeError(str(payload.get("message") or "远程接口返回错误"))
+        return payload
+    finally:
+        response.close()
 
 
 def download_file(
@@ -250,28 +334,21 @@ def download_file(
     *,
     timeout: tuple[int, int] = (10, 90),
     chunk_size: int = 128 * 1024,
+    resume: bool = True,
+    overwrite: bool = False,
+    retries: int = 2,
+    public_referer: str | None = None,
 ) -> int:
-    if cancel_event.is_set():
-        raise TaskCancelled("任务已取消")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(destination.name + ".part")
-    try:
-        with session.get(url, stream=True, timeout=timeout) as response:
-            response.raise_for_status()
-            with temporary.open("wb") as output:
-                for chunk in response.iter_content(chunk_size=chunk_size):
-                    if cancel_event.is_set():
-                        raise TaskCancelled("任务已取消")
-                    if chunk:
-                        output.write(chunk)
-        os.replace(temporary, destination)
-        return destination.stat().st_size
-    finally:
-        if temporary.exists():
-            try:
-                temporary.unlink()
-            except OSError:
-                pass
+    if public_referer is not None:
+        from software_app.core.redirect_policy import anonymous_session
+
+        session = anonymous_session(session)
+        if public_referer:
+            session.headers["Referer"] = public_referer
+    return download_http_file(
+        session, url, destination, cancel_event, timeout=timeout, chunk_size=chunk_size,
+        validate_url=validate_external_url, resume=resume, overwrite=overwrite, retries=retries,
+    )
 
 
 def extension_from_url(url: str, default: str = ".bin", allowed: Iterable[str] | None = None) -> str:
@@ -279,6 +356,79 @@ def extension_from_url(url: str, default: str = ".bin", allowed: Iterable[str] |
     if allowed is not None and suffix not in set(allowed):
         return default
     return suffix or default
+
+
+class MediaDownloadResult(tuple):
+    """Keep size/reused tuple compatibility while exposing the actual output path."""
+    def __new__(cls, size, reused, path):
+        result = super().__new__(cls, (size, reused))
+        result.path = path
+        return result
+
+
+@contextmanager
+def _image_content_errors():
+    try:
+        yield
+    except (ValueError, SyntaxError, Image.DecompressionBombError) as exc:
+        raise InvalidMediaError("图片内容或结构无效") from exc
+    except OSError as exc:
+        if exc.errno is not None or getattr(exc, "winerror", None) is not None:
+            raise
+        raise InvalidMediaError("图片内容或结构无效") from exc
+
+
+def download_media_file(
+    session: requests.Session, url: str, source: Path, destination: Path,
+    cancel_event: threading.Event, final_suffix: str, *,
+    timeout: tuple[int, int] = (10, 90), verify_image: bool = False, conflict_policy: str = "reuse",
+    public_referer: str | None = None,
+) -> tuple[int, bool]:
+    """Lock the entire transfer/conversion pipeline; return (size, reused).
+
+    A second task reuses the completed destination only after the first task has
+    finished converting it. Partial network state stays beside the hidden source.
+    """
+    if source.resolve() == destination.resolve():
+        source = destination.with_name(f".{destination.stem}.source{destination.suffix}")
+    with media_output(destination, conflict_policy, cancel_event, related_paths=(source,)) as destination:
+        if task_cancelled(cancel_event):
+            raise TaskCancelled("任务已取消")
+        if reuse_existing(destination, conflict_policy):
+            if verify_image:
+                with _image_content_errors(), Image.open(destination) as opened:
+                    opened.verify()
+            return MediaDownloadResult(destination.stat().st_size, True, destination)
+        try:
+            arguments = {"public_referer": public_referer} if public_referer is not None else {}
+            download_file(session, url, source, cancel_event, timeout=timeout, overwrite=True, **arguments)
+            if verify_image:
+                with _image_content_errors(), Image.open(source) as opened:
+                    opened.verify()
+            if task_cancelled(cancel_event):
+                raise TaskCancelled("任务已取消")
+            with _image_content_errors() if verify_image else nullcontext():
+                convert_media_file(source, destination, final_suffix, cancel_event=cancel_event)
+            return MediaDownloadResult(destination.stat().st_size, False, destination)
+        finally:
+            source.unlink(missing_ok=True)
+
+
+def write_text_atomic(path: Path, content: str, *, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(content, encoding=encoding)
+        for attempt in range(6):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError as exc:
+                if os.name != "nt" or getattr(exc, "winerror", None) not in {5, 32, 33} or attempt == 5:
+                    raise
+                time.sleep(min(0.4, 0.05 * (2 ** attempt)))
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 OUTPUT_FORMAT_DEFAULTS = {
@@ -334,11 +484,21 @@ def normalized_media_extension(
     return source_suffix
 
 
-def convert_media_file(source: Path, destination: Path, media_extension: str) -> None:
+def convert_media_file(source: Path, destination: Path, media_extension: str, *, cancel_event=None) -> None:
     """Convert a real media file to the selected output format."""
+    cancel_event = cancel_event if cancel_event is not None else threading.Event()
+    if task_cancelled(cancel_event):
+        raise TaskCancelled("转换前任务已取消")
+    with output_paths_lock((source, destination), cancel_event):
+        _convert_media_file(source, destination, media_extension, cancel_event)
+
+
+def _convert_media_file(source: Path, destination: Path, media_extension: str, cancel_event) -> None:
     source = Path(source)
     destination = Path(destination)
     media_extension = media_extension.lower()
+    if task_cancelled(cancel_event):
+        raise TaskCancelled("转换前任务已取消")
     if source.suffix.lower() == media_extension:
         os.replace(source, destination)
         return
@@ -357,13 +517,16 @@ def convert_media_file(source: Path, destination: Path, media_extension: str) ->
                         image = image.convert("RGB")
                 image.save(temporary, format=output_format, quality=95)
             for attempt in range(5):
+                if task_cancelled(cancel_event):
+                    raise TaskCancelled("图片转换提交前任务已取消")
                 try:
                     os.replace(temporary, destination)
                     break
                 except PermissionError as exc:
                     if getattr(exc, "winerror", None) not in {32, 33} or attempt == 4:
                         raise
-                    time.sleep(0.1 * (attempt + 1))
+                    if task_wait(cancel_event, 0.1 * (attempt + 1)):
+                        raise TaskCancelled("等待转换文件提交期间任务已取消") from exc
             source.unlink(missing_ok=True)
         finally:
             temporary.unlink(missing_ok=True)
@@ -380,15 +543,23 @@ def convert_media_file(source: Path, destination: Path, media_extension: str) ->
     elif media_extension == ".gif":
         arguments = ["-vf", "fps=12,scale='min(1280,iw)':-2:flags=lanczos", "-loop", "0"]
     else:
+        if task_cancelled(cancel_event):
+            raise TaskCancelled("转换提交前任务已取消")
         os.replace(source, destination)
         return
-    completed = subprocess.run(
-        [ffmpeg, "-y", "-i", str(source), *arguments, str(destination)],
-        capture_output=True,
-        text=True,
-        timeout=1800,
-    )
-    if completed.returncode != 0 or not destination.is_file():
-        message = (completed.stderr or completed.stdout or "转换失败").strip().splitlines()
-        raise RuntimeError(message[-1] if message else "媒体格式转换失败")
-    source.unlink(missing_ok=True)
+    temporary = destination.with_name(f".{destination.stem}.{uuid.uuid4().hex}.convert{media_extension}")
+    try:
+        completed = run_media_process(
+            [ffmpeg, "-y", "-i", str(source), *arguments, str(temporary)],
+            cancel_event,
+            timeout=1800,
+        )
+        if completed.returncode != 0 or not temporary.is_file() or not temporary.stat().st_size:
+            message = (completed.stderr or completed.stdout or "转换失败").strip().splitlines()
+            raise RuntimeError(message[-1] if message else "媒体格式转换失败")
+        if task_cancelled(cancel_event):
+            raise TaskCancelled("转换提交前任务已取消")
+        os.replace(temporary, destination)
+        source.unlink(missing_ok=True)
+    finally:
+        temporary.unlink(missing_ok=True)

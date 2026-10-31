@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 import threading
 import tkinter as tk
 import webbrowser
 from pathlib import Path
+from datetime import date
 from tkinter import filedialog, messagebox, ttk
 from urllib.parse import urlparse
 
@@ -17,15 +19,21 @@ from software_app.core.browser_cookie_capture import (
     cookie_capture_spec,
     import_cookie_file as import_browser_cookie_file,
 )
-from software_app.core.ehentai_plain_browser import (
-    capture_ehentai_plain_chrome,
+from software_app.core.ehentai_cookie import (
+    eh_validation_failure,
     import_ehentai_cookie_file,
-    open_ehentai_plain_chrome,
-    open_exhentai_after_login,
+    save_ehentai_manual_cookies,
+    validate_saved_ehentai_cookies,
 )
 from software_app.core.jmcomic_plain_browser import capture_jmcomic_plain_chrome, open_jmcomic_plain_chrome
 from software_app.core.plugin_loader import external_plugin_manifest, set_external_plugin_enabled
-from software_app.core.settings import PLUGINS_DIR, PROJECT_ROOT
+from software_app.core.settings import PLUGINS_DIR
+from software_app.core.bandwidth import validate_speed_limit, apply_bandwidth_settings
+from software_app.core.file_conflict import CONFLICT_LABELS
+from software_app.core.recent_directories import recent_directories
+from software_app.core.browser_pool import browser_limit, apply_browser_settings
+from software_app.core.resource_pressure import validate_memory_policy
+from software_app.core.aria2_bt import validate_aria2_limits
 
 
 IMAGE_FORMAT_LABELS = {"PNG": "png", "JPEG": "jpg", "WebP": "webp", "保留原格式": "original"}
@@ -51,7 +59,7 @@ PLUGIN_PURPOSES = {
     "jmcomic": "搜索并下载 JMComic 漫画与章节，读取个人收藏、追更、观看记录及站内屏蔽标签，可使用 PDF/长图后处理。",
     "google_image": "用本地图片发现相似页面候选；只负责发现，不会绕过确认自动下载候选页面。",
     "website": "打开用户选定的普通网页并提取其中的图片、视频和音频资源。",
-    "bluesky": "通过公开 AppView API 读取用户、公开关注、帖子、图片和视频；账号拉黑/静音可在黑名单管理中取回。",
+    "bluesky": "读取公开用户、关注、帖子和媒体。已结束的未加密 HLS 视频可分片恢复；直播、加密、字节范围及独立音轨暂不支持。",
     "instagram": "读取账号、帖子和 Reels 页面媒体；登录限定页面使用本机 Cookie，普通账号关注列表暂未接入。",
     "ehentai": "搜索和预览 E-Hentai/ExHentai 画廊，保存正常展示图与元数据；种子可手动开启，不购买官方归档或启动 P2P。",
 }
@@ -62,6 +70,71 @@ def plugin_purpose(plugin_id: str) -> str:
 
 
 class SettingsTabMixin:
+    def _remember_output_dir(self, _event=None, *, show_errors: bool = False) -> bool:
+        """Remember a committed directory edit independently of other settings."""
+        text = self.output_dir_var.get().strip()
+        if not text:
+            text = str(self.storage.get_setting("default_output_dir", "") or "").strip()
+            if not text:
+                from software_app.core.settings import DEFAULT_OUTPUT_DIR
+
+                text = str(DEFAULT_OUTPUT_DIR)
+        try:
+            text.encode("utf-16-le", errors="strict")
+            if "\x00" in text:
+                raise ValueError("路径包含空字符")
+            directory = Path(text).expanduser().resolve()
+            if directory.exists() and not directory.is_dir():
+                raise ValueError("所选保存位置是一个文件")
+            value = str(directory)
+            old_history = self.storage.get_setting("recent_output_dirs", [])
+            history = recent_directories([value, *(old_history if isinstance(old_history, list) else [])])
+            if self.storage.get_setting("default_output_dir") != value or history != old_history:
+                self.storage.set_settings({"default_output_dir": value, "recent_output_dirs": history})
+        except (OSError, RuntimeError, UnicodeError, ValueError, sqlite3.Error) as exc:
+            if show_errors:
+                messagebox.showwarning("保存目录未记住", f"无法保存此目录：{exc}")
+            return False
+        self.output_dir_var.set(value)
+        return True
+
+    def _create_recent_output_menu(self, parent):
+        button = ttk.Menubutton(parent, text="最近目录")
+        menu = tk.Menu(button, tearoff=False)
+        button.configure(menu=menu)
+
+        def refresh():
+            menu.delete(0, "end")
+            history = recent_directories(self.storage.get_setting("recent_output_dirs", []))
+            if not history:
+                menu.add_command(label="暂无最近目录", state="disabled")
+            for value in history:
+                try:
+                    available = Path(value).is_dir() and os.access(value, os.W_OK)
+                except OSError:
+                    available = False
+                menu.add_command(label=value + ("" if available else "（不可用）"),
+                                 state="normal" if available else "disabled",
+                                 command=lambda value=value: select(value))
+            menu.add_separator()
+            menu.add_command(label="清空最近目录记录", command=lambda: self.storage.set_setting("recent_output_dirs", []))
+
+        def select(value):
+            try:
+                available = Path(value).is_dir() and os.access(value, os.W_OK)
+            except OSError:
+                available = False
+            if not available:
+                messagebox.showwarning("目录不可用", "目录已删除或不可写，请重新选择")
+                return
+            self.output_dir_var.set(value)
+            if self._remember_output_dir(show_errors=True):
+                self._refresh_library()
+                self._load_twitter_history()
+
+        menu.configure(postcommand=refresh)
+        return button
+
     def _build_settings_tab(self) -> None:
         self.settings_tab.columnconfigure(0, weight=1)
         self.settings_tab.rowconfigure(1, weight=1)
@@ -94,14 +167,21 @@ class SettingsTabMixin:
             lambda event: self.settings_canvas.itemconfigure(self._settings_canvas_window, width=max(1, event.width)),
         )
         ttk.Label(body, text="默认保存目录", style="Panel.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10))
-        ttk.Entry(body, textvariable=self.output_dir_var).grid(row=0, column=1, sticky="ew")
-        ttk.Button(body, text="浏览", command=self._choose_output_dir).grid(row=0, column=2, padx=(8, 0))
+        output_entry = ttk.Entry(body, textvariable=self.output_dir_var)
+        output_entry.grid(row=0, column=1, sticky="ew")
+        output_entry.bind("<FocusOut>", self._remember_output_dir)
+        directory_tools = ttk.Frame(body)
+        directory_tools.grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(directory_tools, text="浏览", command=self._choose_output_dir).pack(side="left")
+        self._create_recent_output_menu(directory_tools).pack(side="left", padx=(5, 0))
+        self.transfer_cache_button = ttk.Button(directory_tools, text="续传缓存清理", command=self._open_transfer_cache_tools)
+        self.transfer_cache_button.pack(side="left", padx=(5, 0))
 
         ttk.Label(body, text="代理 URL", style="Panel.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(10, 0))
         ttk.Entry(body, textvariable=self.proxy_var).grid(row=1, column=1, columnspan=2, sticky="ew", pady=(10, 0))
         ttk.Label(
             body,
-            text="可留空；支持 http、https、socks5、socks5h。为避免凭据泄漏，不在这里保存含用户名或密码的代理。",
+            text="支持 http、https、socks5、socks5h；EH 留空时直连，不自动使用系统代理。修改后点“保存设置”用于后续下载；不要填写含用户名或密码的代理。",
             style="Small.TLabel",
             wraplength=680,
         ).grid(row=2, column=1, columnspan=2, sticky="w", pady=(3, 0))
@@ -122,9 +202,34 @@ class SettingsTabMixin:
         ttk.Spinbox(option_grid, from_=30, to=600, textvariable=self.webpage_timeout_var, width=7).grid(
             row=1, column=1, sticky="w", padx=(6, 18), pady=(9, 0)
         )
+        ttk.Checkbutton(option_grid, text="启用媒体 HTTP 总限速", variable=self.speed_limit_enabled_var).grid(
+            row=1, column=2, columnspan=2, sticky="w", pady=(9, 0))
+        ttk.Label(option_grid, text="总速率 KiB/s", style="Panel.TLabel").grid(row=1, column=4, sticky="w", pady=(9, 0))
+        ttk.Spinbox(option_grid, from_=1, to=1048576, textvariable=self.speed_limit_kib_var, width=10).grid(
+            row=1, column=5, sticky="w", padx=(6, 18), pady=(9, 0))
+        ttk.Label(option_grid, text="保存后立即作用于本实例 HTTP 媒体（含 Bluesky HLS 分片）；不含浏览器、其他外部引擎和 BT。关闭时保留数值。",
+                  style="Small.TLabel", wraplength=680).grid(row=2, column=0, columnspan=8, sticky="w", pady=(6, 0))
 
         concurrency_grid = ttk.LabelFrame(option_grid, text="下载任务并发上限", style="Panel.TLabelframe", padding=8)
-        concurrency_grid.grid(row=2, column=0, columnspan=8, sticky="ew", pady=(12, 0))
+        ttk.Label(option_grid, text="浏览器会话总上限", style="Panel.TLabel").grid(row=3, column=0, sticky="w", pady=(9, 0))
+        ttk.Spinbox(option_grid, from_=1, to=10, textvariable=self.browser_session_limit_var, width=7).grid(
+            row=3, column=1, sticky="w", padx=(6, 18), pady=(9, 0))
+        ttk.Label(option_grid, text="Twitter 下载、动态网页与 Google 搜索共用；保存后控制新会话入场。",
+                  style="Small.TLabel", wraplength=540).grid(row=3, column=2, columnspan=6, sticky="w", pady=(9, 0))
+        ttk.Checkbutton(option_grid, text="启用浏览器内存保护（Windows）", variable=self.browser_memory_enabled_var).grid(
+            row=4, column=0, columnspan=4, sticky="w", pady=(9, 0))
+        ttk.Label(option_grid, text="暂停阈值 %", style="Panel.TLabel").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        ttk.Spinbox(option_grid, from_=50, to=99, textvariable=self.browser_memory_high_var, width=7).grid(
+            row=5, column=1, sticky="w", padx=(6, 18), pady=(6, 0))
+        ttk.Label(option_grid, text="恢复阈值 %", style="Panel.TLabel").grid(row=5, column=2, sticky="w", pady=(6, 0))
+        ttk.Spinbox(option_grid, from_=10, to=98, textvariable=self.browser_memory_recovery_var, width=7).grid(
+            row=5, column=3, sticky="w", padx=(6, 18), pady=(6, 0))
+        ttk.Label(option_grid, text="最多等待秒数", style="Panel.TLabel").grid(row=5, column=4, sticky="w", pady=(6, 0))
+        ttk.Spinbox(option_grid, from_=10, to=3600, textvariable=self.browser_memory_timeout_var, width=7).grid(
+            row=5, column=5, sticky="w", padx=(6, 18), pady=(6, 0))
+        ttk.Label(option_grid, text="默认关闭；只延迟新会话，不关闭现有浏览器。内存持续未回落则结束等待并报告失败，可稍后重试。",
+                  style="Small.TLabel", wraplength=680).grid(row=6, column=0, columnspan=8, sticky="w", pady=(6, 0))
+        concurrency_grid.grid(row=7, column=0, columnspan=8, sticky="ew", pady=(12, 0))
         for column in (1, 2, 3):
             concurrency_grid.columnconfigure(column, weight=1)
         for column, title in enumerate(("平台", "平台总上限", "作品 / 单项", "作者 / 范围")):
@@ -198,7 +303,43 @@ class SettingsTabMixin:
             style="Small.TLabel",
             wraplength=650,
         ).grid(row=1, column=0, columnspan=4, sticky="ew", pady=(7, 0))
+        ttk.Checkbutton(
+            archive_grid, text="任务结束时保存未完成文件清单（TXT：文件名 + 下载地址）",
+            variable=self.save_unfinished_txt_var,
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(7, 0))
+        ttk.Label(
+            archive_grid,
+            text=(
+                "当前仅支持 Twitter：存在已发现但未完成的媒体时，在保存目录生成 未完成_<任务ID>.txt，"
+                "列出未下载完成的文件名和原始地址，便于手动重试或排查重命名/占用问题。默认关闭。"
+            ),
+            style="Small.TLabel",
+            wraplength=650,
+        ).grid(row=3, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+        ttk.Checkbutton(
+            archive_grid, text="下载时重命名文件（日期 + 推文ID/作品ID + 序号）",
+            variable=self.rename_downloads_var,
+        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(7, 0))
+        ttk.Checkbutton(
+            archive_grid, text="重命名后删除源文件（原始文件名的下载副本）",
+            variable=self.delete_source_after_rename_var,
+        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        ttk.Label(
+            archive_grid,
+            text=(
+                "这两个开关当前仅控制 Twitter 图片、视频及经视频流程处理的 GIF，不控制音频或其他平台。"
+                "重命名默认开启，有来源信息时使用「日期_来源ID_序号」；关闭后使用 URL 原始名。"
+                "「重命名后删除源文件」默认开启；关闭时复制并保留原始名文件。更改设置不会迁移已有文件。"
+            ),
+            style="Small.TLabel",
+            wraplength=650,
+        ).grid(row=6, column=0, columnspan=4, sticky="ew", pady=(4, 0))
         archive_grid.columnconfigure(3, weight=1)
+        ttk.Label(archive_grid, text="媒体文件重名时").grid(row=7, column=0, sticky="w", pady=(7, 0))
+        ttk.Combobox(archive_grid, textvariable=self.file_conflict_var, values=tuple(CONFLICT_LABELS),
+                     state="readonly", width=20).grid(row=7, column=1, sticky="w", pady=(7, 0))
+        ttk.Label(archive_grid, text="新建任务生效；恢复沿用原策略。媒体、JM 合成及 ZIP 创建共用策略，独立元数据与外部插件范围见手册。",
+                  style="Small.TLabel", wraplength=650).grid(row=8, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
         pixiv_grid = ttk.LabelFrame(body, text="Pixiv 下载", style="Panel.TLabelframe", padding=10)
         pixiv_grid.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(14, 0))
@@ -239,7 +380,7 @@ class SettingsTabMixin:
         ).grid(row=3, column=5, sticky="w", padx=(6, 0), pady=(9, 0))
         ttk.Label(
             pixiv_grid,
-            text="日期格式 YYYY-MM-DD；日期和最低收藏数用于标签/标题搜索。私密关注、R-18 和 FANBOX 付费内容需要有效登录 Cookie；R-18 还必须在 Pixiv 浏览设置中开启。",
+            text="日期格式 YYYY-MM-DD；日期和最低收藏数用于标签/标题搜索。私密关注、R-18 和 FANBOX 付费内容需要有效登录 Cookie；R-18 还必须在 Pixiv 浏览设置中开启。作品收藏先解析选定作品再登记媒体清单，可在队列查看逐页结果及仅补未完成项；动图按整组补下。",
             style="Small.TLabel", wraplength=760,
         ).grid(row=4, column=0, columnspan=6, sticky="w", pady=(7, 0))
         ttk.Label(pixiv_grid, text="收藏标签", style="Panel.TLabel").grid(row=5, column=0, sticky="w", pady=(9, 0))
@@ -397,8 +538,16 @@ class SettingsTabMixin:
             variable=self.eh_bt_download_enabled_var,
         )
         self.eh_bt_checkbutton.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        aria2_limits = ttk.Frame(eh_download_grid)
+        aria2_limits.grid(row=2, column=0, sticky="ew", pady=(7, 0))
+        ttk.Checkbutton(aria2_limits, text="启用 aria2 下载／上传限速", variable=self.aria2_limit_enabled_var).grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(aria2_limits, text="下载 KiB/s").grid(row=1, column=0, sticky="w", pady=(5, 0))
+        ttk.Spinbox(aria2_limits, from_=1, to=1048576, textvariable=self.aria2_download_kib_var, width=9).grid(row=1, column=1, padx=(6, 18), pady=(5, 0))
+        ttk.Label(aria2_limits, text="上传 KiB/s").grid(row=1, column=2, sticky="w", pady=(5, 0))
+        ttk.Spinbox(aria2_limits, from_=1, to=1048576, textvariable=self.aria2_upload_kib_var, width=9).grid(row=1, column=3, padx=(6, 0), pady=(5, 0))
+        ttk.Label(aria2_limits, text="每个 aria2 进程分别限速，不与 HTTP 预算合并；保存后用于新任务，运行中的任务保持原值。", style="Small.TLabel", wraplength=650).grid(row=2, column=0, columnspan=4, sticky="w", pady=(5, 0))
         aria2_actions = ttk.Frame(eh_download_grid, style="Panel.TFrame")
-        aria2_actions.grid(row=2, column=0, sticky="ew", pady=(7, 0))
+        aria2_actions.grid(row=3, column=0, sticky="ew", pady=(7, 0))
         aria2_actions.columnconfigure(1, weight=1)
         ttk.Label(
             aria2_actions, textvariable=self.aria2_status_var, style="Small.TLabel", wraplength=560,
@@ -416,7 +565,7 @@ class SettingsTabMixin:
             ),
             style="Small.TLabel",
             wraplength=600,
-        ).grid(row=3, column=0, sticky="ew", pady=(7, 0))
+        ).grid(row=4, column=0, sticky="ew", pady=(7, 0))
         eh_download_grid.columnconfigure(0, weight=1)
 
         cookie_grid = ttk.LabelFrame(body, text="浏览器登录与 Cookie", style="Panel.TLabelframe", padding=10)
@@ -441,44 +590,43 @@ class SettingsTabMixin:
             command=self._start_cookie_capture,
         )
         self.cookie_capture_button.grid(row=0, column=0, sticky="w")
-        self.eh_plain_open_button = ttk.Button(
-            cookie_actions, text="打开普通 Chrome 登录", command=self._open_eh_plain_browser,
-        )
-        self.eh_plain_open_button.grid(row=0, column=0, sticky="w")
-        self.eh_plain_open_button.grid_remove()
-        self.eh_plain_capture_button = ttk.Button(
-            cookie_actions, text="登录完成后获取", command=self._capture_eh_plain_browser,
-        )
-        self.eh_plain_capture_button.grid(row=0, column=1, sticky="w", padx=(8, 0))
-        self.eh_plain_capture_button.grid_remove()
-        self.eh_inner_open_button = ttk.Button(
-            cookie_actions, text="登录后进入里站", command=self._open_exhentai_after_login,
-        )
-        self.eh_inner_open_button.grid(row=0, column=2, sticky="w", padx=(8, 0))
-        self.eh_inner_open_button.grid_remove()
+        self.eh_manual_button = ttk.Button(cookie_actions, text="手动填写 EH Cookie", command=self._edit_eh_cookie)
+        self.eh_manual_button.grid(row=0, column=0, sticky="w")
+        self.eh_manual_button.grid_remove()
+        self.eh_validate_button = ttk.Button(cookie_actions, text="验证 EH 登录（联网）", command=self._validate_eh_cookie)
+        self.eh_validate_button.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.eh_validate_button.grid_remove()
         self.header_convert_button = ttk.Button(
             cookie_actions, text="请求头 TXT → JSON", command=self._convert_header_txt,
         )
         self.header_convert_button.grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Button(cookie_actions, text="导入 Cookie 文件", command=self._import_selected_cookie_file).grid(
-            row=1, column=1, sticky="w", padx=(8, 0), pady=(8, 0)
+        self.cookie_import_button = ttk.Button(
+            cookie_actions, text="导入 Cookie 文件", command=self._import_selected_cookie_file
         )
+        self.cookie_import_button.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
         ttk.Button(cookie_actions, text="使用说明", command=self._open_cookie_capture_guide).grid(
             row=1, column=2, sticky="w", padx=(8, 0), pady=(8, 0)
         )
+        self.cookie_capture_help_var = tk.StringVar()
+        self.cookie_capture_help_label = ttk.Label(
+            cookie_grid, textvariable=self.cookie_capture_help_var,
+            style="Small.TLabel", wraplength=720,
+        )
+        self.cookie_capture_help_label.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         self.cookie_capture_status_label = ttk.Label(
             cookie_grid,
             textvariable=self.cookie_capture_status_var,
             style="Small.TLabel",
             wraplength=720,
         )
-        self.cookie_capture_status_label.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
-        cookie_grid.bind(
-            "<Configure>",
-            lambda event: self.cookie_capture_status_label.configure(
-                wraplength=max(260, min(560, event.width - 24))
-            ),
-        )
+        self.cookie_capture_status_label.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+
+        def resize_cookie_help(event):
+            width = max(260, min(560, event.width - 24))
+            self.cookie_capture_help_label.configure(wraplength=width)
+            self.cookie_capture_status_label.configure(wraplength=width)
+
+        cookie_grid.bind("<Configure>", resize_cookie_help)
 
         plugin_grid = ttk.LabelFrame(body, text="平台接入插件（与上方压缩后处理不同）", style="Panel.TLabelframe", padding=10)
         plugin_grid.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(14, 0))
@@ -535,18 +683,19 @@ class SettingsTabMixin:
         self.driver_check_button.grid(row=0, column=1, padx=(8, 0))
         self.driver_download_button = ttk.Button(actions, text="安装 / 更新驱动", command=lambda: self._check_browser_driver(True))
         self.driver_download_button.grid(row=0, column=2, padx=(8, 0))
-        ttk.Label(
+        self.driver_status_label = ttk.Label(
             body,
             textvariable=self.browser_driver_status_var,
             style="Section.TLabel",
             wraplength=760,
-        ).grid(row=11, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        )
+        self.driver_status_label.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(12, 0))
         ttk.Label(
             body,
-            text="设置影响之后创建的任务；重试任务会采用当前保存的统一格式。Cookie 继续保存在各平台运行数据目录，不会显示或写入日志。",
+            text="设置影响之后创建的任务；默认按原任务设置重试，只有选择“按当前设置重试”才更新配置。Cookie 独立保存，不进入人物配置。",
             style="Small.TLabel",
             wraplength=760,
-        ).grid(row=12, column=0, columnspan=3, sticky="ew", pady=(16, 0))
+        ).grid(row=13, column=0, columnspan=3, sticky="ew", pady=(16, 0))
         self.bind_all("<MouseWheel>", self._scroll_settings_canvas, add="+")
 
 
@@ -583,18 +732,19 @@ class SettingsTabMixin:
         }
 
 
-    def _saved_format_options(self) -> dict[str, object]:
+    def _saved_format_options(self, settings: dict | None = None) -> dict[str, object]:
+        settings = self.storage.get_settings() if settings is None else settings
         image_format = normalize_output_format(
-            "image_format", self.storage.get_setting("image_output_format", "png")
+            "image_format", settings.get("image_output_format", "png")
         )
         video_format = normalize_output_format(
-            "video_format", self.storage.get_setting("video_output_format", "mp4")
+            "video_format", settings.get("video_output_format", "mp4")
         )
         animation_format = normalize_output_format(
-            "animation_format", self.storage.get_setting("animation_output_format", "gif")
+            "animation_format", settings.get("animation_output_format", "gif")
         )
         audio_format = normalize_output_format(
-            "audio_format", self.storage.get_setting("audio_output_format", "mp3")
+            "audio_format", settings.get("audio_output_format", "mp3")
         )
         return {
             "image_format": image_format,
@@ -606,14 +756,15 @@ class SettingsTabMixin:
         }
 
 
-    def _saved_archive_options(self) -> dict[str, object]:
-        mode = str(self.storage.get_setting("archive_mode", "none") or "none").strip().casefold()
+    def _saved_archive_options(self, settings: dict | None = None) -> dict[str, object]:
+        settings = self.storage.get_settings() if settings is None else settings
+        mode = str(settings.get("archive_mode", "none") or "none").strip().casefold()
         if mode not in {"none", "task", "folder"}:
             mode = "none"
         return {
             "archive_mode": mode,
-            "extract_archives": bool(self.storage.get_setting("extract_archives", False)),
-            "archive_cleanup_sources": bool(self.storage.get_setting("archive_cleanup_sources", False)),
+            "extract_archives": bool(settings.get("extract_archives", False)),
+            "archive_cleanup_sources": mode != "none" and bool(settings.get("archive_cleanup_sources", False)),
         }
 
 
@@ -629,6 +780,20 @@ class SettingsTabMixin:
 
 
     def _save_settings(self) -> None:
+        if self.file_conflict_var.get() not in CONFLICT_LABELS:
+            messagebox.showwarning("文件重名设置无效", "请从列表选择文件重名处理方式")
+            return
+        try:
+            speed_enabled, speed_kib = validate_speed_limit(self.speed_limit_enabled_var.get(), self.speed_limit_kib_var.get())
+            aria2_limits = validate_aria2_limits(self.aria2_limit_enabled_var.get(), self.aria2_download_kib_var.get(), self.aria2_upload_kib_var.get())
+            session_limit = browser_limit(self.browser_session_limit_var.get())
+            memory_policy = validate_memory_policy(
+                self.browser_memory_enabled_var.get(), self.browser_memory_high_var.get(),
+                self.browser_memory_recovery_var.get(), self.browser_memory_timeout_var.get(),
+            )
+        except (ValueError, tk.TclError) as exc:
+            messagebox.showwarning("限速或浏览器会话设置无效", str(exc))
+            return
         output_text = self.output_dir_var.get().strip()
         if not output_text:
             messagebox.showwarning("保存目录无效", "默认保存目录不能为空")
@@ -646,7 +811,14 @@ class SettingsTabMixin:
             return
         proxy_url = self.proxy_var.get().strip()
         if proxy_url:
-            parsed = urlparse(proxy_url)
+            try:
+                parsed = urlparse(proxy_url)
+                port = parsed.port
+                if port == 0 or any(char.isspace() for char in proxy_url):
+                    raise ValueError("代理地址或端口无效")
+            except ValueError:
+                messagebox.showwarning("代理 URL 无效", "请检查主机、IPv6 括号和端口（1–65535）")
+                return
             if parsed.scheme.lower() not in {"http", "https", "socks5", "socks5h"} or not parsed.hostname:
                 messagebox.showwarning("代理 URL 无效", "代理必须包含 http、https、socks5 或 socks5h 协议及主机名")
                 return
@@ -699,13 +871,28 @@ class SettingsTabMixin:
             )
             return
         for label, value in (("开始日期", pixiv_start_date), ("结束日期", pixiv_end_date)):
-            if value and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
-                messagebox.showwarning("Pixiv 日期无效", f"{label}必须使用 YYYY-MM-DD，例如 2026-09-13")
-                return
+            if value:
+                try:
+                    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                        raise ValueError("日期格式无效")
+                    date.fromisoformat(value)
+                except ValueError:
+                    messagebox.showwarning("Pixiv 日期无效", f"{label}必须是有效的 YYYY-MM-DD 日期，例如 2026-09-13")
+                    return
+        if pixiv_start_date and pixiv_end_date and pixiv_start_date > pixiv_end_date:
+            messagebox.showwarning("Pixiv 日期无效", "开始日期不能晚于结束日期")
+            return
         if pixiv_visibility not in {"show", "hide", "both"} or pixiv_age_mode not in {"all", "safe", "r18"} or not pixiv_author_match:
             messagebox.showwarning("Pixiv 设置无效", "收藏/关注范围或年龄分区无效")
             return
-        jm_parsed = urlparse(jm_domain)
+        try:
+            jm_parsed = urlparse(jm_domain)
+            jm_port = jm_parsed.port
+            if jm_port == 0 or jm_parsed.username or jm_parsed.password or any(char.isspace() for char in jm_domain):
+                raise ValueError("站点地址无效")
+        except ValueError:
+            messagebox.showwarning("JMComic 设置无效", "请检查站点域名和端口，地址不能包含账号密码")
+            return
         if jm_parsed.scheme not in {"http", "https"} or not jm_parsed.hostname:
             messagebox.showwarning("JMComic 设置无效", "站点域名必须是完整的 http/https URL")
             return
@@ -761,7 +948,75 @@ class SettingsTabMixin:
             "可能超过未启用长路径支持的软件或 FFmpeg 的限制。\n\n仍要保存这个目录吗？",
         ):
             return
+        settings = {
+            "speed_limit_enabled": speed_enabled,
+            "speed_limit_kib": speed_kib,
+            "browser_session_limit": session_limit,
+            **memory_policy.settings(),
+            "default_output_dir": str(output_dir),
+            "proxy_url": proxy_url,
+            "task_retries": retries,
+            "google_candidate_limit": candidate_limit,
+            "google_manual_wait": manual_wait,
+            "webpage_max_files": max_files,
+            "webpage_read_timeout": webpage_timeout,
+            "pixiv_max_works": pixiv_max_works,
+            "pixiv_filter_ai": pixiv_filter_ai,
+            "pixiv_visibility": pixiv_visibility,
+            "pixiv_start_date": pixiv_start_date,
+            "pixiv_end_date": pixiv_end_date,
+            "pixiv_minimum_bookmarks": pixiv_minimum_bookmarks,
+            "pixiv_age_mode": pixiv_age_mode,
+            "pixiv_bookmark_tag": pixiv_bookmark_tag,
+            "pixiv_author_match_mode": pixiv_author_match,
+            "pixiv_history_limit": pixiv_history_limit,
+            "jmcomic_domain": jm_domain,
+            "jmcomic_user_agent": jm_user_agent,
+            "jmcomic_order_by": jm_order,
+            "jmcomic_time_range": jm_time,
+            "jmcomic_category": jm_category,
+            "jmcomic_favorite_username": jm_favorite_username,
+            "jmcomic_favorite_folder_id": jm_favorite_folder,
+            "jmcomic_novel_favorite_folder_id": jm_novel_favorite_folder,
+            "jmcomic_match_mode": jm_match,
+            "jmcomic_postprocess": jm_postprocess,
+            "jmcomic_download_cover": jm_download_cover,
+            "eh_download_torrent": eh_download_torrent,
+            "eh_bt_download_enabled": eh_bt_download_enabled,
+            **aria2_limits.options(),
+            "image_output_format": format_options["image_format"],
+            "video_output_format": format_options["video_format"],
+            "animation_output_format": format_options["animation_format"],
+            "audio_output_format": format_options["audio_format"],
+            "archive_mode": archive_options["archive_mode"],
+            "extract_archives": archive_options["extract_archives"],
+            "archive_cleanup_sources": archive_options["archive_cleanup_sources"],
+            "save_unfinished_txt": bool(self.save_unfinished_txt_var.get()),
+            "rename_downloads": bool(self.rename_downloads_var.get()),
+            "delete_source_after_rename": bool(self.delete_source_after_rename_var.get()),
+            "file_conflict": CONFLICT_LABELS[self.file_conflict_var.get()],
+        }
+        for module_id, limits in task_concurrency_values.items():
+            for group, prefix in (("total", "task_concurrency"), ("single", "task_concurrency_single"), ("collection", "task_concurrency_collection")):
+                settings[f"{prefix}_{module_id}"] = limits[group]
+        try:
+            self.storage.set_settings(settings)
+        except (OSError, sqlite3.Error) as exc:
+            messagebox.showerror("设置保存失败", f"设置未写入，请检查数据目录权限或数据库占用：{exc}")
+            return
         self.output_dir_var.set(str(output_dir))
+        apply_bandwidth_settings(settings)
+        apply_browser_settings(settings)
+        self.browser_session_limit_var.set(str(session_limit))
+        self.browser_memory_enabled_var.set(memory_policy.enabled)
+        self.browser_memory_high_var.set(str(memory_policy.high))
+        self.browser_memory_recovery_var.set(str(memory_policy.recovery))
+        self.browser_memory_timeout_var.set(str(memory_policy.timeout))
+        self.speed_limit_enabled_var.set(speed_enabled)
+        self.speed_limit_kib_var.set(str(speed_kib))
+        self.aria2_limit_enabled_var.set(aria2_limits.enabled)
+        self.aria2_download_kib_var.set(str(aria2_limits.download_kib))
+        self.aria2_upload_kib_var.set(str(aria2_limits.upload_kib))
         self.retries_var.set(retries)
         self.google_limit_var.set(candidate_limit)
         self.google_wait_var.set(manual_wait)
@@ -796,51 +1051,19 @@ class SettingsTabMixin:
         )
         self.extract_archives_var.set(bool(archive_options["extract_archives"]))
         self.archive_cleanup_sources_var.set(bool(archive_options["archive_cleanup_sources"]))
-        self.storage.set_setting("default_output_dir", str(output_dir))
-        self.storage.set_setting("proxy_url", proxy_url)
-        self.storage.set_setting("task_retries", retries)
-        self.storage.set_setting("google_candidate_limit", candidate_limit)
-        self.storage.set_setting("google_manual_wait", manual_wait)
-        self.storage.set_setting("webpage_max_files", max_files)
-        self.storage.set_setting("webpage_read_timeout", webpage_timeout)
-        for module_id, limits in task_concurrency_values.items():
-            self.storage.set_setting(f"task_concurrency_{module_id}", limits["total"])
-            self.storage.set_setting(f"task_concurrency_single_{module_id}", limits["single"])
-            self.storage.set_setting(f"task_concurrency_collection_{module_id}", limits["collection"])
-        self.storage.set_setting("pixiv_max_works", pixiv_max_works)
-        self.storage.set_setting("pixiv_filter_ai", pixiv_filter_ai)
-        self.storage.set_setting("pixiv_visibility", pixiv_visibility)
-        self.storage.set_setting("pixiv_start_date", pixiv_start_date)
-        self.storage.set_setting("pixiv_end_date", pixiv_end_date)
-        self.storage.set_setting("pixiv_minimum_bookmarks", pixiv_minimum_bookmarks)
-        self.storage.set_setting("pixiv_age_mode", pixiv_age_mode)
-        self.storage.set_setting("pixiv_bookmark_tag", pixiv_bookmark_tag)
-        self.storage.set_setting("pixiv_author_match_mode", pixiv_author_match)
-        self.storage.set_setting("pixiv_history_limit", pixiv_history_limit)
-        self.storage.set_setting("jmcomic_domain", jm_domain)
-        self.storage.set_setting("jmcomic_user_agent", jm_user_agent)
-        self.storage.set_setting("jmcomic_order_by", jm_order)
-        self.storage.set_setting("jmcomic_time_range", jm_time)
-        self.storage.set_setting("jmcomic_category", jm_category)
-        self.storage.set_setting("jmcomic_favorite_username", jm_favorite_username)
-        self.storage.set_setting("jmcomic_favorite_folder_id", jm_favorite_folder)
-        self.storage.set_setting("jmcomic_novel_favorite_folder_id", jm_novel_favorite_folder)
-        self.storage.set_setting("jmcomic_match_mode", jm_match)
-        self.storage.set_setting("jmcomic_postprocess", jm_postprocess)
-        self.storage.set_setting("jmcomic_download_cover", jm_download_cover)
-        self.storage.set_setting("eh_download_torrent", eh_download_torrent)
-        self.storage.set_setting("eh_bt_download_enabled", eh_bt_download_enabled)
-        self.storage.set_setting("image_output_format", format_options["image_format"])
-        self.storage.set_setting("video_output_format", format_options["video_format"])
-        self.storage.set_setting("animation_output_format", format_options["animation_format"])
-        self.storage.set_setting("audio_output_format", format_options["audio_format"])
-        self.storage.set_setting("archive_mode", archive_options["archive_mode"])
-        self.storage.set_setting("extract_archives", archive_options["extract_archives"])
-        self.storage.set_setting("archive_cleanup_sources", archive_options["archive_cleanup_sources"])
         self._refresh_jm_auth_status()
-        self.status_var.set("全局设置已保存，将用于之后创建的任务")
+        self.status_var.set("设置已保存；HTTP 总限速立即生效，aria2 限速及其他选项用于新任务")
         self._append_log("已保存全局设置（代理凭据不会写入日志）")
 
+
+    def _open_transfer_cache_tools(self):
+        from software_app.ui.transfer_cache import TransferCacheDialog
+
+        dialog = getattr(self, "_transfer_cache_dialog", None)
+        if dialog is None or not dialog.winfo_exists():
+            self._transfer_cache_dialog = TransferCacheDialog(self)
+        else:
+            dialog.lift()
 
     def _pixiv_age_selection_changed(self, _event=None) -> None:
         if PIXIV_AGE_LABELS.get(self.pixiv_age_mode_var.get()) != "r18":
@@ -859,10 +1082,11 @@ class SettingsTabMixin:
         self.fanbox_check_button.state(["disabled"])
         self.fanbox_status_var.set("正在读取 FANBOX 订阅状态…")
 
+        proxy_url = self.proxy_var.get().strip()
+
         def worker() -> None:
             try:
                 adapter = self.manager.get_adapter("pixiv")
-                proxy_url = str(self.storage.get_setting("proxy_url", "") or "")
                 status = adapter.fanbox_supporting_status({"proxy_url": proxy_url})
             except Exception as exc:  # noqa: BLE001
                 self.ui_queue.put(("fanbox_status_error", str(exc)))
@@ -875,10 +1099,11 @@ class SettingsTabMixin:
         self.pixiv_connection_button.state(["disabled"])
         self.pixiv_connection_status_var.set("正在检查 Pixiv 资料接口和头像图片…")
 
+        proxy_url = self.proxy_var.get().strip()
+
         def worker() -> None:
             try:
                 adapter = self.manager.get_adapter("pixiv")
-                proxy_url = str(self.storage.get_setting("proxy_url", "") or "")
                 result = adapter.connection_status({"proxy_url": proxy_url})
             except Exception as exc:  # noqa: BLE001
                 self.ui_queue.put(("pixiv_connection_error", str(exc)))
@@ -889,8 +1114,12 @@ class SettingsTabMixin:
 
     def _check_jm_connection(self) -> None:
         domain = self.jm_domain_var.get().strip().rstrip("/")
-        parsed = urlparse(domain)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        try:
+            parsed = urlparse(domain)
+            valid = parsed.scheme in {"http", "https"} and bool(parsed.hostname) and parsed.port != 0
+        except ValueError:
+            valid = False
+        if not valid:
             messagebox.showwarning("JMComic 域名无效", "请先输入完整的 http/https 站点 URL")
             return
         self.jm_connection_button.state(["disabled"])
@@ -1151,90 +1380,93 @@ class SettingsTabMixin:
             "Pixiv": "登录后还会调用 Pixiv 账号接口确认会话有效；保存时保留已有 FANBOX Cookie。",
             "FANBOX": "通过 Pixiv 账号登录，并以 FANBOX 支持方案接口确认会话；保存时保留已有 Pixiv Cookie。",
             "Instagram": "登录完成后检测 sessionid；可以在页面内完成验证码或双重验证。",
-            "E-Hentai 表站": "表站账号独立保存，只用于 e-hentai.org 和表站收藏夹，不会发送给里站。",
-            "ExHentai 里站": "先打开普通登录页完成表站/论坛登录，再点“登录后进入里站”；确认里站正常后关闭全部窗口并获取。尽量使用非亚洲代理/VPN。",
+            "E-Hentai 表站": "仅手动填写或导入：在已登录浏览器的 F12 → Application → Storage → Cookies → e-hentai.org 查看 ipb_member_id、ipb_pass_hash。保存不联网，需验证时再点“验证 EH 登录（联网）”。",
+            "ExHentai 里站": "仅手动填写或导入：确认里站页面正常，在 F12 → Application → Storage → Cookies → exhentai.org 查看 ipb_member_id、ipb_pass_hash、igneous。保存不联网，验证和下载需可用的网络／代理。",
         }
         platform = self.cookie_capture_platform_var.get().strip()
         is_eh = platform in {"E-Hentai 表站", "ExHentai 里站"}
         if is_eh:
             self.cookie_capture_button.grid_remove()
-            self.eh_plain_open_button.grid()
-            self.eh_plain_capture_button.grid()
-            self.eh_inner_open_button.grid() if platform == "ExHentai 里站" else self.eh_inner_open_button.grid_remove()
+            self.eh_manual_button.grid()
+            self.eh_validate_button.grid()
+            site = "exhentai.org" if platform == "ExHentai 里站" else "e-hentai.org"
+            fields = "ipb_member_id、ipb_pass_hash" + ("、igneous" if platform == "ExHentai 里站" else "")
+            self.cookie_capture_help_var.set(
+                f"① 在已登录浏览器的 F12 → Application → Storage → Cookies → {site} 复制 {fields}，手动填写或导入文件。\n"
+                "② 保存 Cookie 只做本地检查，不联网；需确认登录时再点“验证 EH 登录（联网）”。\n"
+                "③ EH 的代理 URL 留空时直连，不自动使用系统代理。浏览器能访问但软件超时，请填写代理软件的 HTTP 地址"
+                "（例如 http://127.0.0.1:6987，端口以实际配置为准）。验证用输入框当前值，后续下载用已保存值，修改后请点“保存设置”。"
+            )
+            self.cookie_capture_help_label.grid()
         else:
-            self.eh_plain_open_button.grid_remove()
-            self.eh_plain_capture_button.grid_remove()
-            self.eh_inner_open_button.grid_remove()
+            self.eh_manual_button.grid_remove()
+            self.eh_validate_button.grid_remove()
             self.cookie_capture_button.grid()
+            self.cookie_capture_help_label.grid_remove()
         self.header_convert_button.grid()
         self.cookie_capture_status_var.set(
             hints.get(platform, "选择平台后打开独立登录窗口；软件不会保存账号密码。")
         )
 
-    def _open_eh_plain_browser(self) -> None:
+    def _edit_eh_cookie(self) -> None:
         platform = self.cookie_capture_platform_var.get().strip()
         if platform not in {"E-Hentai 表站", "ExHentai 里站"}:
-            messagebox.showwarning("平台选择无效", "请先选择 E-Hentai 表站或 ExHentai 里站")
             return
-        if platform == "ExHentai 里站" and not messagebox.askokcancel(
-            "ExHentai 里站网络提示",
-            "里站账号与表站账号使用不同的 Chrome 资料和 Cookie 文件。\n\n"
-            "建议先连接非亚洲代理/VPN，并让登录、获取 Cookie 和后续访问保持同一出口。\n\n"
-            "接下来只打开普通登录页；登录完成后请返回软件点击“登录后进入里站”。",
-            parent=self,
-        ):
-            return
-        self.eh_plain_open_button.state(["disabled"])
-        self.cookie_capture_status_var.set(f"正在打开 {platform} 专用普通 Chrome…")
-        proxy_url = self.proxy_var.get().strip()
+        dialog = tk.Toplevel(self)
+        dialog.title(f"{platform} · 手动填写 Cookie")
+        dialog.transient(self.winfo_toplevel())
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="从已登录浏览器的 Application → Storage → Cookies 复制对应值。\n"
+                  "仅在本机保存，不联网验证；留空不会清除旧资料。", wraplength=500).grid(
+                      row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+        fields = {}
+        for row, name in enumerate(sorted(cookie_capture_spec(platform).required_names), 1):
+            ttk.Label(body, text=name).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=5)
+            entry = ttk.Entry(body, width=52, show="•")
+            entry.grid(row=row, column=1, sticky="ew", pady=5)
+            fields[name] = entry
 
-        def worker() -> None:
+        def save():
             try:
-                status = open_ehentai_plain_chrome(platform, proxy_url=proxy_url)
+                result = save_ehentai_manual_cookies(platform, {name: entry.get() for name, entry in fields.items()})
             except Exception as exc:  # noqa: BLE001
-                self.ui_queue.put(("eh_plain_open_error", (platform, str(exc))))
+                messagebox.showerror("EH Cookie 未保存", str(exc), parent=dialog)
                 return
-            self.ui_queue.put(("eh_plain_opened", status))
+            dialog.destroy()
+            self._finish_cookie_file_import((platform, result.cookie_count, result.destination), error=False)
 
-        threading.Thread(target=worker, name=f"eh-plain-open-{platform}", daemon=True).start()
+        ttk.Button(body, text="保存到本机", command=save).grid(row=len(fields)+1, column=1, sticky="e", pady=(12, 0))
 
-    def _capture_eh_plain_browser(self) -> None:
+    def _validate_eh_cookie(self) -> None:
         platform = self.cookie_capture_platform_var.get().strip()
         if platform not in {"E-Hentai 表站", "ExHentai 里站"}:
-            messagebox.showwarning("平台选择无效", "请先选择 E-Hentai 表站或 ExHentai 里站")
             return
-        self.eh_plain_capture_button.state(["disabled"])
+        proxy = self.proxy_var.get().strip()
+        self.eh_validate_button.state(["disabled"])
+        route = "通过已填写的代理" if proxy else "直连（代理 URL 为空，不使用系统代理）"
+        self.cookie_capture_status_var.set(f"正在验证 {platform}，本次{route}；验证不改写 Cookie…")
+
+        def worker():
+            try:
+                validate_saved_ehentai_cookies(platform, proxy_url=proxy)
+            except Exception as exc:  # noqa: BLE001
+                self.ui_queue.put(("eh_validation_error", (platform, eh_validation_failure(exc, proxy_url=proxy))))
+                return
+            self.ui_queue.put(("eh_validation_done", (platform, f"本次{route}。")))
+
+        threading.Thread(target=worker, name="eh-cookie-validation", daemon=True).start()
+
+    def _finish_eh_validation(self, payload, *, error: bool) -> None:
+        self.eh_validate_button.state(["!disabled"])
+        platform, message = payload
         self.cookie_capture_status_var.set(
-            f"正在读取已关闭的 {platform} 普通 Chrome 资料并在线验证；成功前不会覆盖旧 Cookie…"
+            f"{platform} 验证未通过：{message}"
+            if error else f"{platform} 当前登录验证通过。{message}"
         )
-        proxy_url = self.proxy_var.get().strip()
 
-        def worker() -> None:
-            try:
-                result = capture_ehentai_plain_chrome(platform, proxy_url=proxy_url)
-            except Exception as exc:  # noqa: BLE001
-                self.ui_queue.put(("eh_plain_capture_error", (platform, str(exc))))
-                return
-            self.ui_queue.put(("eh_plain_capture_done", result))
 
-        threading.Thread(target=worker, name=f"eh-plain-capture-{platform}", daemon=True).start()
 
-    def _open_exhentai_after_login(self) -> None:
-        if self.cookie_capture_platform_var.get().strip() != "ExHentai 里站":
-            return
-        self.eh_inner_open_button.state(["disabled"])
-        self.cookie_capture_status_var.set("正在用同一个普通 Chrome 登录资料进入 ExHentai…")
-        proxy_url = self.proxy_var.get().strip()
-
-        def worker() -> None:
-            try:
-                status = open_exhentai_after_login(proxy_url=proxy_url)
-            except Exception as exc:  # noqa: BLE001
-                self.ui_queue.put(("eh_inner_open_error", str(exc)))
-                return
-            self.ui_queue.put(("eh_inner_opened", status))
-
-        threading.Thread(target=worker, name="eh-inner-open-after-login", daemon=True).start()
 
     def _convert_jm_header_txt(self) -> None:
         self._convert_header_txt("JMComic")
@@ -1266,7 +1498,7 @@ class SettingsTabMixin:
             f"已提取 {converted.cookie_count} 个 Cookie 并生成：\n{converted.destination}\n\n"
             "JSON 与原始 TXT 都包含明文登录 Cookie，请勿分享。\n\n"
             + (
-                "是否现在使用当前软件代理在线验证，并导入该账号会话？"
+                "是否现在保存该账号会话？仅检查本地格式，不联网；保存后可手动验证登录。"
                 if platform in {"E-Hentai 表站", "ExHentai 里站"}
                 else "是否现在导入该账号会话？导入后可使用平台连接检查验证。"
             )
@@ -1288,7 +1520,7 @@ class SettingsTabMixin:
                         platform, converted.source, proxy_url=proxy_url
                     )
                     count = result.cookie_count
-                    verified = True
+                    verified = False
                 elif platform == "JMComic":
                     # Import the original capture so JM-specific safe request headers
                     # are retained alongside the cookie-only JSON export.
@@ -1305,35 +1537,45 @@ class SettingsTabMixin:
 
         threading.Thread(target=worker, name="header-json-import", daemon=True).start()
 
-    def _finish_eh_plain_capture(self, payload, *, error: bool) -> None:
-        self.eh_plain_capture_button.state(["!disabled"])
-        if error:
-            platform, message = payload if isinstance(payload, tuple) and len(payload) == 2 else ("EH", str(payload))
-            self.cookie_capture_status_var.set(str(message))
-            self.status_var.set(f"{platform} 登录资料未更新")
-            self._append_log(f"{platform} 普通 Chrome 获取失败：{message}")
-            return
-        platform = str(getattr(payload, "platform", "EH") or "EH")
-        count = int(getattr(payload, "cookie_count", 0) or 0)
-        self.cookie_capture_status_var.set(
-            f"{platform} 已从关闭的普通 Chrome 读取并验证 {count} 个 Cookie；与另一站账号互不覆盖。"
-        )
-        self.status_var.set(f"{platform} 登录资料已更新")
-        self._append_log(f"{platform} 已从普通 Chrome 保存并验证 {count} 个 Cookie")
-        self._refresh_platform_tabs()
 
 
     def _open_cookie_capture_guide(self) -> None:
+        platform = self.cookie_capture_platform_var.get().strip()
+        if platform in {"E-Hentai 表站", "ExHentai 里站"}:
+            messagebox.showinfo(
+                f"{platform} Cookie 获取说明",
+                "【手动获取：查看浏览器存储的 Cookie】\n"
+                "1. 在已登录且能正常访问目标站点的 Chrome/Edge 中按 F12。\n"
+                "2. 选择 Application（应用/应用程序）→ Storage（存储）→ Cookies；"
+                "面板未显示时可在顶部 » 菜单中查找。\n"
+                "3. 表站选择 e-hentai.org，里站选择 exhentai.org，查看 Name（名称）与 Value（值）。\n"
+                "   表站必需：ipb_member_id、ipb_pass_hash。\n"
+                "   里站还必需：igneous；先确认里站页面正常。\n"
+                "4. 在软件选择同一站点，点「手动填写 EH Cookie」粘贴各字段的值并保存；"
+                "也可用「导入 Cookie 文件」导入 JSON / Netscape cookies.txt。\n"
+                "这是 Application 的 Cookie 存储列表，不是 Console（控制台）或 Network（网络）请求列表；"
+                "「请求头 TXT → JSON」仅供已有 Cookie 请求头时使用，不能直接转换存储列表。\n\n"
+                "【保存与验证】\n"
+                "保存只检查本地格式和必需字段，不联网；保存成功不代表登录有效。"
+                "需要检查时再点「验证 EH 登录（联网）」，验证失败保留已保存的 Cookie。\n"
+                "表站和里站分别保存；登录、验证和下载保持同一代理出口，修改代理后请保存设置。"
+                "EH 的代理 URL 留空表示直连，不自动使用系统代理；浏览器能访问而软件超时时，"
+                "请填写本机代理软件的 HTTP 地址（如 http://127.0.0.1:6987，端口以实际配置为准）。\n"
+                "验证使用输入框当前值，后续下载使用已保存设置。连接超时尚不能判断 Cookie 是否有效，无需反复获取 Cookie。\n"
+                "Cookie 仅保存在本机 data/software_app/ehentai/，请勿分享。",
+                parent=self,
+            )
+            return
         messagebox.showinfo(
             "浏览器登录与 Cookie 说明",
             "【使用步骤】\n"
             "1. 打开设置 → 浏览器登录与 Cookie。\n"
             "2. 选择平台：Twitter/X、Pixiv、FANBOX、Instagram、E-Hentai 表站或 ExHentai 里站。\n"
             "3. 确认代理 URL（登录窗口会使用当前值）。\n"
-            "4. 普通平台点「打开登录浏览器并获取」；EH 点「打开普通 Chrome 登录」。\n"
+            "4. 普通平台点「打开登录浏览器并获取」；EH 仅手动填写或导入 Cookie。\n"
             "5. 在官网窗口自行登录并完成验证，不要把密码输入软件。\n"
             "6. 普通平台检测到必需 Cookie 后自动保存并关闭窗口。\n"
-            "   EH 需关闭全部专用窗口后点「登录完成后获取」。\n"
+            "   EH 保存不联网，需要时单独点击「验证 EH 登录（联网）」。\n"
             "\n"
             "【各平台必需 Cookie】\n"
             "- Twitter/X: auth_token、ct0\n"
@@ -1429,28 +1671,54 @@ class SettingsTabMixin:
                 jmcomic_domain=self.jm_domain_var.get().strip(),
                 jmcomic_username=self.jm_favorite_username_var.get().strip(),
             )
-            if platform == "JMComic":
-                adapter = self.manager.get_adapter("jmcomic")
-                count = int(adapter.import_cookie_file(source))
-                destination = adapter.runtime_data_dir / "cookies.json"
-            elif platform in {"E-Hentai 表站", "ExHentai 里站"}:
-                result = import_ehentai_cookie_file(
-                    platform, source, proxy_url=self.proxy_var.get().strip()
-                )
-                count = result.cookie_count
-                destination = result.destination
-            else:
-                result = import_browser_cookie_file(spec, source)
-                count = result.cookie_count
-                destination = result.destination
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Cookie 导入失败", str(exc), parent=self)
             return
+        proxy_url = self.proxy_var.get().strip()
+        self.cookie_import_button.state(["disabled"])
+        self.cookie_capture_status_var.set(
+            f"正在导入 {platform} Cookie（仅本地检查，不联网）…"
+            if platform in {"E-Hentai 表站", "ExHentai 里站"}
+            else f"正在导入 {platform} Cookie 并检查会话…"
+        )
+
+        def worker() -> None:
+            try:
+                if platform == "JMComic":
+                    adapter = self.manager.get_adapter("jmcomic")
+                    count = int(adapter.import_cookie_file(source))
+                    destination = adapter.runtime_data_dir / "cookies.json"
+                elif platform in {"E-Hentai 表站", "ExHentai 里站"}:
+                    result = import_ehentai_cookie_file(platform, source, proxy_url=proxy_url)
+                    count = result.cookie_count
+                    destination = result.destination
+                else:
+                    result = import_browser_cookie_file(spec, source)
+                    count = result.cookie_count
+                    destination = result.destination
+            except Exception as exc:  # noqa: BLE001
+                self.ui_queue.put(("cookie_import_error", (platform, str(exc))))
+                return
+            self.ui_queue.put(("cookie_import_done", (platform, count, destination)))
+
+        try:
+            threading.Thread(target=worker, name="cookie-file-import", daemon=True).start()
+        except RuntimeError as exc:
+            self._finish_cookie_file_import((platform, str(exc)), error=True)
+
+    def _finish_cookie_file_import(self, payload, *, error: bool) -> None:
+        self.cookie_import_button.state(["!disabled"])
+        if error:
+            platform, raw_message = payload
+            self.cookie_capture_status_var.set(f"{platform} Cookie 导入失败：{raw_message}")
+            messagebox.showerror("Cookie 导入失败", str(raw_message), parent=self)
+            return
+        platform, count, destination = payload
         if platform == "JMComic":
             self._refresh_jm_auth_status()
         self.cookie_capture_status_var.set(
             f"{platform} 已从普通浏览器导出文件导入 {count} 个 Cookie；"
-            + ("已完成目标站点在线验证。" if platform in {"E-Hentai 表站", "ExHentai 里站"}
+            + ("已保存，尚未联网验证；可点击“验证 EH 登录（联网）”。" if platform in {"E-Hentai 表站", "ExHentai 里站"}
                else "请使用平台连接检查或在线资料验证有效性。")
         )
         self.status_var.set(f"{platform} Cookie 已导入")

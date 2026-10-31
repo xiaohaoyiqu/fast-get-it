@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from software_app.core.task_control import task_cancelled
+
 import json
+import copy
 import re
 import threading
 from calendar import monthrange
 from datetime import date, datetime
 from pathlib import Path
+from http.cookiejar import CookieJar
 from urllib.parse import urlparse
 
 from software_app.core.blocklist import BlocklistStore
@@ -14,12 +18,18 @@ import requests
 
 from software_app.core.adapter import TaskCancelled
 from software_app.core.models import FileRecord, ProgressEvent
+from software_app.core.output_lock import output_path_lock
+from software_app.core.network_policy import HTTP_BACKOFF, record_http_backoff
+from software_app.core.redirect_policy import SENSITIVE_REDIRECT_HEADERS
+from software_app.crawlers.common import request_get
+from software_app.core.cookie_store import CookieSession, copied_cookie_policy
+from software_app.core.response_read import read_response_json
 from software_app.crawlers.common import (
-    convert_media_file,
-    download_file,
+    download_media_file,
     extension_from_url,
     normalized_media_extension,
     safe_component,
+    write_text_atomic,
 )
 
 
@@ -40,21 +50,41 @@ def _restricted_session(source, cookie_names: set[str]) -> requests.Session:
     """Copy transport settings without sending Pixiv/FANBOX credentials to the wrong host."""
     if not isinstance(source, requests.Session):
         return source
-    session = requests.Session()
-    session.trust_env = bool(getattr(source, "trust_env", False))
-    session.headers.update(dict(getattr(source, "headers", {}) or {}))
+    session = CookieSession()
+    session.trust_env = False
+    session.verify = source.verify
+    session.headers.update({name: value for name, value in source.headers.items()
+                            if name.casefold() not in SENSITIVE_REDIRECT_HEADERS})
     session.proxies.update(dict(getattr(source, "proxies", {}) or {}))
     source_cookies = getattr(source, "cookies", None)
+    if isinstance(source_cookies, CookieJar):
+        session.cookies.set_policy(copied_cookie_policy(source_cookies))
     if source_cookies is not None:
-        values = source_cookies.get_dict()
-        session.cookies.update({name: value for name, value in values.items() if name in cookie_names})
+        for cookie in source_cookies:
+            if cookie.name not in cookie_names:
+                continue
+            domain = cookie.domain.lstrip(".").casefold()
+            if domain and domain != "fanbox.cc" and not domain.endswith(".fanbox.cc"):
+                continue
+            retained = copy.copy(cookie)
+            if not domain:
+                retained.domain = ".fanbox.cc"
+                retained.domain_specified = True
+                retained.domain_initial_dot = True
+            retained.secure = True
+            session.cookies.set_cookie(retained)
     return session
 
 
 def _json_response(session, url: str, *, headers: dict | None = None) -> dict:
-    response = session.get(url, headers=headers or {}, timeout=(10, 60))
-    response.raise_for_status()
-    payload = response.json()
+    HTTP_BACKOFF.wait(url)
+    response = request_get(session, url, headers=headers or {}, timeout=(10, 60))
+    try:
+        record_http_backoff(response, url)
+        response.raise_for_status()
+        payload = read_response_json(response)
+    finally:
+        response.close()
     if not isinstance(payload, dict):
         raise ValueError(f"接口未返回 JSON 对象：{url}")
     if payload.get("error") is True:
@@ -77,7 +107,8 @@ def _walk_media_urls(value: object) -> list[str]:
             suffix = Path(urlparse(node).path).suffix.lower()
             media_key = key.casefold() in {"originalurl", "downloadurl", "original"}
             media_host = urlparse(node).hostname or ""
-            trusted_binary_host = media_host.endswith(("pximg.net", "fanbox.cc", "pixiv.net"))
+            trusted_binary_host = any(media_host == domain or media_host.endswith("." + domain)
+                                      for domain in ("pximg.net", "fanbox.cc", "pixiv.net"))
             if (suffix in MEDIA_SUFFIXES or (media_key and trusted_binary_host)) and node.casefold() not in seen:
                 seen.add(node.casefold())
                 result.append(node)
@@ -99,9 +130,26 @@ def _media_kind(url: str) -> tuple[str, str]:
     return "attachment", suffix
 
 
-class FanboxClient:
+class _RestrictedClient:
+    def __init__(self, session, cookie_names):
+        self.session = _restricted_session(session, cookie_names)
+        self._owns_session = self.session is not session
+
+    def close(self):
+        if self._owns_session:
+            self.session.close()
+            self._owns_session = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+
+class FanboxClient(_RestrictedClient):
     def __init__(self, session) -> None:
-        self.session = _restricted_session(session, {"FANBOXSESSID", "cf_clearance"})
+        super().__init__(session, {"FANBOXSESSID", "cf_clearance"})
 
     @staticmethod
     def parse_target(raw_target: str) -> tuple[str, str]:
@@ -273,8 +321,8 @@ class FanboxClient:
         restricted_posts = 0
         blocklist_path = str(task.options.get("_blocklist_path") or "")
         blocklist = BlocklistStore(blocklist_path) if blocklist_path else None
-        for post_index, summary in enumerate(posts, 1):
-            if cancel_event.is_set():
+        for summary in posts:
+            if task_cancelled(cancel_event):
                 raise TaskCancelled("任务已取消")
             post_id = str(summary.get("id") or "")
             payload = self._get(f"post.info?postId={post_id}", f"https://www.fanbox.cc/posts/{post_id}")
@@ -304,7 +352,8 @@ class FanboxClient:
             folder = root / safe_component(f"FANBOX_{creator_id}") / safe_component(f"{title}_{post_id}")
             folder.mkdir(parents=True, exist_ok=True)
             metadata = folder / f"{post_id}.json"
-            metadata.write_text(json.dumps(post, ensure_ascii=False, indent=2), encoding="utf-8")
+            with output_path_lock(metadata, cancel_event):
+                write_text_atomic(metadata, json.dumps(post, ensure_ascii=False, indent=2))
             callbacks.on_file(FileRecord(
                 path=metadata.resolve(), module_id=task.module_id, task_id=task.task_id, media_type="metadata",
                 size=metadata.stat().st_size, title=title, source_url=f"https://www.fanbox.cc/posts/{post_id}",
@@ -312,21 +361,15 @@ class FanboxClient:
             ))
             downloaded += 1
             for media_index, url in enumerate(_walk_media_urls(post), 1):
-                if cancel_event.is_set():
+                if task_cancelled(cancel_event):
                     raise TaskCancelled("任务已取消")
                 kind, suffix = _media_kind(url)
                 final_suffix = normalized_media_extension("", suffix, kind, task.options) if kind != "attachment" else suffix
                 destination = folder / f"{media_index:03d}{final_suffix}"
-                if destination.is_file() and destination.stat().st_size:
-                    continue
                 source = destination if final_suffix == suffix else folder / f".{media_index:03d}.source{suffix}"
-                try:
-                    download_file(self.session, url, source, cancel_event)
-                    if source != destination:
-                        convert_media_file(source, destination, final_suffix)
-                finally:
-                    if source != destination:
-                        source.unlink(missing_ok=True)
+                result = download_media_file(self.session, url, source, destination, cancel_event, final_suffix,
+                                             conflict_policy=task.options.get("file_conflict", "reuse"))
+                destination = result.path
                 callbacks.on_file(FileRecord(
                     path=destination.resolve(), module_id=task.module_id, task_id=task.task_id, media_type=kind,
                     size=destination.stat().st_size, title=title, source_url=url, source_id=post_id,
@@ -338,9 +381,9 @@ class FanboxClient:
         return downloaded
 
 
-class SketchClient:
+class SketchClient(_RestrictedClient):
     def __init__(self, session) -> None:
-        self.session = _restricted_session(session, set())
+        super().__init__(session, set())
 
     @staticmethod
     def parse_target(raw_target: str) -> tuple[str, str]:
@@ -410,7 +453,7 @@ class SketchClient:
         blocklist_path = str(task.options.get("_blocklist_path") or "")
         blocklist = BlocklistStore(blocklist_path) if blocklist_path else None
         for item in posts:
-            if cancel_event.is_set():
+            if task_cancelled(cancel_event):
                 raise TaskCancelled("任务已取消")
             post_id = str(item.get("id") or "")
             user = item.get("user") if isinstance(item.get("user"), dict) else {}
@@ -431,13 +474,9 @@ class SketchClient:
                 final_suffix = normalized_media_extension("", suffix, kind, task.options)
                 destination = folder / f"{index:03d}{final_suffix}"
                 source = destination if final_suffix == suffix else folder / f".{index:03d}.source{suffix}"
-                try:
-                    download_file(self.session, url, source, cancel_event)
-                    if source != destination:
-                        convert_media_file(source, destination, final_suffix)
-                finally:
-                    if source != destination:
-                        source.unlink(missing_ok=True)
+                result = download_media_file(self.session, url, source, destination, cancel_event, final_suffix,
+                                             conflict_policy=task.options.get("file_conflict", "reuse"))
+                destination = result.path
                 callbacks.on_file(FileRecord(
                     path=destination.resolve(), module_id=task.module_id, task_id=task.task_id, media_type=kind,
                     size=destination.stat().st_size, title=title, source_url=url, source_id=post_id,

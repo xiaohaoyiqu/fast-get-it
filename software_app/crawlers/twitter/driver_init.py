@@ -1,21 +1,22 @@
 ﻿import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
+import time
 from pathlib import Path
-from selenium import webdriver
 from selenium.webdriver.chrome.webdriver import WebDriver as ChromeWebDriver
 from selenium.webdriver.chrome.options import Options as ChromeOptions
-from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.common.by import By
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from software_app.core.browser_driver import ensure_chromedriver
-from software_app.core.settings import BROWSER_TOOLS_DIR
+from software_app.core.browser_driver import ensure_chromedriver  # noqa: E402 - direct script bootstrap
+from software_app.core.browser_process import BrowserProcessError, ManagedChromeService as ChromeService  # noqa: E402
+from software_app.core.settings import BROWSER_TOOLS_DIR  # noqa: E402
 
 SKEB_BUTTON_EXTENSION_ID = "onjegdbehgoamaiochjfnkokondpgoim"
 
@@ -48,23 +49,57 @@ def find_skeb_button_extension(user_data_roots: list[Path] | None = None) -> Pat
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
+def _profile_identity(path):
+    info = Path(path).lstat()
+    return info.st_dev, info.st_ino
+
+
+def _cleanup_temporary_profile(profile_dir, identity):
+    path = Path(profile_dir)
+    root = (Path(BROWSER_TOOLS_DIR) / "session_profiles").resolve()
+    if path.parent.resolve() != root or not path.name.startswith("twitter_"):
+        raise BrowserProcessError("临时浏览器目录不在本次受管理范围内，未删除")
+    path = root / path.name
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                or getattr(info, "st_file_attributes", 0) & 0x400
+                or (info.st_dev, info.st_ino) != identity):
+            raise BrowserProcessError("临时浏览器目录身份已变化，保留现有内容")
+        try:
+            shutil.rmtree(path)
+            return
+        except OSError as error:
+            if time.monotonic() >= deadline:
+                raise BrowserProcessError("临时浏览器资料仍被占用，已保留；请退出相关进程后检查") from error
+            time.sleep(0.1)
+
+
 class TemporaryProfileChrome(ChromeWebDriver):
     """Chrome session backed by an isolated, disposable user-data directory."""
 
     def __init__(self, *args, profile_dir: Path, skeb_extension_path: Path | None = None, **kwargs):
         self._temporary_profile_dir = Path(profile_dir)
+        self._temporary_profile_identity = _profile_identity(profile_dir)
         self._skeb_extension_path = Path(skeb_extension_path) if skeb_extension_path else None
         try:
             super().__init__(*args, **kwargs)
-        except Exception:
-            shutil.rmtree(self._temporary_profile_dir, ignore_errors=True)
+        except BaseException:
+            try:
+                _cleanup_temporary_profile(self._temporary_profile_dir, self._temporary_profile_identity)
+            except Exception:
+                pass
             raise
 
     def quit(self):
         try:
             return super().quit()
         finally:
-            shutil.rmtree(self._temporary_profile_dir, ignore_errors=True)
+            _cleanup_temporary_profile(self._temporary_profile_dir, self._temporary_profile_identity)
 
 
 def short_error(error):
@@ -108,9 +143,17 @@ def normalize_cookie_for_selenium(cookie):
     return cookie
 
 
-def initialize_driver():
+def initialize_driver(proxy_url=""):
     # 初始化Chrome浏览器驱动
     options = ChromeOptions()
+    endpoint = str(proxy_url or "").strip()
+    if endpoint:
+        if "://" not in endpoint:
+            endpoint = f"http://{endpoint}"
+        # Chrome's SOCKS5 proxy resolves target hostnames remotely already.
+        if endpoint.lower().startswith("socks5h://"):
+            endpoint = "socks5://" + endpoint[len("socks5h://"):]
+        options.add_argument(f"--proxy-server={endpoint}")
     options.set_capability(
         "goog:loggingPrefs", {"performance": "ALL"}
     )
@@ -119,10 +162,7 @@ def initialize_driver():
     # options.add_argument("--disable-gpu")  # 禁用GPU加速
     # options.add_argument("--window-size=1920x1080")  # 设置窗口大小，防止某些元素不可见
 
-    # 1. 忽略SSL证书错误（解决handshake failed; SSL error code 1）
-    options.add_argument('--ignore-certificate-errors')
-    options.add_argument('--ignore-ssl-errors')
-    options.add_argument('--ignore-certificate-errors-spki-list')
+    # Preserve Chrome's certificate validation; proxy trust belongs in the OS/browser trust store.
     # -------------------------- 防检测配置（避免Twitter反爬） --------------------------
     options.add_argument('--no-sandbox')  # 禁用沙箱模式
     options.add_argument('--disable-dev-shm-usage')  # 解决/dev/shm内存不足
@@ -138,20 +178,32 @@ def initialize_driver():
     profile_root = Path(BROWSER_TOOLS_DIR) / "session_profiles"
     profile_root.mkdir(parents=True, exist_ok=True)
     profile_dir = Path(tempfile.mkdtemp(prefix="twitter_", dir=profile_root))
+    profile_identity = _profile_identity(profile_dir)
     options.add_argument(f"--user-data-dir={profile_dir}")
     skeb_extension_path = find_skeb_button_extension()
     if skeb_extension_path:
         options.add_argument(f"--load-extension={skeb_extension_path}")
 
-    driver_path = ensure_chromedriver()
-    service = ChromeService(str(driver_path), log_output=os.devnull) if driver_path else ChromeService(log_output=os.devnull)
-    driver = TemporaryProfileChrome(
-        service=service,
-        options=options,
-        profile_dir=profile_dir,
-        skeb_extension_path=skeb_extension_path,
-    )
-    driver.set_page_load_timeout(5)
+    try:
+        driver_path = ensure_chromedriver()
+        service = ChromeService(str(driver_path), log_output=os.devnull) if driver_path else ChromeService(log_output=os.devnull)
+        driver = TemporaryProfileChrome(
+            service=service, options=options, profile_dir=profile_dir, skeb_extension_path=skeb_extension_path,
+        )
+    except BaseException:
+        try:
+            _cleanup_temporary_profile(profile_dir, profile_identity)
+        except Exception:
+            pass
+        raise
+    try:
+        driver.set_page_load_timeout(5)
+    except BaseException:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        raise
     return driver
 
 

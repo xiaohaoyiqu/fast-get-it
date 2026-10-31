@@ -11,7 +11,7 @@ AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg"}
 TEXT_EXTENSIONS = {".txt", ".md", ".html", ".htm", ".json", ".csv"}
 MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | AUDIO_EXTENSIONS | TEXT_EXTENSIONS
 
-FINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
+FINAL_TASK_STATUSES = {"completed", "partial", "failed", "cancelled"}
 
 
 def classify_file(path: str | Path) -> str:

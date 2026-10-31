@@ -7,7 +7,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from software_app.core.browser_driver import (  # noqa: F401
+from software_app.core.browser_driver import (  # noqa: E402,F401 - direct script bootstrap and exports
     BrowserDriverError,
     BrowserDriverStatus,
     chrome_version,

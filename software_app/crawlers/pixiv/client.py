@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+from software_app.core.task_control import task_cancelled
+from software_app.core.collection_plan import ARTWORK_SEARCH_MODES, publish_collection_plan, restored_collection_ids
+from software_app.crawlers.pixiv.collection_media import download_collection_media, retry_collection_media
+
 import html
+import hashlib
 import json
 import re
 import threading
@@ -9,17 +14,21 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
 from software_app.core.adapter import TaskCancelled
+from software_app.core.network_policy import HTTP_BACKOFF, record_http_backoff
+from software_app.crawlers.common import request_get
+from software_app.core.response_read import read_response_text
+from software_app.core.file_conflict import reuse_existing, media_output
 from software_app.core.events import CallbackSet
 from software_app.core.models import DownloadTask, FileRecord, ProgressEvent, TargetPreview
 from software_app.crawlers.common import (
-    convert_media_file,
-    download_file,
+    download_media_file,
     extension_from_url,
     make_session,
     normalized_media_extension,
     platform_output_root,
     request_json,
     safe_component,
+    write_text_atomic,
 )
 from software_app.crawlers.pixiv.following import (
     FOLLOWING_PAGE_SIZE,
@@ -28,8 +37,10 @@ from software_app.crawlers.pixiv.following import (
     parse_following_payload,
 )
 from software_app.crawlers.pixiv.catalog import PixivCatalog, novel_row
+from software_app.crawlers.pixiv.catalog_discovery import profile_ids
 from software_app.crawlers.pixiv.external import FanboxClient, SketchClient
 from software_app.crawlers.pixiv.ugoira import download_ugoira
+from software_app.crawlers.pixiv.media import download_static_work, retry_static_work
 from software_app.core.blocklist import BlocklistStore
 
 
@@ -193,7 +204,8 @@ def _first_html_group(pattern: str, source: str) -> str:
 
 class PixivCrawler:
     def __init__(self, cookie_file: Path | str | None = None, proxy_url: str = "") -> None:
-        self.session = make_session(referer=PIXIV_BASE + "/", cookie_file=cookie_file, proxy_url=proxy_url)
+        self.session = make_session(referer=PIXIV_BASE + "/", cookie_file=cookie_file, proxy_url=proxy_url,
+                                    cookie_domains={"PHPSESSID": ".pixiv.net", "FANBOXSESSID": ".fanbox.cc"})
         # Pixiv has an explicit app-level proxy setting. Ignoring ambient HTTP(S)_PROXY
         # makes "blank proxy" a real direct connection instead of a hidden system proxy.
         self.session.trust_env = False
@@ -267,7 +279,7 @@ class PixivCrawler:
             body = self._body(f"/ajax/novel/{target.value}?lang=zh")
             return self._novel_summary(body, target.value)
         if target.kind == "manga_series":
-            rows = PixivCatalog(self._body, self._json).manga_series(target.value, 20)
+            rows = self._catalog().manga_series(target.value, 20)
             return {
                 "title": f"Pixiv 漫画系列 {target.value}",
                 "description": f"已读取 {len(rows)} 个系列作品候选",
@@ -275,7 +287,7 @@ class PixivCrawler:
             }
         if target.kind == "novel_series":
             info = self._body(f"/ajax/novel/series/{target.value}?lang=zh")
-            rows = PixivCatalog(self._body, self._json).novel_series(target.value, 20)
+            rows = self._catalog().novel_series(target.value, 20)
             return {
                 "title": str(info.get("title") or f"Pixiv 小说系列 {target.value}") if isinstance(info, dict) else f"Pixiv 小说系列 {target.value}",
                 "description": f"已读取 {len(rows)} 篇系列小说",
@@ -284,10 +296,12 @@ class PixivCrawler:
                 "author_name": str(info.get("userName") or "") if isinstance(info, dict) else "",
             }
         if target.kind == "fanbox":
-            rows = FanboxClient(self.session).candidates(target.value, 20)
+            with FanboxClient(self.session) as client:
+                rows = client.candidates(target.value, 20)
             return {"title": f"FANBOX：{target.value}", "description": f"已读取 {len(rows)} 个帖子", "search_results": rows}
         if target.kind == "sketch":
-            rows = SketchClient(self.session).candidates(target.value, 20)
+            with SketchClient(self.session) as client:
+                rows = client.candidates(target.value, 20)
             return {"title": f"Pixiv Sketch：{target.value}", "description": f"已读取 {len(rows)} 个帖子", "search_results": rows}
         results = self.search(
             target.value,
@@ -308,11 +322,26 @@ class PixivCrawler:
             "page_html": f"<h2>搜索结果</h2><ol>{items}</ol>",
         }
 
+    def _catalog(self):
+        catalog = PixivCatalog(self._body, self._json)
+        self.last_catalog_status = catalog.last_discovery_status
+        self.last_catalog_rows = catalog.last_discovery_rows
+        return catalog
+
+    def _report_catalog_discovery(self, task, callbacks):
+        status = getattr(self, "last_catalog_status", {})
+        if status.get("reason") not in {"exhausted", "limit_reached"}:
+            return
+        ending = "已读到本次列表末尾" if status["complete"] else "达到本次数量上限，后续作品未读取"
+        callbacks.on_progress(ProgressEvent(task.task_id, task.module_id, "info",
+            f"作品列表读取 {status['pages']} 页、选定 {status['selected']} 项：{ending}",
+            metadata={"catalog_discovery": dict(status)}))
+
     def search(self, keyword: str, limit: int = 20, search_mode: str = "", options: dict | None = None) -> list[dict]:
         options = options or {}
         upper_limit = 10000 if search_mode in {"浏览历史（Premium）", "作品收藏", "小说收藏"} else 100
         requested_limit = max(1, min(int(limit), upper_limit))
-        catalog = PixivCatalog(self._body, self._json)
+        catalog = self._catalog()
         if search_mode == "漫画系列":
             return catalog.manga_series(_numeric_id(keyword), requested_limit)
         if search_mode == "小说 ID":
@@ -327,119 +356,35 @@ class PixivCrawler:
             return catalog.ranking(keyword, requested_limit)
         if search_mode == "新作":
             return catalog.new_works(keyword, requested_limit)
-        if search_mode == "作品收藏":
+        if search_mode in {"作品收藏", "小说收藏"}:
+            self.last_bookmark_status, self.last_bookmark_rows = {}, []
             user_id = _numeric_id(keyword) if re.search(r"\d+", keyword) else str(options.get("account_id") or "")
             if not user_id:
-                raise ValueError("作品收藏请输入用户 ID；自己的收藏可填写当前 Pixiv 账号 ID")
-            rows = catalog.bookmarks(
-                user_id,
-                limit=requested_limit,
-                visibility=str(options.get("pixiv_visibility") or "show"),
-                tag=str(options.get("bookmark_tag") or ""),
-                start_date=str(options.get("start_date") or ""),
-                end_date=str(options.get("end_date") or ""),
-                date_basis=str(options.get("bookmark_date_basis") or "bookmarked"),
-            )
-            self.last_bookmark_status = catalog.last_bookmark_status
-            return rows
-        if search_mode == "小说收藏":
-            user_id = _numeric_id(keyword) if re.search(r"\d+", keyword) else str(options.get("account_id") or "")
-            if not user_id:
-                raise ValueError("小说收藏请输入用户 ID；自己的收藏可留空并使用 Cookie 账号 ID")
-            rows = catalog.novel_bookmarks(
-                user_id,
-                limit=requested_limit,
-                visibility=str(options.get("pixiv_visibility") or "show"),
-                tag=str(options.get("bookmark_tag") or ""),
-                start_date=str(options.get("start_date") or ""),
-                end_date=str(options.get("end_date") or ""),
-                date_basis=str(options.get("bookmark_date_basis") or "bookmarked"),
-            )
-            self.last_bookmark_status = catalog.last_bookmark_status
-            return rows
+                raise ValueError("收藏读取需要用户 ID 或当前 Pixiv 账号 ID")
+            fetch = catalog.novel_bookmarks if search_mode == "小说收藏" else catalog.bookmarks
+            try:
+                return fetch(
+                    user_id, limit=requested_limit,
+                    visibility=str(options.get("pixiv_visibility") or "show"),
+                    tag=str(options.get("bookmark_tag") or ""),
+                    start_date=str(options.get("start_date") or ""),
+                    end_date=str(options.get("end_date") or ""),
+                    date_basis=str(options.get("bookmark_date_basis") or "bookmarked"),
+                )
+            finally:
+                self.last_bookmark_status = catalog.last_bookmark_status
+                self.last_bookmark_rows = catalog.last_bookmark_rows
         if search_mode == "浏览历史（Premium）":
             return self.account_history(requested_limit)
         if search_mode == "作者 + 标签":
             return catalog.author_tag(keyword, requested_limit)
         if search_mode == "FANBOX":
-            return FanboxClient(self.session).candidates(keyword, requested_limit)
+            with FanboxClient(self.session) as client:
+                return client.candidates(keyword, requested_limit)
         if search_mode == "Sketch":
-            return SketchClient(self.session).candidates(keyword, requested_limit)
-        type_value = {
-            "标签（插画）": "illust_and_ugoira",
-            "标签（漫画）": "manga",
-        }.get(str(search_mode or ""), "all")
-        search_match = "s_tc" if search_mode == "标题 / 简介" else "s_tag_full"
-        start_date = str(options.get("start_date") or "").strip()
-        end_date = str(options.get("end_date") or "").strip()
-        minimum_bookmarks = max(0, int(options.get("minimum_bookmarks") or 0))
-        age_mode = str(options.get("age_mode") or "all").strip().lower()
-        mode = "r18" if age_mode == "r18" else "safe" if age_mode == "safe" else "all"
-        result: list[dict] = []
-        seen: set[str] = set()
-        for page in range(1, 11):
-            path = (
-                f"/ajax/search/artworks/{quote(keyword)}?word={quote(keyword)}"
-                f"&order=date_d&mode={mode}&p={page}&s_mode={search_match}&type={type_value}"
-            )
-            if start_date:
-                path += f"&scd={quote(start_date)}"
-            if end_date:
-                path += f"&ecd={quote(end_date)}"
-            if minimum_bookmarks:
-                path += f"&blt={minimum_bookmarks}"
-            body = self._body(path)
-            container = body.get("illustManga") if isinstance(body, dict) else {}
-            rows = container.get("data", []) if isinstance(container, dict) else []
-            if not isinstance(rows, list) or not rows:
-                break
-            before = len(result)
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                work_id = str(row.get("id") or "")
-                if not work_id or work_id in seen:
-                    continue
-                seen.add(work_id)
-                illust_type = int(row.get("illustType") or 0)
-                kind = {0: "插画", 1: "漫画", 2: "动图"}.get(illust_type, "作品")
-                result.append(
-                    {
-                        "id": work_id,
-                        "title": self._decode_html_entities(row.get("title") or work_id),
-                        "author_id": str(row.get("userId") or ""),
-                        "author_name": self._decode_html_entities(row.get("userName") or ""),
-                        "url": f"{PIXIV_BASE}/artworks/{work_id}",
-                        "ai_type": int(row.get("aiType") or 0),
-                        "type": kind,
-                        "search_mode": search_mode or "标签（全部）",
-                        "avatar_url": str(row.get("url") or row.get("imageUrl") or ""),
-                        "thumbnail_url": str(row.get("url") or row.get("imageUrl") or ""),
-                        "published_at": str(row.get("createDate") or row.get("date") or ""),
-                        "page_count": row.get("pageCount", ""),
-                        "likes": row.get("likeCount", ""),
-                        "bookmarks": row.get("bookmarkCount", ""),
-                        "views": row.get("viewCount", ""),
-                        "tags": [
-                            self._decode_html_entities(item.get("tag") if isinstance(item, dict) else item)
-                            for item in (
-                                (row.get("tags") or {}).get("tags", [])
-                                if isinstance(row.get("tags"), dict)
-                                else row.get("tags") or []
-                            )
-                        ],
-                    }
-                )
-                if len(result) >= requested_limit:
-                    return result
-            total_value = container.get("total") if isinstance(container, dict) else None
-            try:
-                total = int(total_value)
-            except (TypeError, ValueError):
-                total = 0
-            if len(result) == before or (total and len(result) >= total) or len(rows) < 20:
-                break
-        return result
+            with SketchClient(self.session) as client:
+                return client.candidates(keyword, requested_limit)
+        return catalog.artwork_search(keyword, requested_limit, search_mode, options)
 
     def _user_profile(self, user_id: str) -> dict:
         body: dict = {}
@@ -447,6 +392,8 @@ class PixivCrawler:
         try:
             value = self._body(f"/ajax/user/{user_id}?full=1")
             body = value if isinstance(value, dict) else {}
+        except TaskCancelled:
+            raise
         except Exception as exc:  # noqa: BLE001 - the rendered profile is an intentional fallback.
             api_error = exc
         description_html = str(body.get("commentHtml") or body.get("comment") or "")
@@ -466,9 +413,10 @@ class PixivCrawler:
         needs_html = not result["avatar_url"] or not external_links or not body.get("name")
         if needs_html:
             try:
-                response = self.session.get(f"{PIXIV_BASE}/users/{user_id}", timeout=(5, 20))
-                response.raise_for_status()
-                fallback = parse_pixiv_profile_html(response.text, user_id)
+                text, _ = self._text(f"{PIXIV_BASE}/users/{user_id}", timeout=(5, 20))
+                fallback = parse_pixiv_profile_html(text, user_id)
+            except TaskCancelled:
+                raise
             except Exception as html_error:
                 if not body:
                     raise RuntimeError(
@@ -511,18 +459,18 @@ class PixivCrawler:
             )
             candidates: list[dict] = []
 
-            def visit(node: object) -> None:
+            def visit(node: object, candidates: list[dict]) -> None:
                 if isinstance(node, dict):
                     if any(key in node for key in ("userId", "user_id")):
                         candidates.append(node)
                     for value in node.values():
                         if isinstance(value, (dict, list)):
-                            visit(value)
+                            visit(value, candidates)
                 elif isinstance(node, list):
                     for value in node:
-                        visit(value)
+                        visit(value, candidates)
 
-            visit(body)
+            visit(body, candidates)
             before = len(rows)
             for item in candidates:
                 normalized = normalize_following_user(item)
@@ -551,13 +499,12 @@ class PixivCrawler:
         return rows
 
     def account_history(self, limit: int = 100) -> list[dict]:
-        response = self.session.get(f"{PIXIV_BASE}/history.php", timeout=(5, 25))
-        response.raise_for_status()
-        rows = parse_pixiv_history_html(response.text, limit)
+        page_text, final_url = self._text(f"{PIXIV_BASE}/history.php", timeout=(5, 25))
+        rows = parse_pixiv_history_html(page_text, limit)
         if rows:
             return rows
-        text = response.text.casefold()
-        if "login" in response.url.casefold() or "ログイン" in text or "登录" in text:
+        text = page_text.casefold()
+        if "login" in final_url.casefold() or "ログイン" in text or "登录" in text:
             raise PermissionError("Pixiv 浏览历史需要有效 PHPSESSID")
         raise PermissionError("没有读取到 Pixiv 浏览历史；该功能需要 Pixiv Premium，且只包含作品详情页浏览记录")
 
@@ -593,11 +540,15 @@ class PixivCrawler:
                 }
             )
             return parsed
+        except TaskCancelled:
+            raise
         except Exception as api_error:  # The public HTML remains useful when the AJAX login expires.
             if rest == "hide":
                 raise RuntimeError(f"读取 Pixiv 非公开关注失败，请检查 cookies.json：{api_error}") from api_error
             try:
                 return self.fetch_following_html_page(owner_id, page=page, visibility=rest)
+            except TaskCancelled:
+                raise
             except Exception as html_error:
                 raise RuntimeError(
                     f"Pixiv 关注接口和分页网页均读取失败；请检查 cookies.json。接口：{api_error}；网页：{html_error}"
@@ -615,27 +566,46 @@ class PixivCrawler:
         url = f"{PIXIV_BASE}/users/{owner_id}/following"
         if query:
             url += "?" + "&".join(query)
-        response = self.session.get(url, timeout=(10, 45))
-        response.raise_for_status()
-        if f"/users/{owner_id}/following" not in response.url and f"/users/{owner_id}/following" not in response.text:
+        text, final_url = self._text(url, timeout=(10, 45))
+        if f"/users/{owner_id}/following" not in final_url and f"/users/{owner_id}/following" not in text:
             raise RuntimeError("Pixiv 将关注页重定向到了登录页")
-        parsed = parse_following_html(response.text, rest)
+        parsed = parse_following_html(text, rest)
         parsed.update({"page": page, "source": "html"})
         return parsed
 
     def download(self, task: DownloadTask, callbacks: CallbackSet, cancel_event: threading.Event) -> None:
-        if cancel_event.is_set():
+        if task_cancelled(cancel_event):
             raise TaskCancelled("任务已取消")
         target = parse_pixiv_target(task.target, str(task.options.get("input_kind") or ""))
+        self.last_catalog_status, self.last_catalog_rows = {}, []
+        owner_id = None
+        if target.kind in {"bookmark", "manga_series"}:
+            owner_id = (_numeric_id(target.value) if re.search(r"\d+", target.value)
+                        else str(task.options.get("account_id") or ""))
+        elif target.kind == "ranking" or (target.kind == "search" and task.options.get("search_mode", "") in ARTWORK_SEARCH_MODES):
+            owner_id = hashlib.sha256(target.value.encode("utf-8")).hexdigest()
+        if "_retry_media" in task.options:
+            if owner_id is not None:
+                ids = restored_collection_ids(task, target.kind, owner_id)
+                if ids is None:
+                    raise ValueError("缺少原集合范围记录，未重新发现其他作品")
+                retry_collection_media(self, task, ids, callbacks, cancel_event)
+                return
+            if target.kind != "work":
+                raise ValueError("Pixiv 逐媒体补下目前支持单作品静态图片、作品收藏、漫画系列、作品搜索和排行榜")
+            retry_static_work(self, task, target.value, callbacks, cancel_event)
+            return
         if target.kind in {"novel", "novel_series", "user_novels", "novel_bookmark"}:
             self._download_novel_target(task, target, callbacks, cancel_event)
             return
         if target.kind in {"fanbox", "sketch"}:
             root = platform_output_root(task.output_dir, "pixiv")
             if target.kind == "fanbox":
-                downloaded = FanboxClient(self.session).download(target.value, root, task, callbacks, cancel_event)
+                with FanboxClient(self.session) as client:
+                    downloaded = client.download(target.value, root, task, callbacks, cancel_event)
             else:
-                downloaded = SketchClient(self.session).download(target.value, root, task, callbacks, cancel_event)
+                with SketchClient(self.session) as client:
+                    downloaded = client.download(target.value, root, task, callbacks, cancel_event)
             callbacks.on_progress(
                 ProgressEvent(
                     task.task_id, task.module_id, "info", f"{target.kind} 完成：下载 {downloaded} 个文件",
@@ -643,12 +613,23 @@ class PixivCrawler:
                 )
             )
             return
-        work_ids = self._work_ids(
-            target,
-            int(task.options.get("max_works") or 20),
-            str(task.options.get("search_mode") or ""),
-            task.options,
-        )
+        work_ids = None
+        if owner_id is not None:
+            work_ids = restored_collection_ids(task, target.kind, owner_id)
+        if work_ids is None:
+            work_ids = self._work_ids(
+                target, int(task.options.get("max_works") or 20),
+                str(task.options.get("search_mode") or ""), task.options,
+            )
+            if owner_id is not None and work_ids:
+                publish_collection_plan(task, target.kind, owner_id, work_ids, callbacks)
+        if owner_id is not None:
+            if not work_ids:
+                raise ValueError("Pixiv 没有找到可下载的集合作品")
+            self._report_catalog_discovery(task, callbacks)
+            download_collection_media(self, task, work_ids, callbacks, cancel_event)
+            return
+        self._report_catalog_discovery(task, callbacks)
         root = platform_output_root(task.output_dir, "pixiv")
         downloaded = 0
         skipped_ai = 0
@@ -663,17 +644,17 @@ class PixivCrawler:
                 task.task_id,
                 task.module_id,
                 "info",
-                f"Pixiv 已找到 {len(work_ids)} 个作品",
+                f"Pixiv 本次范围包含 {len(work_ids)} 个作品",
                 current=0,
                 total=len(work_ids),
                 percent=0.0,
             )
         )
         for work_index, work_id in enumerate(work_ids, 1):
-            if cancel_event.is_set():
+            if task_cancelled(cancel_event):
                 raise TaskCancelled("任务已取消")
             detail = self._body(f"/ajax/illust/{work_id}")
-            if cancel_event.is_set():
+            if task_cancelled(cancel_event):
                 raise TaskCancelled("任务已取消")
             summary = self._work_summary(detail)
             if blocklist and blocklist.is_blocked("pixiv", f"https://www.pixiv.net/artworks/{work_id}", author_id=str(summary.get("author_id") or "")):
@@ -710,6 +691,9 @@ class PixivCrawler:
                     percent=(work_index - 1) / len(work_ids) * 100.0,
                 )
             )
+            if target.kind == "work" and int(detail.get("illustType") or 0) != 2:
+                download_static_work(self, task, work_id, summary, work_dir, callbacks, cancel_event)
+                return
             if int(detail.get("illustType") or 0) == 2:
                 meta = self._body(f"/ajax/illust/{work_id}/ugoira_meta")
                 for destination, media_type, source_url in download_ugoira(
@@ -745,7 +729,7 @@ class PixivCrawler:
                 pages = []
             else:
                 pages = self._body(f"/ajax/illust/{work_id}/pages")
-                if cancel_event.is_set():
+                if task_cancelled(cancel_event):
                     raise TaskCancelled("任务已取消")
                 if not isinstance(pages, list):
                     raise ValueError(f"Pixiv 作品 {work_id} 页数据格式异常")
@@ -753,7 +737,7 @@ class PixivCrawler:
                     raise ValueError(f"Pixiv 作品 {work_id} 未返回任何图片页，不能标记为下载完成")
             available_pages = 0
             for page_index, page in enumerate(pages, 1):
-                if cancel_event.is_set():
+                if task_cancelled(cancel_event):
                     raise TaskCancelled("任务已取消")
                 original = ((page or {}).get("urls") or {}).get("original") if isinstance(page, dict) else ""
                 if not original:
@@ -762,19 +746,16 @@ class PixivCrawler:
                 suffix = extension_from_url(original, ".jpg", PIXIV_IMAGE_EXTENSIONS)
                 final_suffix = normalized_media_extension("image/gif" if suffix == ".gif" else "image/*", suffix, "image", task.options)
                 destination = work_dir / f"{page_index:03d}{final_suffix}"
-                if destination.exists() and destination.stat().st_size:
-                    reused += 1
-                    continue
                 source_path = destination if final_suffix == suffix else work_dir / f".{page_index:03d}.source{suffix}"
-                try:
-                    download_file(self.session, original, source_path, cancel_event)
-                    if source_path != destination:
-                        convert_media_file(source_path, destination, final_suffix)
-                finally:
-                    if source_path != destination:
-                        source_path.unlink(missing_ok=True)
-                size = destination.stat().st_size
-                downloaded += 1
+                result = download_media_file(
+                    self.session, original, source_path, destination, cancel_event, final_suffix,
+                    conflict_policy=task.options.get("file_conflict", "reuse"),
+                    public_referer="https://www.pixiv.net/",
+                )
+                size, was_reused = result
+                destination = result.path
+                reused += int(was_reused)
+                downloaded += int(not was_reused)
                 callbacks.on_file(
                     FileRecord(
                         path=destination.resolve(),
@@ -831,7 +812,7 @@ class PixivCrawler:
         if target.kind == "search":
             return [item["id"] for item in self.search(target.value, limit=limit, search_mode=search_mode, options=options)]
         if target.kind == "manga_series":
-            return [item["id"] for item in PixivCatalog(self._body, self._json).manga_series(target.value, limit)]
+            return [item["id"] for item in self._catalog().manga_series(target.value, limit)]
         if target.kind in {"ranking", "new", "bookmark", "history", "author_tag"}:
             modes = {
                 "ranking": "排行榜",
@@ -840,14 +821,14 @@ class PixivCrawler:
                 "history": "浏览历史（Premium）",
                 "author_tag": "作者 + 标签",
             }
-            return [item["id"] for item in self.search(target.value, limit=limit, search_mode=modes[target.kind], options=options)]
+            rows = self.search(target.value, limit=limit, search_mode=modes[target.kind], options=options)
+            if target.kind == "bookmark":
+                from .bookmark_discovery import require_downloadable_discovery
+
+                require_downloadable_discovery(self.last_bookmark_status)
+            return [item["id"] for item in rows]
         body = self._body(f"/ajax/user/{target.value}/profile/all")
-        ids: set[str] = set()
-        for key in ("illusts", "manga"):
-            values = body.get(key, {}) if isinstance(body, dict) else {}
-            if isinstance(values, dict):
-                ids.update(str(item) for item in values)
-        return sorted(ids, key=int, reverse=True)[:limit]
+        return profile_ids(body, ("illusts", "manga"), limit)
 
     def _download_novel_target(
         self,
@@ -862,43 +843,69 @@ class PixivCrawler:
             series_id = ""
         elif target.kind == "user_novels":
             profile = self._body(f"/ajax/user/{target.value}/profile/all")
-            novels = profile.get("novels", {}) if isinstance(profile, dict) else {}
-            novel_ids = sorted(
-                (str(item) for item in novels if str(item).isdigit()), key=int, reverse=True
-            )[:limit] if isinstance(novels, dict) else []
+            novel_ids = profile_ids(profile, ("novels",), limit)
             series_id = ""
         elif target.kind == "novel_bookmark":
             owner_id = _numeric_id(target.value) if re.search(r"\d+", target.value) else str(task.options.get("account_id") or "")
             if not owner_id:
                 raise ValueError("小说收藏需要 Pixiv 账号 ID 或包含账号 ID 的目标")
-            novel_ids = [
-                str(row["id"])
-                for row in PixivCatalog(self._body, self._json).novel_bookmarks(
-                    owner_id,
-                    limit=limit,
-                    visibility=str(task.options.get("pixiv_visibility") or "show"),
-                    tag=str(task.options.get("bookmark_tag") or ""),
-                    start_date=str(task.options.get("start_date") or ""),
-                    end_date=str(task.options.get("end_date") or ""),
-                    date_basis=str(task.options.get("bookmark_date_basis") or "bookmarked"),
-                )
-            ]
+            novel_ids = restored_collection_ids(task, target.kind, owner_id)
+            if novel_ids is None:
+                catalog = self._catalog()
+                novel_ids = [
+                    str(row["id"])
+                    for row in catalog.novel_bookmarks(
+                        owner_id, limit=limit,
+                        visibility=str(task.options.get("pixiv_visibility") or "show"),
+                        tag=str(task.options.get("bookmark_tag") or ""),
+                        start_date=str(task.options.get("start_date") or ""),
+                        end_date=str(task.options.get("end_date") or ""),
+                        date_basis=str(task.options.get("bookmark_date_basis") or "bookmarked"),
+                    )
+                ]
+                from .bookmark_discovery import require_downloadable_discovery
+
+                require_downloadable_discovery(catalog.last_bookmark_status)
+                if novel_ids:
+                    publish_collection_plan(task, target.kind, owner_id, novel_ids, callbacks)
             series_id = ""
         else:
             series_id = target.value
             novel_ids = [
                 str(row["id"])
-                for row in PixivCatalog(self._body, self._json).novel_series(target.value, limit)
+                for row in self._catalog().novel_series(target.value, limit)
             ]
         if not novel_ids:
             raise ValueError("Pixiv 小说目标没有可下载内容")
+        self._report_catalog_discovery(task, callbacks)
         root = platform_output_root(task.output_dir, "pixiv")
         downloaded = 0
+        skipped_ai = 0
+        skipped_blocked = 0
+        blocklist_path = str(task.options.get("_blocklist_path") or "")
+        blocklist = BlocklistStore(blocklist_path) if blocklist_path else None
         for index, novel_id in enumerate(novel_ids, 1):
-            if cancel_event.is_set():
+            if task_cancelled(cancel_event):
                 raise TaskCancelled("任务已取消")
             body = self._body(f"/ajax/novel/{novel_id}?lang=zh")
+            if task_cancelled(cancel_event):
+                raise TaskCancelled("任务已取消")
             summary = self._novel_summary(body, novel_id)
+            source_url = self.target_url(PixivTarget("novel", novel_id))
+            reason = ""
+            if blocklist and blocklist.is_blocked("pixiv", source_url, author_id=summary["author_id"]):
+                skipped_blocked += 1
+                reason = "跨平台黑名单"
+            elif bool(task.options.get("filter_ai", True)) and self._is_ai(body):
+                skipped_ai += 1
+                reason = "AI 作品"
+            if reason:
+                callbacks.on_progress(ProgressEvent(
+                    task.task_id, task.module_id, "warning", f"跳过小说 {novel_id}：{reason}",
+                    current=index, total=len(novel_ids), percent=index / len(novel_ids) * 100.0,
+                    metadata={"source_id": novel_id, "source_url": source_url, "skip_reason": reason},
+                ))
+                continue
             author_dir = safe_component(f'{summary.get("author_name") or "unknown"}_{summary.get("author_id") or "0"}')
             folder_label = f'{summary.get("title") or novel_id}_{novel_id}'
             if series_id:
@@ -907,52 +914,63 @@ class PixivCrawler:
             for component in folder_label.split("/"):
                 novel_dir /= safe_component(component)
             destination = novel_dir / f"{safe_component(summary.get('title') or novel_id)}_{novel_id}.html"
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            content = str(body.get("content") or "") if isinstance(body, dict) else ""
-            document = (
-                "<!doctype html><html lang=\"zh\"><meta charset=\"utf-8\">"
-                f"<title>{html.escape(str(summary.get('title') or novel_id))}</title>"
-                f"<h1>{html.escape(str(summary.get('title') or novel_id))}</h1>"
-                f"<p>作者：{html.escape(str(summary.get('author_name') or summary.get('author_id') or ''))}</p>"
-                f"<pre style=\"white-space:pre-wrap\">{html.escape(content)}</pre></html>"
-            )
-            destination.write_text(document, encoding="utf-8")
             text_path = destination.with_suffix(".txt")
-            plain_content = self._decode_html_entities(content)
-            text_document = "\n".join(
-                part
-                for part in (
-                    str(summary.get("title") or novel_id),
-                    f"作者：{summary.get('author_name') or summary.get('author_id') or '-'}",
-                    f"发布日期：{summary.get('published_at') or '-'}",
-                    "标签：" + "、".join(str(tag) for tag in summary.get("tags") or [])
-                    if summary.get("tags")
-                    else "标签：-",
-                    f"来源：{self.target_url(PixivTarget('novel', novel_id))}",
-                    "",
-                    plain_content,
-                )
-            )
-            text_path.write_text(text_document, encoding="utf-8-sig")
             metadata_path = destination.with_suffix(".json")
-            metadata_path.write_text(json.dumps(body, ensure_ascii=False, indent=2), encoding="utf-8")
-            for path, media_type in (
-                (destination, "text"),
-                (text_path, "text"),
-                (metadata_path, "metadata"),
-            ):
-                callbacks.on_file(
-                    FileRecord(
-                        path=path.resolve(), module_id=task.module_id, task_id=task.task_id,
-                        media_type=media_type, size=path.stat().st_size,
-                        title=str(summary.get("title") or novel_id), source_url=self.target_url(PixivTarget("novel", novel_id)),
-                        source_id=novel_id, author_id=str(summary.get("author_id") or ""),
-                        author_name=str(summary.get("author_name") or ""), published_at=str(summary.get("published_at") or ""),
-                        tags=tuple(str(item) for item in summary.get("tags") or ()),
-                        metadata={"pixiv_type": "novel", "series_id": series_id},
+            with media_output(destination, task.options.get("file_conflict", "reuse"), cancel_event,
+                              companions=lambda path: (path.with_suffix(".txt"), path.with_suffix(".json"))) as destination:
+                text_path = destination.with_suffix(".txt")
+                metadata_path = destination.with_suffix(".json")
+                policy = task.options.get("file_conflict", "reuse")
+                reuse_html = reuse_existing(destination, policy)
+                reuse_text = reuse_existing(text_path, policy)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                content = str(body.get("content") or "") if isinstance(body, dict) else ""
+                document = (
+                    "<!doctype html><html lang=\"zh\"><meta charset=\"utf-8\">"
+                    f"<title>{html.escape(str(summary.get('title') or novel_id))}</title>"
+                    f"<h1>{html.escape(str(summary.get('title') or novel_id))}</h1>"
+                    f"<p>作者：{html.escape(str(summary.get('author_name') or summary.get('author_id') or ''))}</p>"
+                    f"<pre style=\"white-space:pre-wrap\">{html.escape(content)}</pre></html>"
+                )
+                if not reuse_html:
+                    write_text_atomic(destination, document)
+                text_path = destination.with_suffix(".txt")
+                plain_content = self._decode_html_entities(content)
+                text_document = "\n".join(
+                    part
+                    for part in (
+                        str(summary.get("title") or novel_id),
+                        f"作者：{summary.get('author_name') or summary.get('author_id') or '-'}",
+                        f"发布日期：{summary.get('published_at') or '-'}",
+                        "标签：" + "、".join(str(tag) for tag in summary.get("tags") or [])
+                        if summary.get("tags")
+                        else "标签：-",
+                        f"来源：{self.target_url(PixivTarget('novel', novel_id))}",
+                        "",
+                        plain_content,
                     )
                 )
-                downloaded += 1
+                if not reuse_text:
+                    write_text_atomic(text_path, text_document, encoding="utf-8-sig")
+                metadata_path = destination.with_suffix(".json")
+                write_text_atomic(metadata_path, json.dumps(body, ensure_ascii=False, indent=2))
+                for path, media_type in (
+                    (destination, "text"),
+                    (text_path, "text"),
+                    (metadata_path, "metadata"),
+                ):
+                    callbacks.on_file(
+                        FileRecord(
+                            path=path.resolve(), module_id=task.module_id, task_id=task.task_id,
+                            media_type=media_type, size=path.stat().st_size,
+                            title=str(summary.get("title") or novel_id), source_url=self.target_url(PixivTarget("novel", novel_id)),
+                            source_id=novel_id, author_id=str(summary.get("author_id") or ""),
+                            author_name=str(summary.get("author_name") or ""), published_at=str(summary.get("published_at") or ""),
+                            tags=tuple(str(item) for item in summary.get("tags") or ()),
+                            metadata={"pixiv_type": "novel", "series_id": series_id},
+                        )
+                    )
+                    downloaded += 1
             callbacks.on_progress(
                 ProgressEvent(
                     task.task_id, task.module_id, "info", f"[{index}/{len(novel_ids)}] 已保存小说 {summary.get('title') or novel_id}",
@@ -961,8 +979,10 @@ class PixivCrawler:
             )
         callbacks.on_progress(
             ProgressEvent(
-                task.task_id, task.module_id, "info", f"Pixiv 小说完成：保存 {downloaded} 个文件",
-                current=len(novel_ids), total=len(novel_ids), percent=100.0, metadata={"downloaded": downloaded},
+                task.task_id, task.module_id, "info",
+                f"Pixiv 小说完成：保存 {downloaded} 个文件，AI 跳过 {skipped_ai} 篇，黑名单跳过 {skipped_blocked} 篇",
+                current=len(novel_ids), total=len(novel_ids), percent=100.0,
+                metadata={"downloaded": downloaded, "skipped_ai": skipped_ai, "skipped_blocked": skipped_blocked},
             )
         )
 
@@ -989,21 +1009,28 @@ class PixivCrawler:
         return payload.get("body")
 
     def _json(self, url: str) -> dict:
-        response = self.session.get(url, timeout=(10, 45))
-        response.raise_for_status()
-        payload = response.json()
-        if not isinstance(payload, dict):
-            raise ValueError(f"Pixiv 接口未返回对象：{url}")
-        if payload.get("error") is True:
-            raise RuntimeError(str(payload.get("message") or "Pixiv 接口返回错误"))
-        return payload
+        return request_json(self.session, url)
+
+    def _text(self, url: str, *, timeout: tuple[int, int]) -> tuple[str, str]:
+        HTTP_BACKOFF.wait(url)
+        response = request_get(self.session, url, timeout=timeout)
+        try:
+            record_http_backoff(response, url)
+            response.raise_for_status()
+            return read_response_text(response), str(response.url or url)
+        finally:
+            response.close()
 
     @staticmethod
     def _is_ai(detail: dict) -> bool:
-        if int(detail.get("aiType") or 0) == 2:
+        if str(detail.get("aiType") or "") == "2":
             return True
-        tags = ((detail.get("tags") or {}).get("tags") or []) if isinstance(detail, dict) else []
-        values = {str((item or {}).get("tag") or "").lower() for item in tags if isinstance(item, dict)}
+        tags = detail.get("tags") or []
+        if isinstance(tags, dict):
+            tags = tags.get("tags") or []
+        if not isinstance(tags, list):
+            return False
+        values = {str(item.get("tag") if isinstance(item, dict) else item).strip().casefold() for item in tags}
         return bool(values & {"ai生成", "ai-generated", "aiイラスト"})
 
     @staticmethod

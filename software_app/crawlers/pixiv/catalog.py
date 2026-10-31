@@ -7,6 +7,10 @@ from collections.abc import Callable
 from urllib.parse import quote, urlencode
 
 
+from .bookmark_discovery import BookmarkDiscovery
+from .catalog_discovery import CatalogDiscovery, object_field, list_field
+
+
 PIXIV_BASE = "https://www.pixiv.net"
 
 
@@ -158,6 +162,12 @@ class PixivCatalog:
         self.body = body_getter
         self.json = json_getter
         self.last_bookmark_status: dict = {}
+        self.last_bookmark_rows: list[dict] = []
+        self.last_discovery_status: dict = {}
+        self.last_discovery_rows: list[dict] = []
+
+    def _discovery(self, kind, limit):
+        return CatalogDiscovery(kind, limit, self.last_discovery_status, self.last_discovery_rows)
 
     @staticmethod
     def _unique(rows: list[dict], limit: int) -> list[dict]:
@@ -174,197 +184,75 @@ class PixivCatalog:
         return result
 
     def manga_series(self, series_id: str, limit: int = 100) -> list[dict]:
-        rows: list[dict] = []
-        for page in range(1, 101):
-            body = self.body(f"/ajax/series/{series_id}?p={page}&lang=zh")
-            page_data = body.get("page", {}) if isinstance(body, dict) else {}
-            items = page_data.get("series", []) if isinstance(page_data, dict) else []
-            if not isinstance(items, list) or not items:
-                break
-            for item in items:
-                row = artwork_row(item, source=f"漫画系列 {series_id}", fallback_type="漫画")
-                if row:
-                    row["series_id"] = series_id
-                    row["series_order"] = (item or {}).get("order") if isinstance(item, dict) else None
-                    rows.append(row)
-            if len(rows) >= limit or len(rows) >= int(page_data.get("total") or len(rows)):
-                break
-        return self._unique(rows, limit)
+        def row(item):
+            value = artwork_row(item, source=f"漫画系列 {series_id}", fallback_type="漫画")
+            if value:
+                value.update(series_id=series_id, series_order=item.get("order"))
+            return value
+
+        with self._discovery("manga_series", limit) as discovery:
+            for page in range(1, 101):
+                body = discovery.request(self.body, f"/ajax/series/{series_id}?p={page}&lang=zh")
+                data = object_field(body, "page")
+                items = list_field(data, "series")
+                discovery.add_page(items, row, total=data.get("total"))
+                # There is no known requested page size for this route. Missing
+                # total must continue until an explicit empty page, not len(rows).
+                if discovery.finish(terminal=not items):
+                    return list(discovery.rows)
 
     def novel_series(self, series_id: str, limit: int = 100) -> list[dict]:
-        rows: list[dict] = []
-        last_order = 0
-        while len(rows) < limit:
-            page_limit = min(30, limit - len(rows))
-            body = self.body(
-                f"/ajax/novel/series_content/{series_id}?"
-                + urlencode({"limit": page_limit, "last_order": last_order, "order_by": "asc", "lang": "zh"})
-            )
-            page_data = body.get("page", {}) if isinstance(body, dict) else {}
-            items = page_data.get("seriesContents", []) if isinstance(page_data, dict) else []
-            if not isinstance(items, list) or not items:
-                break
-            before = len(rows)
-            for item in items:
-                row = novel_row(item, source=f"小说系列 {series_id}")
-                if row:
-                    row["series_id"] = series_id
-                    row["series_order"] = (item or {}).get("order") if isinstance(item, dict) else None
-                    rows.append(row)
-            if len(rows) == before:
-                break
-            last_order += len(items)
-            total = int(page_data.get("total") or body.get("total") or 0) if isinstance(body, dict) else 0
-            if (total and len(rows) >= total) or len(items) < page_limit:
-                break
-        return self._unique(rows, limit)
+        def row(item):
+            value = novel_row(item, source=f"小说系列 {series_id}")
+            if value:
+                value.update(series_id=series_id, series_order=item.get("order"))
+            return value
+
+        with self._discovery("novel_series", limit) as discovery:
+            last_order = 0
+            while True:
+                count = min(30, limit - len(discovery.rows))
+                body = discovery.request(self.body, f"/ajax/novel/series_content/{series_id}?"
+                                 + urlencode({"limit": count, "last_order": last_order, "order_by": "asc", "lang": "zh"}))
+                data = object_field(body, "page")
+                items = list_field(data, "seriesContents")
+                discovery.add_page(items, row, total=data["total"] if data.get("total") is not None else body.get("total"))
+                if discovery.finish(terminal=not items or (len(items) < count and discovery.status["total"] is None)):
+                    return list(discovery.rows)
+                last_order += len(items)
 
     def novel_search(self, keyword: str, limit: int = 100) -> list[dict]:
-        rows: list[dict] = []
-        for page in range(1, 11):
-            body = self.body(
-                f"/ajax/search/novels/{quote(keyword)}?"
-                + urlencode({"word": keyword, "order": "date_d", "mode": "all", "p": page, "s_mode": "s_tag_full", "lang": "zh"})
-            )
-            container = body.get("novel", {}) if isinstance(body, dict) else {}
-            items = container.get("data", []) if isinstance(container, dict) else []
-            if not isinstance(items, list) or not items:
-                break
-            rows.extend(row for item in items if (row := novel_row(item, source=f"小说搜索：{keyword}")))
-            total = int(container.get("total") or 0) if isinstance(container, dict) else 0
-            if len(rows) >= limit or (total and len(rows) >= total) or len(items) < 20:
-                break
-        return self._unique(rows, limit)
+        with self._discovery("novel_search", limit) as discovery:
+            for page in range(1, 11):
+                body = discovery.request(self.body, f"/ajax/search/novels/{quote(keyword)}?"
+                                 + urlencode({"word": keyword, "order": "date_d", "mode": "all", "p": page, "s_mode": "s_tag_full", "lang": "zh"}))
+                data = object_field(body, "novel")
+                items = list_field(data, "data")
+                discovery.add_page(items, lambda item: novel_row(item, source=f"小说搜索：{keyword}"), total=data.get("total"))
+                if discovery.finish(terminal=not items or (len(items) < 20 and discovery.status["total"] is None)):
+                    return list(discovery.rows)
 
     def bookmarks(
-        self,
-        user_id: str,
-        *,
-        limit: int = 100,
-        visibility: str = "show",
-        tag: str = "",
-        start_date: str = "",
-        end_date: str = "",
-        date_basis: str = "bookmarked",
+        self, user_id: str, *, limit: int = 100, visibility: str = "show", tag: str = "",
+        start_date: str = "", end_date: str = "", date_basis: str = "bookmarked",
     ) -> list[dict]:
-        rows: list[dict] = []
-        rest_values = ("show", "hide") if visibility == "both" else (("hide",) if visibility == "hide" else ("show",))
-        scope_status: list[dict] = []
-        for rest in rest_values:
-            offset = 0
-            exhausted = False
-            known_total = 0
-            fetched_ids: set[str] = set()
-            page_count = 0
-            while len(rows) < limit and page_count < 250:
-                page_count += 1
-                count = min(48, limit - len(rows))
-                body = self.body(
-                    f"/ajax/user/{user_id}/illusts/bookmarks?"
-                    + urlencode({"tag": tag, "offset": offset, "limit": count, "rest": rest, "lang": "zh"})
-                )
-                items = body.get("works", []) if isinstance(body, dict) else []
-                known_total = int(body.get("total") or 0) if isinstance(body, dict) else 0
-                if not isinstance(items, list) or not items:
-                    exhausted = not known_total or (offset >= known_total and len(fetched_ids) >= known_total)
-                    break
-                for item in items:
-                    row = artwork_row(item, source=f"作品收藏（{'私密' if rest == 'hide' else '公开'}）")
-                    if row:
-                        fetched_ids.add(row["id"])
-                        row["visibility"] = rest
-                        date_key = "published_at" if date_basis == "published" else "bookmarked_at"
-                        filter_date = str(row.get(date_key) or "")[:10]
-                        if (start_date or end_date) and not filter_date:
-                            continue
-                        if start_date and filter_date < start_date:
-                            continue
-                        if end_date and filter_date > end_date:
-                            continue
-                        rows.append(row)
-                offset += count
-                exhausted = (
-                    (len(items) < count and len(fetched_ids) >= known_total)
-                    if known_total else len(items) < count
-                )
-                if len(rows) >= limit or exhausted:
-                    break
-            scope_status.append({"visibility": rest, "complete": exhausted, "total": known_total, "fetched": len(fetched_ids)})
-        self.last_bookmark_status = {
-            "complete": len(scope_status) == len(rest_values) and all(item["complete"] for item in scope_status),
-            "scopes": scope_status,
-        }
-        return self._unique(rows, limit)
+        return self._bookmarks(user_id, "work", limit, visibility, tag, start_date, end_date, date_basis)
 
     def novel_bookmarks(
-        self,
-        user_id: str,
-        *,
-        limit: int = 100,
-        visibility: str = "show",
-        tag: str = "",
-        start_date: str = "",
-        end_date: str = "",
-        date_basis: str = "bookmarked",
+        self, user_id: str, *, limit: int = 100, visibility: str = "show", tag: str = "",
+        start_date: str = "", end_date: str = "", date_basis: str = "bookmarked",
     ) -> list[dict]:
-        rows: list[dict] = []
-        rest_values = ("show", "hide") if visibility == "both" else (("hide",) if visibility == "hide" else ("show",))
-        scope_status: list[dict] = []
-        for rest in rest_values:
-            offset = 0
-            exhausted = False
-            known_total = 0
-            fetched_ids: set[str] = set()
-            page_count = 0
-            while len(rows) < limit and page_count < 500:
-                page_count += 1
-                count = min(24, limit - len(rows))
-                body = self.body(
-                    f"/ajax/user/{user_id}/novels/bookmarks?"
-                    + urlencode({"tag": tag, "offset": offset, "limit": count, "rest": rest, "lang": "zh"})
-                )
-                items = body.get("works", body.get("novels", body.get("data", []))) if isinstance(body, dict) else []
-                known_total = int(body.get("total") or 0) if isinstance(body, dict) else 0
-                if isinstance(items, dict):
-                    items = list(items.values())
-                if not isinstance(items, list) or not items:
-                    exhausted = not known_total or (offset >= known_total and len(fetched_ids) >= known_total)
-                    break
-                for item in items:
-                    row = novel_row(item, source=f"小说收藏（{'私密' if rest == 'hide' else '公开'}）")
-                    if not row:
-                        continue
-                    fetched_ids.add(row["id"])
-                    bookmark_data = item.get("bookmarkData") if isinstance(item, dict) and isinstance(item.get("bookmarkData"), dict) else {}
-                    row["visibility"] = rest
-                    row["bookmarked_at"] = str(
-                        bookmark_data.get("bookmarkDate")
-                        or bookmark_data.get("createDate")
-                        or (item.get("bookmarkDate") if isinstance(item, dict) else "")
-                        or ""
-                    )
-                    date_key = "published_at" if date_basis == "published" else "bookmarked_at"
-                    filter_date = str(row.get(date_key) or "")[:10]
-                    if (start_date or end_date) and not filter_date:
-                        continue
-                    if start_date and filter_date < start_date:
-                        continue
-                    if end_date and filter_date > end_date:
-                        continue
-                    rows.append(row)
-                offset += count
-                exhausted = (
-                    (len(items) < count and len(fetched_ids) >= known_total)
-                    if known_total else len(items) < count
-                )
-                if len(rows) >= limit or exhausted:
-                    break
-            scope_status.append({"visibility": rest, "complete": exhausted, "total": known_total, "fetched": len(fetched_ids)})
-        self.last_bookmark_status = {
-            "complete": len(scope_status) == len(rest_values) and all(item["complete"] for item in scope_status),
-            "scopes": scope_status,
-        }
-        return self._unique(rows, limit)
+        return self._bookmarks(user_id, "novel", limit, visibility, tag, start_date, end_date, date_basis)
+
+    def _bookmarks(self, user_id, kind, limit, visibility, tag, start_date, end_date, date_basis):
+        discovery = BookmarkDiscovery(
+            self.body, novel_row if kind == "novel" else artwork_row,
+            kind=kind, limit=limit, visibility=visibility, tag=tag,
+            start_date=start_date, end_date=end_date, date_basis=date_basis,
+        )
+        self.last_bookmark_status = discovery.status
+        self.last_bookmark_rows = discovery.rows
+        return discovery.run(user_id)
 
     def ranking(self, query: str, limit: int = 100) -> list[dict]:
         tokens = [token for token in re.split(r"[\s,，]+", str(query or "").strip()) if token]
@@ -377,74 +265,110 @@ class PixivCatalog:
         content_aliases = {"插画": "illust", "漫画": "manga", "动图": "ugoira", "illust": "illust", "manga": "manga", "ugoira": "ugoira"}
         content = next((content_aliases[token] for token in tokens if token in content_aliases), "")
         date = next((token.replace("-", "") for token in tokens if re.fullmatch(r"\d{4}-?\d{2}-?\d{2}", token)), "")
-        rows: list[dict] = []
-        for page in range(1, 21):
-            params = {"mode": mode, "p": page, "format": "json"}
-            if content:
-                params["content"] = content
-            if date:
-                params["date"] = date
-            payload = self.json(f"{PIXIV_BASE}/ranking.php?{urlencode(params)}")
-            items = payload.get("contents", []) if isinstance(payload, dict) else []
-            if not isinstance(items, list) or not items:
-                break
-            for item in items:
-                row = artwork_row(item, source=f"排行榜 {mode}")
-                if row:
-                    row["rank"] = (item or {}).get("rank") if isinstance(item, dict) else None
-                    rows.append(row)
-            if len(rows) >= limit or not payload.get("next"):
-                break
-        return self._unique(rows, limit)
+        def row(item):
+            value = artwork_row(item, source=f"排行榜 {mode}")
+            if value:
+                value["rank"] = item.get("rank")
+            return value
+
+        with self._discovery("ranking", limit) as discovery:
+            for page in range(1, 21):
+                params = {"mode": mode, "p": page, "format": "json"}
+                if content:
+                    params["content"] = content
+                if date:
+                    params["date"] = date
+                payload = discovery.request(self.json, f"{PIXIV_BASE}/ranking.php?{urlencode(params)}")
+                items = list_field(payload, "contents")
+                discovery.add_page(items, row, total=payload.get("total"))
+                # A selected count is already fulfilled; no cursor outside that
+                # selected range is required. Otherwise an explicit end is needed.
+                if discovery.finish():
+                    return list(discovery.rows)
+                if "next" not in payload:
+                    discovery.fail("invalid_cursor")
+                following = payload["next"]
+                if following is False or type(following) is int and following == 0:
+                    if discovery.finish(terminal=True):
+                        return list(discovery.rows)
+                elif following is not True and str(following) != str(page + 1):
+                    discovery.fail("invalid_cursor")
+                elif not items:
+                    discovery.fail("no_progress")
 
     def new_works(self, query: str, limit: int = 100) -> list[dict]:
         value = str(query or "").casefold()
         type_mode = "manga" if "漫画" in value or "manga" in value else "illust"
         r18 = "r18" in value or "r-18" in value
-        last_id = "0"
-        rows: list[dict] = []
-        while len(rows) < limit:
-            count = min(60, limit - len(rows))
-            body = self.body(
-                f"/ajax/illust/new?"
-                + urlencode({"lastId": last_id, "limit": count, "type": type_mode, "r18": str(r18).lower(), "lang": "zh"})
-            )
-            items = body.get("illusts", []) if isinstance(body, dict) else []
-            if not isinstance(items, list) or not items:
-                break
-            for item in items:
-                row = artwork_row(item, source="Pixiv 新作", fallback_type="漫画" if type_mode == "manga" else "插画")
-                if row:
-                    rows.append(row)
-            next_id = str(body.get("lastId") or "") if isinstance(body, dict) else ""
-            if not next_id or next_id == last_id or len(items) < count:
-                break
-            last_id = next_id
-        return self._unique(rows, limit)
+        with self._discovery("new_works", limit) as discovery:
+            last_id, cursors = "0", {"0"}
+            while True:
+                count = min(60, limit - len(discovery.rows))
+                body = discovery.request(self.body, "/ajax/illust/new?"
+                                 + urlencode({"lastId": last_id, "limit": count, "type": type_mode, "r18": str(r18).lower(), "lang": "zh"}))
+                items = list_field(body, "illusts")
+                discovery.add_page(items, lambda item: artwork_row(item, source="Pixiv 新作", fallback_type="漫画" if type_mode == "manga" else "插画"), total=body.get("total"))
+                if discovery.finish(terminal=not items):
+                    return list(discovery.rows)
+                if "lastId" not in body:
+                    if len(items) < count and discovery.finish(terminal=True):
+                        return list(discovery.rows)
+                    discovery.fail("invalid_cursor")
+                following = body["lastId"]
+                if following in (None, ""):
+                    if discovery.finish(terminal=True):
+                        return list(discovery.rows)
+                next_id = str(following)
+                if not next_id.isascii() or not next_id.isdigit() or len(next_id) > 32 or next_id in cursors:
+                    discovery.fail("invalid_cursor")
+                cursors.add(next_id)
+                last_id = next_id
 
     def author_tag(self, query: str, limit: int = 100) -> list[dict]:
         match = re.match(r"\s*(\d+)\s+(.+?)\s*$", str(query or ""))
         if not match:
             raise ValueError("作者 + 标签请输入：作者ID 标签，例如 123456 风景")
         user_id, tag = match.groups()
-        rows: list[dict] = []
-        offset = 0
-        while len(rows) < limit:
-            count = min(48, limit - len(rows))
-            body = self.body(
-                f"/ajax/user/{user_id}/illustmanga/tag?"
-                + urlencode({"tag": tag, "offset": offset, "limit": count, "lang": "zh"})
-            )
-            items = body.get("works", body.get("data", [])) if isinstance(body, dict) else []
-            if isinstance(items, dict):
-                items = list(items.values())
-            if not isinstance(items, list) or not items:
-                break
-            rows.extend(row for item in items if (row := artwork_row(item, source=f"作者 {user_id} · {tag}")))
-            offset += len(items)
-            if len(items) < count:
-                break
-        return self._unique(rows, limit)
+        with self._discovery("author_tag", limit) as discovery:
+            offset = 0
+            while True:
+                count = min(48, limit - len(discovery.rows))
+                body = discovery.request(self.body, f"/ajax/user/{user_id}/illustmanga/tag?"
+                                 + urlencode({"tag": tag, "offset": offset, "limit": count, "lang": "zh"}))
+                items = list_field(body, "works", "data", mapping=True)
+                discovery.add_page(items, lambda item: artwork_row(item, source=f"作者 {user_id} · {tag}"), total=body.get("total"))
+                if discovery.finish(terminal=not items or (len(items) < count and discovery.status["total"] is None)):
+                    return list(discovery.rows)
+                offset += len(items)
+
+    def artwork_search(self, keyword, limit=20, search_mode="", options=None):
+        options = options or {}
+        type_value = {"标签（插画）": "illust_and_ugoira", "标签（漫画）": "manga"}.get(search_mode, "all")
+        match = "s_tc" if search_mode == "标题 / 简介" else "s_tag_full"
+        age = str(options.get("age_mode") or "all").strip().lower()
+        params = {"word": keyword, "order": "date_d", "mode": age if age in {"safe", "r18"} else "all"}
+        if options.get("start_date"):
+            params["scd"] = str(options["start_date"])
+        if options.get("end_date"):
+            params["ecd"] = str(options["end_date"])
+        minimum = max(0, int(options.get("minimum_bookmarks") or 0))
+        if minimum:
+            params["blt"] = minimum
+
+        def row(item):
+            value = artwork_row(item, fallback_type="插画")
+            if value:
+                value["search_mode"] = search_mode or "标签（全部）"
+            return value
+
+        with self._discovery("artwork_search", limit) as discovery:
+            for page in range(1, 11):
+                body = discovery.request(self.body, f"/ajax/search/artworks/{quote(keyword)}?" + urlencode({**params, "p": page, "s_mode": match, "type": type_value}))
+                data = object_field(body, "illustManga")
+                items = list_field(data, "data")
+                discovery.add_page(items, row, total=data.get("total"))
+                if discovery.finish(terminal=not items or (len(items) < 20 and discovery.status["total"] is None)):
+                    return list(discovery.rows)
 
 
 __all__ = ["PixivCatalog", "artwork_row", "novel_row", "filter_bookmark_candidates"]

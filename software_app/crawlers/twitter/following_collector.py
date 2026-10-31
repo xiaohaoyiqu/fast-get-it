@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import argparse
 import base64
 import json
@@ -15,8 +16,13 @@ from selenium.common.exceptions import NoSuchWindowException, TimeoutException, 
 from selenium.webdriver.common.by import By
 
 try:
+    from software_app.core.task_control import task_cancelled, task_wait
     from .driver_init import cookies_web, initialize_driver
 except ImportError:  # Direct script execution used by the desktop subprocess.
+    project_root = str(Path(__file__).resolve().parents[3])
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    from software_app.core.task_control import task_cancelled, task_wait
     from driver_init import cookies_web, initialize_driver
 
 
@@ -116,7 +122,7 @@ def discover_current_handle(driver, timeout: int = 25, cancel_event=None) -> str
     safe_get(driver, "https://x.com/home", timeout=timeout)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if cancel_event is not None and cancel_event.is_set():
+        if cancel_event is not None and task_cancelled(cancel_event):
             raise FollowingRefreshCancelled("关注列表刷新已停止")
         if page_has_login_or_restriction(driver):
             raise RuntimeError("当前页面仍是登录/限制页面，无法识别自己的账号。")
@@ -620,6 +626,7 @@ def collect_following(
     cancel_event=None,
     on_status=None,
     on_accounts=None,
+    proxy_url: str = "",
 ) -> dict:
     requested_update_mode = str(update_mode or "all").strip().lower()
     if requested_update_mode not in FOLLOWING_UPDATE_MODES:
@@ -666,7 +673,7 @@ def collect_following(
             metadata["removed_count"] = len(known_handles - set(result))
         return metadata
 
-    driver = initialize_driver()
+    driver = initialize_driver(proxy_url=proxy_url)
     accounts: dict[str, FollowingAccount] = {}
     started_at = time.monotonic()
     stopped_reason = ""
@@ -688,7 +695,7 @@ def collect_following(
             initial_deadline = min(total_deadline, initial_deadline)
         last_wait_report = -1
         while time.monotonic() < initial_deadline:
-            if cancel_event is not None and cancel_event.is_set():
+            if cancel_event is not None and task_cancelled(cancel_event):
                 stopped_reason = "cancelled"
                 break
             try:
@@ -714,7 +721,7 @@ def collect_following(
             if not int(scroll_state.get("cells") or 0) and should_report:
                 report_status(on_status, "关注列表仍在懒加载，正在滚动页面触发首批账号")
             if cancel_event is not None:
-                cancel_event.wait(1)
+                task_wait(cancel_event, 1)
             else:
                 time.sleep(1)
 
@@ -728,7 +735,7 @@ def collect_following(
         greatest_height = -1
         completion_reason = ""
         while not stopped_reason:
-            if cancel_event is not None and cancel_event.is_set():
+            if cancel_event is not None and task_cancelled(cancel_event):
                 stopped_reason = "cancelled"
                 break
             if total_deadline is not None and time.monotonic() >= total_deadline:
@@ -800,7 +807,7 @@ def collect_following(
                 completion_reason = "list_end"
                 break
             if cancel_event is not None:
-                cancel_event.wait(scroll_pause)
+                task_wait(cancel_event, scroll_pause)
             else:
                 time.sleep(scroll_pause)
 

@@ -12,7 +12,9 @@ from urllib.parse import urljoin, urlparse
 import requests
 from Crypto.Cipher import AES
 
-from software_app.crawlers.common import load_cookie_file
+from software_app.crawlers.common import load_cookie_file, request_get
+from software_app.core.adapter import TaskCancelled
+from software_app.core.response_read import read_response_json, read_response_text, ResponseLimitError
 
 
 APP_VERSION = "2.1.7"
@@ -125,8 +127,9 @@ class JmComicApiClient:
         forbidden = False
         for domain in self._api_domains():
             url = urljoin(domain.rstrip("/") + "/", endpoint.lstrip("/"))
+            response = None
             try:
-                response = self.session.get(url, params=params, headers=headers, timeout=(5, 25))
+                response = request_get(self.session, url, params=params, headers=headers, timeout=(5, 25))
                 if response.status_code == 401:
                     unauthorized = True
                     errors.append(f"{domain}: HTTP 401（账号会话未通过）")
@@ -137,11 +140,12 @@ class JmComicApiClient:
                     continue
                 response.raise_for_status()
                 try:
-                    envelope = response.json()
+                    envelope = read_response_json(response)
+                except ResponseLimitError:
+                    raise
                 except ValueError as exc:
                     content_type = str(response.headers.get("Content-Type") or "").casefold()
-                    body_start = str(response.text or "")[:512].casefold()
-                    if "text/html" in content_type or "<html" in body_start or "<!doctype" in body_start:
+                    if "text/html" in content_type:
                         raise RuntimeError(
                             "接口返回了网页或访问验证页，而不是账号数据；当前节点可能被 Cloudflare 或站点验证拦截"
                         ) from exc
@@ -155,8 +159,13 @@ class JmComicApiClient:
                 if not isinstance(data, str) or not data:
                     raise RuntimeError("接口没有返回数据")
                 return json.loads(self._decrypt(data, timestamp))
+            except (TaskCancelled, ResponseLimitError):
+                raise
             except (OSError, ValueError, RuntimeError, requests.RequestException) as exc:
                 errors.append(f"{domain}: {exc}")
+            finally:
+                if response is not None:
+                    response.close()
         if unauthorized:
             raise PermissionError("JMComic 账号接口返回 HTTP 401；AVS 已失效、不是 AVS Cookie，或来自不同的网页域名")
         if forbidden:
@@ -179,24 +188,29 @@ class JmComicApiClient:
             discovered: tuple[str, ...] = ()
             # Do not reuse the account session here: the domain-list service
             # does not need AVS and must never receive an account cookie.
-            discovery = requests.Session()
-            discovery.trust_env = False
-            discovery.headers.update({"User-Agent": self.session.headers.get("User-Agent", "Mozilla/5.0")})
-            discovery.proxies.update(self.session.proxies)
-            for source in API_DOMAIN_SERVERS:
-                try:
-                    response = discovery.get(source, timeout=(3, 8))
-                    response.raise_for_status()
-                    text = str(response.text or "")
-                    while text and not text[0].isascii():
-                        text = text[1:]
-                    payload = json.loads(self._decrypt(text.strip(), "", API_DOMAIN_SERVER_SECRET))
-                    discovered = self._normalize_api_domains(payload.get("Server") if isinstance(payload, dict) else None)
-                    if discovered:
-                        break
-                except (OSError, ValueError, RuntimeError, requests.RequestException):
-                    continue
-            discovery.close()
+            with requests.Session() as discovery:
+                discovery.trust_env = False
+                discovery.headers.update({"User-Agent": self.session.headers.get("User-Agent", "Mozilla/5.0")})
+                discovery.proxies.update(self.session.proxies)
+                for source in API_DOMAIN_SERVERS:
+                    response = None
+                    try:
+                        response = request_get(discovery, source, timeout=(3, 8))
+                        response.raise_for_status()
+                        text = read_response_text(response, maximum=1024 * 1024)
+                        while text and not text[0].isascii():
+                            text = text[1:]
+                        payload = json.loads(self._decrypt(text.strip(), "", API_DOMAIN_SERVER_SECRET))
+                        discovered = self._normalize_api_domains(payload.get("Server") if isinstance(payload, dict) else None)
+                        if discovered:
+                            break
+                    except (TaskCancelled, ResponseLimitError):
+                        raise
+                    except (OSError, ValueError, RuntimeError, requests.RequestException):
+                        continue
+                    finally:
+                        if response is not None:
+                            response.close()
             type(self)._domain_cache = discovered
             return discovered
 

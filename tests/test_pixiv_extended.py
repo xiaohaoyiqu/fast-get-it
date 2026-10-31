@@ -5,10 +5,14 @@ import threading
 import unittest
 from datetime import date
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import requests
 
 from software_app.adapters.pixiv import PixivNativeAdapter
 from software_app.core.events import CallbackSet
+from software_app.core.blocklist import BlocklistStore
+from software_app.core.adapter import TaskCancelled
 from software_app.core.models import DownloadTask, TargetPreview, classify_file
 from software_app.core.plugin_loader import load_adapter_plugins, set_external_plugin_enabled
 from software_app.crawlers.pixiv.catalog import PixivCatalog, filter_bookmark_candidates
@@ -24,6 +28,10 @@ from software_app.ui.settings_tab import plugin_purpose
 
 
 class _Response:
+    status_code = 200
+    headers = {}
+    encoding = "utf-8"
+
     def __init__(self, payload):
         self.payload = payload
 
@@ -33,11 +41,20 @@ class _Response:
     def json(self):
         return self.payload
 
+    def iter_content(self, **_kwargs):
+        yield json.dumps(self.payload).encode("utf-8")
+
+    def close(self):
+        pass
+
 
 class _Session:
     def __init__(self, routes):
         self.routes = routes
         self.urls = []
+
+    def close(self):
+        pass
 
     def get(self, url, **_kwargs):
         self.urls.append(url)
@@ -48,20 +65,28 @@ class _Session:
 
 
 class PixivExtendedTests(unittest.TestCase):
+    def setUp(self):
+        validation = patch("software_app.crawlers.common.validate_external_url", side_effect=lambda url: url)
+        validation.start()
+        self.addCleanup(validation.stop)
     def test_pixiv_session_uses_only_the_app_proxy_setting(self):
         crawler = PixivCrawler(cookie_file=Path("missing-cookie.json"), proxy_url="")
         self.assertFalse(crawler.session.trust_env)
 
     def test_preview_avatar_rejects_lookalike_hosts_and_non_images(self):
         class Response:
+            status_code = 200
             content = b"not-an-image"
             headers = {"Content-Type": "text/html; charset=utf-8"}
 
             def raise_for_status(self):
                 return None
 
+            def close(self):
+                pass
+
         class Client:
-            class Session:
+            class Session(requests.Session):
                 def get(self, _url, **_kwargs):
                     return Response()
 
@@ -205,8 +230,68 @@ class PixivExtendedTests(unittest.TestCase):
             self.assertIn("第一行\n第二行", txt)
             self.assertEqual(progress[-1].percent, 100.0)
 
+    def test_novel_collection_filters_each_discovered_work_before_writing(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            store = BlocklistStore(root / "blocked.json")
+            store.add_group(("pixiv", "8"))
+            store.add_work("pixiv", "https://www.pixiv.net/novel/show.php?id=103")
+            bodies = {
+                "101": {"title": "AI", "userId": "7", "aiType": 2},
+                "102": {"title": "Blocked author", "userId": "8"},
+                "103": {"title": "Blocked novel", "userId": "7"},
+                "104": {"title": "Allowed", "userId": "7", "content": "正文"},
+            }
+            crawler = object.__new__(PixivCrawler)
+
+            def body(path):
+                if "profile/all" in path:
+                    return {"novels": dict.fromkeys(bodies)}
+                return bodies[path.split("/novel/")[1].split("?")[0]]
+
+            crawler._body = body
+            files, events = [], []
+            task = DownloadTask("filtered", "pixiv", "https://www.pixiv.net/users/7", root / "out", {
+                "input_kind": "user_novels", "_blocklist_path": str(store.path),
+            })
+            crawler.download(task, CallbackSet(on_file=files.append, on_progress=events.append), threading.Event())
+            self.assertEqual({file.source_id for file in files}, {"104"})
+            self.assertEqual(len(files), 3)
+            self.assertEqual(events[-1].metadata, {"downloaded": 3, "skipped_ai": 1, "skipped_blocked": 2})
+            self.assertEqual(len([event for event in events if event.metadata.get("skip_reason")]), 3)
+            self.assertFalse(any("Blocked" in str(path) for path in (root / "out").rglob("*")))
+
+    def test_single_ai_novel_can_be_explicitly_allowed(self):
+        for filter_ai in (True, False):
+            with self.subTest(filter_ai=filter_ai), tempfile.TemporaryDirectory() as temp_dir:
+                crawler = object.__new__(PixivCrawler)
+                crawler._body = lambda _path: {"title": "AI", "tags": ["AI-generated"], "content": "正文"}
+                files, events = [], []
+                task = DownloadTask("ai", "pixiv", "https://www.pixiv.net/novel/show.php?id=1", Path(temp_dir), {
+                    "filter_ai": filter_ai,
+                })
+                crawler.download(task, CallbackSet(on_file=files.append, on_progress=events.append), threading.Event())
+                self.assertEqual(len(files), 0 if filter_ai else 3)
+                self.assertEqual(events[-1].metadata["skipped_ai"], int(filter_ai))
+
+    def test_novel_cancelled_during_detail_fetch_does_not_write(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cancel = threading.Event()
+            crawler = object.__new__(PixivCrawler)
+
+            def body(_path):
+                cancel.set()
+                return {"title": "Cancelled", "content": "正文"}
+
+            crawler._body = body
+            task = DownloadTask("cancel", "pixiv", "https://www.pixiv.net/novel/show.php?id=1", Path(temp_dir))
+            with self.assertRaises(TaskCancelled):
+                crawler.download(task, CallbackSet(), cancel)
+            self.assertEqual(list(Path(temp_dir).rglob("*.txt")), [])
+
     def test_own_bookmarks_are_cached_and_can_be_loaded_offline(self):
         class Client:
+            session = Mock()
             def search(self, query, limit=20, search_mode="", options=None):
                 self.call = (query, limit, search_mode, options)
                 return [{"id": "8", "title": "Saved", "url": "https://www.pixiv.net/artworks/8"}]
@@ -279,6 +364,7 @@ class PixivExtendedTests(unittest.TestCase):
     def test_partial_bookmark_refresh_preserves_previous_cache_and_ignores_display_filters(self):
         class Client:
             last_bookmark_status = {"complete": False, "scopes": [{"visibility": "show", "total": 3}]}
+            session = Mock()
 
             def search(self, query, limit=20, search_mode="", options=None):
                 self.options = options
@@ -455,7 +541,7 @@ class PixivExtendedTests(unittest.TestCase):
             {"user_id": "2", "display_name": "private old", "visibility": "hide"},
         ]
         adapter.load_following_accounts = lambda: existing
-        adapter._client = lambda _options=None: object()
+        adapter._client = lambda _options=None: type("Client", (), {"session": Mock()})()
         adapter._write_following_payload = lambda _payload: None
 
         complete_parts = [
@@ -478,13 +564,21 @@ class PixivExtendedTests(unittest.TestCase):
 
     def test_pixiv_profile_and_account_history_cache(self):
         class AvatarResponse:
+            status_code = 200
             content = b"avatar-bytes"
+            headers = {"Content-Type": "image/png"}
 
             @staticmethod
             def raise_for_status():
                 return None
 
-        class AvatarSession:
+            def iter_content(self, chunk_size):
+                yield self.content
+
+            def close(self):
+                pass
+
+        class AvatarSession(requests.Session):
             @staticmethod
             def get(_url, **_kwargs):
                 return AvatarResponse()
@@ -539,6 +633,7 @@ class PixivExtendedTests(unittest.TestCase):
 
     def test_pixiv_following_partial_page_is_cached_before_callback(self):
         class Client:
+            session = Mock()
             @staticmethod
             def fetch_following_page(_owner_id, page=1, visibility="show"):
                 return {

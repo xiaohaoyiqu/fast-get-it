@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from software_app.core.task_control import task_cancelled, task_wait
+
 import csv
 import html as html_module
 import re
@@ -10,13 +12,15 @@ from typing import Callable
 from urllib.parse import parse_qs, unquote, urlparse
 
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchWindowException, TimeoutException, WebDriverException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver import ChromeOptions
-from selenium.webdriver.chrome.service import Service
+from software_app.core.browser_process import ManagedChromeService as Service
 from selenium.webdriver.common.by import By
 
 from software_app.core.adapter import TaskCancelled
 from software_app.core.browser_driver import ensure_chromedriver
+from software_app.core.browser_pool import BROWSER_POOL
+from software_app.core.browser_session import BrowserSessionLost, is_browser_session_lost
 from software_app.core.events import CallbackSet
 from software_app.core.models import DownloadTask, FileRecord, ProgressEvent, TargetPreview
 from software_app.crawlers.common import platform_output_root, safe_component
@@ -158,16 +162,12 @@ def is_google_image_expired_page(page_text: str) -> bool:
     )
 
 
-class BrowserClosedByUser(RuntimeError):
+class BrowserClosedByUser(BrowserSessionLost):
     pass
 
 
 def is_browser_closed_error(error: BaseException) -> bool:
-    message = str(error).lower()
-    return isinstance(error, NoSuchWindowException) or any(
-        marker in message
-        for marker in ("no such window", "invalid session", "disconnected", "not connected to devtools", "target window")
-    )
+    return is_browser_session_lost(error)
 
 
 class GoogleImageCrawler:
@@ -189,6 +189,26 @@ class GoogleImageCrawler:
         )
 
     def search(
+        self, image_path: Path | str, *, max_results: int = 50, headless: bool = False,
+        proxy_url: str = "", task_id: str = "search", cancel_event: threading.Event | None = None,
+        manual_wait_seconds: int = 60, on_status: Callable[[str], None] | None = None,
+    ) -> tuple[list[str], str]:
+        source = Path(image_path).expanduser().resolve()
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        stop = cancel_event if cancel_event is not None else threading.Event()
+        on_wait = (lambda active, limit, waiting, admitted=False: on_status(
+            "已取得浏览器会话名额，正在启动浏览器" if admitted else f"等待浏览器会话：使用 {active}/{limit}，等待 {waiting} 项")) if on_status else None
+        from software_app.core.resource_pressure import memory_wait_message
+
+        on_memory_wait = (lambda used, recovery, remaining: on_status(
+            memory_wait_message(used, recovery, remaining))) if on_status else None
+        with BROWSER_POOL.session(stop, on_wait, on_memory_wait=on_memory_wait):
+            return self._search(source, max_results=max_results, headless=headless, proxy_url=proxy_url,
+                                task_id=task_id, cancel_event=stop, manual_wait_seconds=manual_wait_seconds,
+                                on_status=on_status)
+
+    def _search(
         self,
         image_path: Path | str,
         *,
@@ -230,9 +250,11 @@ class GoogleImageCrawler:
             if on_status and not links:
                 on_status("当前页面没有提取到来源候选；请先检查是否有人机验证或图片已过期，再尝试重新上传")
             return links, page_html
-        except WebDriverException as error:
-            if is_browser_closed_error(error):
-                raise BrowserClosedByUser("浏览器已关闭，相似搜索已结束") from error
+        except Exception as error:
+            if task_cancelled(cancel_event):
+                raise TaskCancelled("任务已取消") from error
+            if is_browser_session_lost(error, driver):
+                raise BrowserClosedByUser("浏览器已关闭或会话中断，相似搜索已结束") from error
             raise
         finally:
             with self._lock:
@@ -306,7 +328,14 @@ class GoogleImageCrawler:
             options.add_argument(f"--proxy-server={proxy_url}")
         options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
         driver = webdriver.Chrome(service=Service(str(driver_path)), options=options)
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"})
+        try:
+            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"})
+        except BaseException:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            raise
         return driver
 
     def _upload(
@@ -372,7 +401,7 @@ class GoogleImageCrawler:
             if on_status and report_value != last_reported:
                 on_status(f"等待页面结果 / 人机验证，剩余约 {remaining} 秒")
                 last_reported = report_value
-            cancel_event.wait(1.0)
+            task_wait(cancel_event, 1.0)
         if on_status:
             on_status("验证等待结束，正在尝试读取当前页面结果")
 
@@ -401,7 +430,7 @@ class GoogleImageCrawler:
                 });
                 window.scrollBy(0, Math.max(window.innerHeight, 800));
             """)
-            cancel_event.wait(1.2)
+            task_wait(cancel_event, 1.2)
         return prefer_specific_pages(links[:max_results])
 
     @staticmethod
@@ -457,7 +486,7 @@ class GoogleImageCrawler:
             if on_status and report_value != last_reported:
                 on_status(f"{status_message}，剩余约 {remaining} 秒")
                 last_reported = report_value
-            cancel_event.wait(0.4)
+            task_wait(cancel_event, 0.4)
         raise TimeoutException("等待 Google 图片搜索控件超时")
 
     @staticmethod
@@ -473,5 +502,5 @@ class GoogleImageCrawler:
 
     @staticmethod
     def _check_cancel(cancel_event: threading.Event) -> None:
-        if cancel_event.is_set():
+        if task_cancelled(cancel_event):
             raise TaskCancelled("任务已取消")

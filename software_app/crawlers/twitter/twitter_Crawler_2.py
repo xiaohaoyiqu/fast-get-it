@@ -1,3 +1,4 @@
+
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
@@ -13,10 +14,15 @@ from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 
 try:
+    from software_app.core.task_control import task_cancelled, task_wait
     from .download_method import DownloadFailureRecord, DownloadRecord, configure_downloads
     from .driver_init import cookies_web, get_twitter_name, initialize_driver
     from .manga_downloader import download_media
 except ImportError:  # Preserve direct script execution.
+    project_root = str(Path(__file__).resolve().parents[3])
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    from software_app.core.task_control import task_cancelled, task_wait
     from download_method import DownloadFailureRecord, DownloadRecord, configure_downloads
     from driver_init import cookies_web, get_twitter_name, initialize_driver
     from manga_downloader import download_media
@@ -82,8 +88,8 @@ X 当前媒体页入口:
 
 GIF 说明:
   - X 标记为 animated_gif 的媒体通常实际分发为 MP4。
-  - 类型 3 默认直接保存该 MP4；仅 --convert-gif 时才转换为 .gif。
-  - GIF 转换会明显增大文件体积，建议保留默认设置。
+  - 类型 3 默认转换为 .gif；--no-convert-gif 可保留 MP4。
+  - GIF 转换会增大文件体积和转码开销，实际设置由配置文件和命令行覆盖。
 
 命令行示例:
   python .\\twitter_Crawler_2.py @user1::1 @user2::23
@@ -312,7 +318,7 @@ def wait_for_media_page(driver, timeout=30, cancel_event=None, on_status=None):
     deadline = time.monotonic() + timeout
     while True:
         while time.monotonic() < deadline:
-            if cancel_event is not None and cancel_event.is_set():
+            if cancel_event is not None and task_cancelled(cancel_event):
                 raise RuntimeError("任务已取消")
             if page_has_login_or_restriction(driver):
                 raise RuntimeError("当前页面仍是登录/限制页面，说明 cookie 未生效或账号仍被 X 限制。")
@@ -323,7 +329,7 @@ def wait_for_media_page(driver, timeout=30, cancel_event=None, on_status=None):
                 return
 
             if not refresh_attempted and page_requests_refresh(driver):
-                if cancel_event is not None and cancel_event.is_set():
+                if cancel_event is not None and task_cancelled(cancel_event):
                     raise RuntimeError("任务已取消")
                 refresh_attempted = True
                 message = "检测到 X 页面提示重新加载；自动刷新一次并重新等待媒体列表。"
@@ -342,7 +348,7 @@ def wait_for_media_page(driver, timeout=30, cancel_event=None, on_status=None):
                 break
 
             if cancel_event is not None:
-                if cancel_event.wait(1):
+                if task_wait(cancel_event, 1):
                     raise RuntimeError("任务已取消")
             else:
                 time.sleep(1)
@@ -637,6 +643,8 @@ def download_one_target(
     cancel_event=None,
     on_status=None,
     on_media_result=None,
+    pending_tracker=None,
+    network_config=None,
 ):
     print(f"\n开始下载目标: {target_url}")
     page_tasks = build_media_page_tasks(target_url, user_choice)
@@ -651,7 +659,7 @@ def download_one_target(
     target_stats = {}
 
     for page_label, page_url, page_types in page_tasks:
-        if cancel_event is not None and cancel_event.is_set():
+        if cancel_event is not None and task_cancelled(cancel_event):
             raise RuntimeError("任务已取消")
         print(f"打开{page_label}页: {page_url}")
         safe_get(driver, page_url, timeout=int(config.get("page_load_timeout", 30)))
@@ -704,6 +712,9 @@ def download_one_target(
             desired_tweet_id=desired_tweet_id,
             cancel_event=cancel_event,
             on_media_result=on_media_result,
+            pending_tracker=pending_tracker, network_config=network_config,
+            rename_downloads=config_bool(config, "rename_downloads", True),
+            delete_source_after_rename=config_bool(config, "delete_source_after_rename", True),
         )
         merge_stats(target_stats, stats)
 
@@ -712,7 +723,7 @@ def download_one_target(
 
 
 def initialize_authenticated_driver(cookie_file, config):
-    driver = initialize_driver()
+    driver = initialize_driver(proxy_url=str(config.get("proxy_url") or ""))
     try:
         print("打开 x.com，用于注入 cookie.....")
         safe_get(driver, BOOTSTRAP_URL, timeout=int(config.get("bootstrap_timeout", 20)))
@@ -729,14 +740,14 @@ def initialize_authenticated_driver(cookie_file, config):
         raise
 
 
-def download_target_with_own_driver(index, total, task, cookie_file, output_dir, config, record, failure_record):
+def download_target_with_own_driver(index, total, task, cookie_file, output_dir, config, record, failure_record, network_config=None):
     driver = None
     target_url = task["url"]
     user_choice = task["types"]
     try:
         print(f"\n[{index}/{total}] 启动独立浏览器: {target_url}")
         driver = initialize_authenticated_driver(cookie_file, config)
-        return download_one_target(driver, target_url, output_dir, user_choice, config, record, failure_record)
+        return download_one_target(driver, target_url, output_dir, user_choice, config, record, failure_record, network_config=network_config)
     finally:
         if driver:
             try:
@@ -764,7 +775,7 @@ def main():
         len(targets),
     )
 
-    configure_downloads(
+    network_config = configure_downloads(
         max_retries=config.get("max_retries", 5),
         connect_timeout=config.get("request_connect_timeout", 10),
         read_timeout=config.get("request_read_timeout", 60),
@@ -793,7 +804,7 @@ def main():
                 user_choice = task["types"]
                 print(f"\n[{index}/{len(targets)}]")
                 try:
-                    stats = download_one_target(driver, target_url, output_dir, user_choice, config, record, failure_record)
+                    stats = download_one_target(driver, target_url, output_dir, user_choice, config, record, failure_record, network_config=network_config)
                     merge_stats(total_stats, stats)
                 except Exception as error:
                     print(f"目标下载失败，继续下一个: {target_url} ({short_error(error)})")
@@ -810,6 +821,7 @@ def main():
                         config,
                         record,
                         failure_record,
+                        network_config,
                     ): task
                     for index, task in enumerate(targets, 1)
                 }

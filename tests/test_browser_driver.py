@@ -18,6 +18,25 @@ from software_app.core.settings import runtime_root
 
 
 class BrowserDriverTests(unittest.TestCase):
+    def test_twitter_browser_receives_explicit_proxy(self):
+        from software_app.crawlers.twitter import driver_init
+
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            for proxy, expected in (
+                ("http://127.0.0.1:7890", "http://127.0.0.1:7890"),
+                ("socks5h://127.0.0.1:1080", "socks5://127.0.0.1:1080"),
+                ("", ""),
+            ):
+                with self.subTest(proxy=proxy), patch.object(driver_init, "BROWSER_TOOLS_DIR", Path(directory)), patch.object(
+                    driver_init, "ensure_chromedriver", return_value=None
+                ), patch.object(driver_init, "find_skeb_button_extension", return_value=None), patch.object(
+                    driver_init, "TemporaryProfileChrome"
+                ) as chrome:
+                    driver_init.initialize_driver(proxy_url=proxy)
+                arguments = chrome.call_args.kwargs["options"].arguments
+                self.assertEqual([arg for arg in arguments if arg.startswith("--proxy-server=")],
+                                 [f"--proxy-server={expected}"] if expected else [])
+
     def test_versions_match_by_major_version(self):
         self.assertTrue(versions_compatible("122.0.6182.0", "122.0.6229.0"))
         self.assertFalse(versions_compatible("123.0.1.0", "122.0.6229.0"))
@@ -68,10 +87,12 @@ class BrowserDriverTests(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 2)
         pause.assert_called_once_with(1)
 
-    def test_frozen_runtime_root_uses_local_app_data_and_override_wins(self):
-        with patch.dict("os.environ", {"LOCALAPPDATA": r"C:\Users\Example\AppData\Local"}, clear=False):
-            with patch.dict("os.environ", {"YUQIUDA_HOME": ""}, clear=False):
-                self.assertEqual(runtime_root(frozen=True), Path(r"C:\Users\Example\AppData\Local\YuqiuDa"))
+    def test_frozen_runtime_root_uses_install_dir_and_override_wins(self):
+        install = Path.cwd() / "portable-app"
+        with patch.dict("os.environ", {"YUQIUDA_HOME": ""}, clear=False), patch(
+            "software_app.core.settings.INSTALL_ROOT", install
+        ):
+            self.assertEqual(runtime_root(frozen=True), install)
         with patch.dict("os.environ", {"YUQIUDA_HOME": str(Path.cwd() / "portable-data")}, clear=False):
             self.assertEqual(runtime_root(frozen=True), (Path.cwd() / "portable-data").resolve())
 

@@ -1,21 +1,30 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 import re
 import threading
-import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
 from software_app.core.adapter import CrawlerAdapter
 from software_app.core.events import CallbackSet
+from software_app.core.preview_http import read_preview_image
 from software_app.core.models import DownloadTask, ModuleInfo, TargetPreview
 from software_app.core.settings import EHENTAI_DATA_DIR
-from software_app.crawlers.common import load_cookie_file
+from software_app.crawlers.common import load_cookie_file, make_session, request_get
 from software_app.crawlers.ehentai import EhentaiClient, parse_ehentai_target
 
 
 class EhentaiNativeAdapter(CrawlerAdapter):
+    @contextmanager
+    def _open_client(self, options=None, *, site="e-hentai"):
+        client = self._client(options, site=site)
+        try:
+            yield client
+        finally:
+            client.session.close()
+
     max_concurrency = 1
 
     def __init__(self) -> None:
@@ -83,19 +92,19 @@ class EhentaiNativeAdapter(CrawlerAdapter):
 
     def preview_target(self, raw_target: str, options: dict | None = None) -> TargetPreview:
         target = parse_ehentai_target(raw_target, default_site=self._default_site(options))
-        return self._client(options, site=target.site).preview(target, live=bool((options or {}).get("live")))
+        with self._open_client(options, site=target.site) as client:
+            return client.preview(target, live=bool((options or {}).get("live")))
 
     def search_targets(self, query: str, limit: int = 20, options: dict | None = None) -> list[dict]:
         mode = str((options or {}).get("search_mode") or "表站关键词")
         site = "exhentai" if "里站" in mode else "e-hentai"
-        return self._client(options, site=site).search(
-            query, mode, limit,
-            filter_ai=bool((options or {}).get("filter_ai", True)),
-        )
+        with self._open_client(options, site=site) as client:
+            return client.search(query, mode, limit, filter_ai=bool((options or {}).get("filter_ai", True)))
 
     def download(self, task: DownloadTask, callbacks: CallbackSet, cancel_event: threading.Event) -> None:
         target = parse_ehentai_target(task.target, default_site=self._default_site(task.options))
-        self._client(task.options, site=target.site).download(task, callbacks, cancel_event)
+        with self._open_client(task.options, site=target.site) as client:
+            client.download(task, callbacks, cancel_event)
 
     def fetch_preview_image_bytes(self, url: str, options: dict | None = None) -> bytes:
         parsed = urlparse(str(url or ""))
@@ -103,28 +112,24 @@ class EhentaiNativeAdapter(CrawlerAdapter):
         if parsed.scheme != "https" or not (host == "ehgt.org" or host.endswith(".ehgt.org")):
             raise ValueError("EH 预览图只允许从官方 ehgt.org 图片主机读取")
         # EH 缩略图位于独立的 ehgt.org 主机，不需要登录 Cookie。
-        response = EhentaiClient(
-            proxy_url=str((options or {}).get("proxy_url") or ""),
-        ).session.get(url, timeout=(10, 30))
-        response.raise_for_status()
-        content_type = str(response.headers.get("content-type") or "").casefold()
-        payload = response.content
-        if not content_type.startswith("image/") or not payload or len(payload) > 10 * 1024 * 1024:
-            raise ValueError("EH 预览图响应类型无效、为空或超过 10 MiB")
-        return payload
+        with make_session(proxy_url=str((options or {}).get("proxy_url") or "")) as session:
+            response = request_get(session, url, timeout=(10, 30))
+            return read_preview_image(response, 10 * 1024 * 1024)
 
     def set_favorite(self, raw_target: str, category: int | None, note: str = "",
                      options: dict | None = None) -> dict[str, object]:
         target = parse_ehentai_target(raw_target)
         if target.kind != "gallery":
             raise ValueError("EH 收藏管理只支持具体画廊链接")
-        return self._client(options, site=target.site).set_favorite(target, category, note)
+        with self._open_client(options, site=target.site) as client:
+            return client.set_favorite(target, category, note)
 
     def favorite_state(self, raw_target: str, options: dict | None = None) -> dict[str, object]:
         target = parse_ehentai_target(raw_target)
         if target.kind != "gallery":
             raise ValueError("EH 收藏状态只支持具体画廊链接")
-        return self._client(options, site=target.site).favorite_state(target)
+        with self._open_client(options, site=target.site) as client:
+            return client.favorite_state(target)
 
     def import_cookie_file(self, source: Path | str, *, site: str = "e-hentai") -> int:
         from software_app.crawlers.common import load_cookie_file
@@ -138,15 +143,12 @@ class EhentaiNativeAdapter(CrawlerAdapter):
             required.add("igneous")
         if not required.issubset(cookies):
             raise ValueError(f"{'ExHentai 里站' if normalized_site == 'exhentai' else 'E-Hentai 表站'} Cookie 不完整")
-        self.runtime_data_dir.mkdir(parents=True, exist_ok=True)
-        destination = self._cookie_file(normalized_site)
-        temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
-        try:
-            temporary.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
-            temporary.replace(destination)
-        finally:
-            temporary.unlink(missing_ok=True)
-        return len(cookies)
+        from dataclasses import replace
+        from software_app.core.browser_cookie_capture import cookie_capture_spec, import_cookie_file
+
+        label = "ExHentai 里站" if normalized_site == "exhentai" else "E-Hentai 表站"
+        spec = replace(cookie_capture_spec(label), destination=self._cookie_file(normalized_site))
+        return import_cookie_file(spec, source).cookie_count
 
     def cookie_status(self, site: str = "e-hentai") -> dict[str, object]:
         normalized_site = "exhentai" if str(site).casefold().startswith("ex") else "e-hentai"

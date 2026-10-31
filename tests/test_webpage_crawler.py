@@ -85,6 +85,7 @@ class WebPageCrawlerParsingTests(unittest.TestCase):
             def __init__(self, status_code):
                 self.status_code = status_code
                 self.url = "https://example.com/final"
+                self.headers = {}
 
             def close(self):
                 pass
@@ -98,7 +99,9 @@ class WebPageCrawlerParsingTests(unittest.TestCase):
 
         expectations = {200: "available", 404: "missing", 410: "missing", 403: "restricted", 429: "restricted", 503: "temporary"}
         for status_code, expected in expectations.items():
-            with self.subTest(status_code=status_code):
+            with self.subTest(status_code=status_code), patch(
+                "software_app.crawlers.webpage.client._validate_public_destination", side_effect=lambda url: url,
+            ), patch("software_app.crawlers.webpage.client.HTTP_BACKOFF"):
                 result = check_page_availability("https://example.com/work", session=Session(status_code))
                 self.assertEqual(result["availability"], expected)
 
@@ -106,6 +109,7 @@ class WebPageCrawlerParsingTests(unittest.TestCase):
 class _FakeResponse:
     def __init__(self, url, body, content_type):
         self.url = url
+        self.status_code = 200
         self._body = body
         self.headers = {"Content-Type": content_type, "Content-Length": str(len(body))}
         self.encoding = "utf-8"
@@ -339,7 +343,12 @@ class WebPageCrawlerDownloadTests(unittest.TestCase):
             self.assertEqual(records[0].metadata["transport"], "browser")
 
     def test_all_discovered_media_failures_fail_the_task_after_retries(self):
-        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+        # This case exercises three fake connection resets, not external DNS.
+        # Retain the real URL/IP checks against a deterministic public answer.
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir, patch(
+            "software_app.crawlers.webpage.client.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("93.184.216.34", 443))],
+        ):
             task = DownloadTask(
                 "failed-media-task",
                 "website",

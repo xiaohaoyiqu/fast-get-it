@@ -9,6 +9,7 @@ from software_app.crawlers.bluesky import BlueskyClient, parse_bluesky_target
 
 
 class BlueskyNativeAdapter(CrawlerAdapter):
+    supports_media_retry = True
     max_concurrency = 3
 
     def __init__(self) -> None:

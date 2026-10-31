@@ -4,8 +4,10 @@ from __future__ import annotations
 TASK_STATUS_LABELS = {
     "queued": "等待中",
     "running": "运行中",
+    "paused": "已暂停",
     "cancelling": "正在取消",
     "completed": "已完成",
+    "partial": "部分完成",
     "failed": "失败",
     "cancelled": "已取消",
 }

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+from software_app.core.task_control import task_cancelled
+from software_app.core.network_policy import HTTP_BACKOFF, retry_after_seconds
+from software_app.core.error_policy import http_error_info
+
 import hashlib
+import copy
 import html as html_module
 import json
 import math
@@ -25,18 +30,23 @@ except ImportError:  # pragma: no cover - packaged builds install requirements-a
         pass
 
 from software_app.core.adapter import TaskCancelled
+from software_app.core.bandwidth import limited_content
 from software_app.core.blocklist import BlocklistStore
+from software_app.core.browser_driver import chrome_version
 from software_app.core.events import CallbackSet
 from software_app.core.image_postprocess import build_image_artifacts
 from software_app.core.models import DownloadTask, FileRecord, ProgressEvent, TargetPreview
+from software_app.core.redirect_policy import SENSITIVE_REDIRECT_HEADERS
+from software_app.core.response_read import read_response_text
+from software_app.core.cookie_store import copied_cookie_policy
+from requests.cookies import RequestsCookieJar
 from software_app.crawlers.common import (
-    load_cookie_file,
+    request_get,
     make_session,
     normalize_output_format,
     platform_output_root,
     safe_component,
 )
-from software_app.crawlers.jmcomic.api import JmComicApiClient
 
 
 DEFAULT_DOMAIN = "https://18comic.vip"
@@ -52,6 +62,94 @@ JM_CATEGORY_VALUES = {
 }
 
 
+_CURL_IMPERSONATE_TARGETS = (99, 100, 101, 104, 107, 110, 116, 119, 120, 123, 124, 131, 133, 136, 142, 145, 146, 150)
+
+
+def _best_curl_impersonate() -> str:
+    """Pick the curl_cffi Chrome impersonate target closest to the installed Chrome."""
+    version = str(chrome_version() or "").strip()
+    major = 0
+    if version:
+        try:
+            major = int(version.split(".", 1)[0])
+        except (ValueError, IndexError):
+            major = 0
+    if major <= 0:
+        return "chrome123"
+    best = min(_CURL_IMPERSONATE_TARGETS, key=lambda v: abs(v - major))
+    return f"chrome{best}"
+
+
+def _resolve_proxy(proxy_url: str) -> dict[str, str]:
+    """Return effective proxies for a JMComic session.
+
+    An explicit ``proxy_url`` always wins.  When it is empty the Windows
+    system proxy (Internet Settings registry) is read directly so that users
+    behind a local proxy client (Clash / V2Ray / …) can reach JMComic without
+    typing the address again.  ``urllib.request.getproxies`` is deliberately
+    avoided because sandbox launchers may inject custom proxy env vars that
+    shadow the real system proxy.
+    """
+    explicit = str(proxy_url or "").strip()
+    if explicit:
+        return {"http": explicit, "https": explicit}
+    result: dict[str, str] = {}
+    try:
+        import winreg
+
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        )
+        try:
+            proxy_enable, _ = winreg.QueryValueEx(key, "ProxyEnable")
+            if int(proxy_enable or 0):
+                proxy_server, _ = winreg.QueryValueEx(key, "ProxyServer")
+                server = str(proxy_server or "").strip()
+                if server:
+                    # ProxyServer may be "host:port" or "http=host:port;https=host:port"
+                    if "=" in server:
+                        for part in server.split(";"):
+                            if "=" in part:
+                                scheme, addr = part.split("=", 1)
+                                scheme = scheme.strip().lower()
+                                addr = addr.strip()
+                                if scheme in ("http", "https") and addr:
+                                    result[scheme] = addr if "://" in addr else f"http://{addr}"
+                    else:
+                        url = server if "://" in server else f"http://{server}"
+                        result["http"] = url
+                        result["https"] = url
+        finally:
+            winreg.CloseKey(key)
+    except Exception:
+        pass
+    return result
+
+
+if curl_requests is not None:
+    class _JmCurlSession(curl_requests.Session):
+        def for_redirect(self):
+            jar = RequestsCookieJar()
+            jar.set_policy(copied_cookie_policy(self.cookies.jar))
+            for cookie in self.cookies.jar:
+                if cookie.domain:
+                    jar.set_cookie(copy.copy(cookie))
+            view = _JmCurlSession(
+                impersonate=self.impersonate, verify=self.verify, proxies=dict(self.proxies),
+                trust_env=False, cookies=jar,
+                headers={name: value for name, value in self.headers.items()
+                         if name.casefold() not in SENSITIVE_REDIRECT_HEADERS},
+            )
+            view._close_after_redirect = True
+            return view
+
+        def get(self, url, **kwargs):
+            if kwargs.get("headers") is not None:
+                kwargs["headers"] = {name: value for name, value in kwargs["headers"].items() if value is not None}
+            return super().get(url, **kwargs)
+
+
 def make_jm_session(
     domain: str, cookie_file: Path | str | None = None, proxy_url: str = "", *,
     user_agent: str = "", browser_headers: dict[str, str] | None = None,
@@ -59,26 +157,37 @@ def make_jm_session(
     headers = dict(browser_headers or {})
     if str(user_agent or "").strip():
         headers["User-Agent"] = str(user_agent).strip()
+    proxies = _resolve_proxy(proxy_url)
     fallback = make_session(
-        referer=domain.rstrip("/") + "/", cookie_file=cookie_file, proxy_url=proxy_url,
+        referer=domain.rstrip("/") + "/", cookie_file=cookie_file, proxy_url="",
         extra_headers=headers or None,
     )
+    if proxies:
+        fallback.proxies.update(proxies)
     fallback.trust_env = False
     if curl_requests is None:
         return fallback
-    curl_session = curl_requests.Session(
-        impersonate="chrome123", headers=dict(fallback.headers), proxies=dict(fallback.proxies)
-    )
-    curl_session.trust_env = False
-    curl_session.cookies.update(load_cookie_file(cookie_file))
-    fallback.close()
-    return curl_session
+    impersonate = _best_curl_impersonate()
+    curl_session = None
+    try:
+        curl_session = _JmCurlSession(
+            impersonate=impersonate, headers=dict(fallback.headers), proxies=dict(fallback.proxies)
+        )
+        curl_session.trust_env = False
+        curl_session.cookies.update(fallback.cookies)
+        return curl_session
+    except BaseException:
+        if curl_session is not None:
+            curl_session.close()
+        raise
+    finally:
+        fallback.close()
 
 
 def jm_response_text(response) -> str:
     if not getattr(response, "encoding", None):
         response.encoding = "utf-8"
-    return response.text
+    return read_response_text(response)
 
 
 @dataclass(frozen=True)
@@ -215,6 +324,8 @@ class JmComicCrawler:
                 detail["first_page_url"] = next(iter(first_photo["images"]), "")
                 detail["first_page_photo_id"] = first_chapter_id
                 detail["first_page_scramble_id"] = first_photo["scramble_id"]
+            except TaskCancelled:
+                raise
             except (OSError, RuntimeError, ValueError, PermissionError) as exc:
                 warnings.append(f"第一页暂时无法预览：{exc}")
         elif target.kind == "photo":
@@ -502,7 +613,7 @@ class JmComicCrawler:
             self._download_photo(target.value, target.value, root / f"JM{target.value}", callbacks, task, cancel_event)
             return
         for album_index, album_id in enumerate(album_ids, 1):
-            if cancel_event.is_set():
+            if task_cancelled(cancel_event):
                 raise TaskCancelled("任务已取消")
             album_html = self._get_text(f"{self.domain}/album/{album_id}")
             album = self._parse_album(album_html, album_id)
@@ -529,12 +640,12 @@ class JmComicCrawler:
             )
             if bool(task.options.get("jm_download_cover", True)) and album.get("cover_url"):
                 try:
-                    self._download_cover(str(album["cover_url"]), album_id, album_dir, callbacks, task)
+                    self._download_cover(str(album["cover_url"]), album_id, album_dir, callbacks, task, cancel_event)
                 except Exception as exc:  # noqa: BLE001 - a missing thumbnail must not discard the manga pages.
                     callbacks.on_progress(ProgressEvent(
                         task.task_id, task.module_id, "warning", f"JM{album_id} 封面下载失败，继续下载章节：{exc}"
                     ))
-            if cancel_event.is_set():
+            if task_cancelled(cancel_event):
                 raise TaskCancelled("任务已取消")
             chapters = album.get("chapters") or [{"id": album_id, "title": album.get("title") or album_id}]
             callbacks.on_progress(ProgressEvent(task.task_id, task.module_id, "info", f"[{album_index}/{len(album_ids)}] 下载 {album.get('title') or album_id}"))
@@ -544,6 +655,12 @@ class JmComicCrawler:
                 self._download_photo(chapter_id, album_id, chapter_dir, callbacks, task, cancel_event)
 
     def _download_photo(self, photo_id: str, album_id: str, folder: Path, callbacks: CallbackSet, task: DownloadTask, cancel_event: threading.Event) -> None:
+        from software_app.core.output_lock import output_path_lock
+
+        with output_path_lock(folder / ".chapter-output", cancel_event):
+            self._download_photo_locked(photo_id, album_id, folder, callbacks, task, cancel_event)
+
+    def _download_photo_locked(self, photo_id: str, album_id: str, folder: Path, callbacks: CallbackSet, task: DownloadTask, cancel_event: threading.Event) -> None:
         html_text = self._get_text(f"{self.domain}/photo/{photo_id}")
         photo = self._parse_photo(html_text, photo_id)
         image_urls = photo.get("images") or []
@@ -554,33 +671,41 @@ class JmComicCrawler:
         downloaded_paths: list[Path] = []
         scramble_notice_sent = False
         for index, url in enumerate(image_urls, 1):
-            if cancel_event.is_set():
+            if task_cancelled(cancel_event):
                 raise TaskCancelled("任务已取消")
             filename = Path(urlparse(url).path).name or f"{index:05d}.jpg"
             segment_count = segmentation_count(scramble_id, photo_id, filename)
             if segment_count and not scramble_notice_sent:
                 callbacks.on_progress(ProgressEvent(task.task_id, task.module_id, "info", f"JM{album_id} 检测到分割图，正在按章节信息还原"))
                 scramble_notice_sent = True
-            response = self._get_response(url, timeout=(10, 90))
-            try:
-                image = decode_scrambled_image(response.content, segment_count)
-            except Exception as exc:
-                raise ValueError(f"JMComic 章节 {photo_id} 第 {index} 张未返回有效图片；请检查站点或代理") from exc
             image_format = normalize_output_format("image_format", task.options.get("image_format"))
             image_format = "jpg" if image_format == "original" else image_format
             destination = folder / f"{index:03d}.{image_format}"
             destination.parent.mkdir(parents=True, exist_ok=True)
             temporary = destination.with_name(destination.name + ".part")
             output_format = {"jpg": "JPEG", "png": "PNG", "webp": "WEBP"}[image_format]
-            output_image = image.convert("RGB") if image_format == "jpg" else image
-            try:
-                output_image.save(temporary, format=output_format, quality=95)
-                temporary.replace(destination)
-            finally:
-                temporary.unlink(missing_ok=True)
-                if output_image is not image:
-                    output_image.close()
-                image.close()
+            from software_app.core.file_conflict import reuse_existing, media_output
+            with media_output(destination, task.options.get("file_conflict", "reuse"), cancel_event) as destination:
+                temporary = destination.with_name(destination.name + ".part")
+                if not reuse_existing(destination, task.options.get("file_conflict", "reuse")):
+                    response = self._get_response(url, timeout=(10, 90), stream=True)
+                    try:
+                        content = limited_content(response, cancel_event)
+                    finally:
+                        response.close()
+                    try:
+                        image = decode_scrambled_image(content, segment_count)
+                    except Exception as exc:
+                        raise ValueError(f"JMComic 章节 {photo_id} 第 {index} 张未返回有效图片；请检查站点或代理") from exc
+                    output_image = image.convert("RGB") if image_format == "jpg" else image
+                    try:
+                        output_image.save(temporary, format=output_format, quality=95)
+                        temporary.replace(destination)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                        if output_image is not image:
+                            output_image.close()
+                        image.close()
             downloaded_paths.append(destination)
             callbacks.on_file(
                 FileRecord(
@@ -604,6 +729,8 @@ class JmComicCrawler:
             safe_component(f"JM{album_id}_{photo_id}"),
             postprocess_mode,
             group_size=30,
+            file_conflict=task.options.get("file_conflict", "reuse"),
+            cancel_event=cancel_event,
         ):
             callbacks.on_file(FileRecord(
                 path=artifact.resolve(), module_id=task.module_id, task_id=task.task_id,
@@ -612,18 +739,41 @@ class JmComicCrawler:
                 metadata={"postprocess": postprocess_mode, "max_images_per_group": 30},
             ))
 
-    def _download_cover(self, url: str, album_id: str, folder: Path, callbacks: CallbackSet, task: DownloadTask) -> None:
-        response = self._get_response(url, timeout=(10, 60))
+    def _download_cover(self, url: str, album_id: str, folder: Path, callbacks: CallbackSet, task: DownloadTask, cancel_event=None) -> None:
+        from software_app.core.file_conflict import reuse_existing, media_output
         image_format = normalize_output_format("image_format", task.options.get("image_format"))
         image_format = "jpg" if image_format == "original" else image_format
         destination = folder / f"JM{album_id}_cover.{image_format}"
+        with media_output(destination, task.options.get("file_conflict", "reuse"), cancel_event) as destination:
+            if reuse_existing(destination, task.options.get("file_conflict", "reuse")):
+                callbacks.on_file(FileRecord(
+                    path=destination.resolve(), module_id=task.module_id, task_id=task.task_id,
+                    media_type="image", size=destination.stat().st_size, title=destination.name,
+                    source_url=url, source_id=album_id, metadata={"jmcomic_kind": "cover"},
+                ))
+            else:
+                self._download_cover_locked(url, album_id, folder, callbacks, task, cancel_event, destination)
+
+    def _download_cover_locked(self, url: str, album_id: str, folder: Path, callbacks: CallbackSet, task: DownloadTask, cancel_event=None, destination=None) -> None:
+        response = self._get_response(url, timeout=(10, 60), stream=True)
+        try:
+            content = limited_content(response, cancel_event)
+        finally:
+            response.close()
+        image_format = normalize_output_format("image_format", task.options.get("image_format"))
+        image_format = "jpg" if image_format == "original" else image_format
+        destination = destination or folder / f"JM{album_id}_cover.{image_format}"
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_name(destination.name + ".part")
-        with Image.open(BytesIO(response.content)) as source:
+        with Image.open(BytesIO(content)) as source:
             output = source.convert("RGB") if image_format == "jpg" else source.copy()
             try:
-                output.save(temporary, format={"jpg": "JPEG", "png": "PNG", "webp": "WEBP"}[image_format], quality=95)
-                temporary.replace(destination)
+                from software_app.core.output_lock import output_path_lock
+                from software_app.core.file_conflict import reuse_existing
+                with output_path_lock(destination, cancel_event):
+                    if not reuse_existing(destination, task.options.get("file_conflict", "reuse")):
+                        output.save(temporary, format={"jpg": "JPEG", "png": "PNG", "webp": "WEBP"}[image_format], quality=95)
+                        temporary.replace(destination)
             finally:
                 temporary.unlink(missing_ok=True)
                 output.close()
@@ -642,35 +792,167 @@ class JmComicCrawler:
             raise RuntimeError("JMComic 服务器内部错误；请稍后重试")
         return page
 
-    def _get_response(self, url: str, timeout: tuple[int, int]):
+    def check_connection(self, *, connect_timeout: int = 8, read_timeout: int = 12) -> dict[str, object]:
+        """Fast connectivity probe: headers only, no retry, short timeout.
+
+        Returns a dict with ok, status_code, cloudflare_challenge, effective_url,
+        error_type and error.  Used by the settings \"检查\" button so a hung
+        Cloudflare challenge or dead proxy does not block the UI for a minute.
+        """
+        result: dict[str, object] = {
+            "ok": False, "status_code": 0, "cloudflare_challenge": False,
+            "effective_url": "", "error_type": "", "error": "",
+        }
         response = None
-        for attempt in range(2):
+        try:
+            response = request_get(self.session, self.domain + "/", timeout=(connect_timeout, read_timeout))
+            status = int(getattr(response, "status_code", 0) or 0)
+            result["status_code"] = status
+            result["effective_url"] = str(getattr(response, "url", "") or self.domain)
+            server = str(getattr(response, "headers", {}).get("server", "") or "").casefold()
+            cf_ray = bool(getattr(response, "headers", {}).get("cf-ray"))
+            if "cloudflare" in server or cf_ray or status in (403, 503):
+                result["cloudflare_challenge"] = True
+            if 200 <= status < 400:
+                result["ok"] = True
+                # Read a small body chunk to detect site-level error pages without
+                # downloading the full homepage.
+                try:
+                    body_prefix = ""
+                    for chunk in response.iter_content(chunk_size=8192, decode_unicode=True):
+                        if isinstance(chunk, bytes):
+                            body_prefix += chunk.decode("utf-8", errors="replace")
+                        else:
+                            body_prefix += str(chunk)
+                        if len(body_prefix) >= 8192:
+                            break
+                    lowered = body_prefix.casefold()
+                    if "restricted access" in lowered:
+                        result["ok"] = False
+                        result["error_type"] = "restricted"
+                        result["error"] = "JMComic 拒绝当前地区或网络访问；请更换可用域名或代理"
+                    elif "could not connect to mysql" in lowered:
+                        result["ok"] = False
+                        result["error_type"] = "server_error"
+                        result["error"] = "JMComic 服务器内部错误（数据库连接失败）；请稍后重试"
+                except Exception:
+                    pass  # body probe is best-effort; headers already confirmed reachability
+            elif status == 403:
+                result["error_type"] = "cloudflare_403"
+                result["error"] = "Cloudflare 返回 403；cf_clearance 可能与当前代理/浏览器指纹不匹配，请在专用 Chrome 重新过验证后获取"
+            elif status == 503:
+                result["error_type"] = "cloudflare_503"
+                result["error"] = "Cloudflare 返回 503 挑战页；请在专用 Chrome 完成人机验证后重新获取"
+            else:
+                result["error_type"] = f"http_{status}"
+                result["error"] = f"站点返回 HTTP {status}"
+        except requests.exceptions.ProxyError as exc:
+            result["error_type"] = "proxy_error"
+            result["error"] = f"代理连接失败：{exc};请检查代理地址或暂时清空代理"
+        except requests.exceptions.ConnectTimeout:
+            result["error_type"] = "connect_timeout"
+            result["error"] = "连接超时（8s）；请检查域名是否正确、代理是否可用、网络是否可达"
+        except requests.exceptions.ReadTimeout:
+            result["error_type"] = "read_timeout"
+            result["error"] = "服务器响应超时（12s）；可能被 Cloudflare 挂起挑战，或站点当前繁忙"
+        except requests.exceptions.ConnectionError as exc:
+            result["error_type"] = "connection_error"
+            result["error"] = f"无法建立连接：{exc};请检查域名、代理或 DNS"
+        except requests.exceptions.RequestException as exc:
+            result["error_type"] = "request_error"
+            result["error"] = f"请求失败：{exc}"
+        except CurlRequestsError as exc:
+            message = str(exc)
+            lowered = message.casefold()
+            if "timed out" in lowered or "timeout" in lowered:
+                result["error_type"] = "timeout"
+                result["error"] = "连接或响应超时；请检查域名、代理或网络"
+            elif "proxy" in lowered:
+                result["error_type"] = "proxy_error"
+                result["error"] = f"代理连接失败：{message}"
+            else:
+                result["error_type"] = "curl_error"
+                result["error"] = f"浏览器指纹请求失败：{message}"
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+        return result
+
+    def _get_response(self, url: str, timeout: tuple[int, int], *, stream: bool = False):
+        response = None
+        last_exc: Exception | None = None
+        for attempt in range(3):
             try:
-                response = self.session.get(url, timeout=timeout)
+                HTTP_BACKOFF.wait(url)
+                response = request_get(self.session, url, timeout=timeout)
             except requests.exceptions.ProxyError as exc:
                 raise RuntimeError("JMComic 代理连接失败；请在设置中检查代理地址或暂时清空代理") from exc
             except requests.exceptions.ConnectTimeout as exc:
+                last_exc = exc
+                if attempt < 2:
+                    time.sleep(0.8 * (attempt + 1))
+                    continue
                 raise TimeoutError("JMComic 站点连接超时；请检查当前域名、代理或网络后重试") from exc
             except requests.exceptions.Timeout as exc:
+                last_exc = exc
+                if attempt < 2:
+                    time.sleep(0.8 * (attempt + 1))
+                    continue
                 raise TimeoutError("JMComic 响应超时；站点可能繁忙，请稍后重试") from exc
+            except requests.exceptions.ConnectionError as exc:
+                last_exc = exc
+                if attempt < 2:
+                    time.sleep(0.8 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"JMComic 网络连接失败：{exc}") from exc
             except requests.exceptions.RequestException as exc:
                 raise RuntimeError(f"JMComic 网络请求失败：{exc}") from exc
             except CurlRequestsError as exc:
                 message = str(exc)
-                if "timed out" in message.casefold() or "timeout" in message.casefold():
+                lowered = message.casefold()
+                is_transient = (
+                    "timed out" in lowered
+                    or "timeout" in lowered
+                    or "ssl_connect" in lowered
+                    or "connection closed" in lowered
+                    or "connection reset" in lowered
+                    or "empty reply" in lowered
+                    or "recv failure" in lowered
+                    or "(35)" in message
+                    or "(56)" in message
+                )
+                if is_transient and attempt < 2:
+                    last_exc = exc
+                    time.sleep(0.8 * (attempt + 1))
+                    continue
+                if "timed out" in lowered or "timeout" in lowered:
                     raise TimeoutError("JMComic 连接或响应超时；请检查当前域名、代理或网络后重试") from exc
-                if "proxy" in message.casefold():
+                if "proxy" in lowered:
                     raise RuntimeError("JMComic 代理连接失败；请在设置中检查代理地址") from exc
                 raise RuntimeError(f"JMComic 浏览器指纹请求失败：{message}") from exc
-            if int(getattr(response, "status_code", 0) or 0) != 403 or attempt:
-                break
-            response.close()
-            time.sleep(0.6)
-        assert response is not None
+            status = int(getattr(response, "status_code", 0) or 0)
+            if status in {429, 503}:
+                HTTP_BACKOFF.defer(url, retry_after_seconds(response.headers.get("Retry-After"), 1.0))
+            if status == 403 and attempt < 2:
+                response.close()
+                response = None
+                time.sleep(0.6)
+                continue
+            break
+        if response is None:
+            if last_exc is not None:
+                raise RuntimeError(f"JMComic 请求多次重试后仍失败：{last_exc}") from last_exc
+            raise RuntimeError("JMComic 请求失败：未获得响应")
         try:
             response.raise_for_status()
         except Exception as exc:
             status = int(getattr(response, "status_code", 0) or 0)
+            if 400 <= status < 600:
+                exc._download_error_info = http_error_info(status)
+            response.close()
             if status == 429:
                 raise RuntimeError("JMComic 请求过于频繁（HTTP 429），请稍后再试并降低连续搜索/下载频率") from exc
             if status == 403:

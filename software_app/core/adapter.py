@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from abc import ABC, abstractmethod
+from pathlib import Path
 
 from .events import CallbackSet
 from .models import DownloadTask, ModuleInfo, TargetPreview
@@ -14,6 +15,7 @@ class TaskCancelled(RuntimeError):
 class CrawlerAdapter(ABC):
     info: ModuleInfo
     max_concurrency: int = 1
+    reports_files: bool = False
 
     @property
     def module_id(self) -> str:

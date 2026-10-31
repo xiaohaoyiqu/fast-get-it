@@ -21,6 +21,7 @@ except ImportError:
     winreg = None
 
 from .settings import BROWSER_TOOLS_DIR, GOOGLE_IMAGE_ROOT, PROJECT_ROOT, TWITTER_ROOT, ensure_data_dirs
+from .tool_install import staged_tool_payload
 
 
 CHROME_FOR_TESTING_BUILDS = "https://googlechromelabs.github.io/chrome-for-testing/latest-patch-versions-per-build-with-downloads.json"
@@ -182,7 +183,7 @@ def chromedriver_version(driver_path: Path) -> str:
 
 def versions_compatible(browser_version: str, driver_version: str) -> bool:
     if not browser_version or not driver_version:
-        return bool(driver_version)
+        return False
     return browser_version.split(".", 1)[0] == driver_version.split(".", 1)[0]
 
 
@@ -329,29 +330,21 @@ def download_chromedriver(timeout: int = 180) -> Path:
         raise BrowserDriverError("ChromeDriver 下载结果不是有效 ZIP") from exc
     if not executable_bytes:
         raise BrowserDriverError("ChromeDriver 压缩包中未找到驱动文件")
-    temporary = target.with_name(f".{target.name}.installing")
-    try:
-        temporary.write_bytes(executable_bytes)
+    with staged_tool_payload(target, executable_bytes, executable=True) as temporary:
+        installed_version = ""
+        for attempt in range(3):
+            installed_version = chromedriver_version(temporary)
+            if installed_version:
+                break
+            if attempt < 2:
+                time.sleep(1)
+        if not installed_version:
+            raise BrowserDriverError("下载的 ChromeDriver 连续三次无法运行，未替换原驱动；请检查安全软件拦截")
+        if not versions_compatible(version, installed_version):
+            raise BrowserDriverError(
+                f"下载的 ChromeDriver {installed_version} 与本机 Chrome {version} 主版本不匹配，未替换原驱动"
+            )
         temporary.replace(target)
-    finally:
-        temporary.unlink(missing_ok=True)
-    if platform.system() != "Windows":
-        target.chmod(target.stat().st_mode | 0o755)
-    installed_version = ""
-    for attempt in range(3):
-        installed_version = chromedriver_version(target)
-        if installed_version:
-            break
-        if attempt < 2:
-            time.sleep(1)
-    if not installed_version:
-        target.unlink(missing_ok=True)
-        raise BrowserDriverError("下载的 ChromeDriver 连续三次无法运行，已删除；请检查安全软件拦截")
-    if not versions_compatible(version, installed_version):
-        target.unlink(missing_ok=True)
-        raise BrowserDriverError(
-            f"下载的 ChromeDriver {installed_version} 与本机 Chrome {version} 主版本不匹配，已删除"
-        )
     return target.resolve()
 
 
@@ -375,10 +368,12 @@ def chromedriver_status(auto_download: bool = False) -> BrowserDriverStatus:
     if existing:
         driver_version = chromedriver_version(existing)
         if driver_version and versions_compatible(version, driver_version):
-            if source != "global":
+            if source != "global" and auto_download:
                 existing = copy_driver_to_global(existing)
                 source = f"global-copy:{source}"
             return BrowserDriverStatus(existing, version, driver_version, source, "ChromeDriver 可用且版本匹配")
+        if not version and not auto_download:
+            return BrowserDriverStatus(existing, "", driver_version, "browser-missing", "未检测到 Chrome，无法确认驱动兼容性")
         mismatch = (
             f"ChromeDriver {driver_version or '未知'} 与 Chrome {version or '未知'} 不匹配"
             if driver_version else "现有 ChromeDriver 无法运行"

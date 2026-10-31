@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from software_app.core.task_control import task_cancelled
+
 import html
 import json
 import re
@@ -13,20 +15,24 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import requests
-from PIL import Image
+from software_app.crawlers.common import request_get, validate_external_url
+from software_app.core.network_policy import HTTP_BACKOFF, record_http_backoff
+from software_app.core.redirect_policy import url_origin
+from software_app.core.cookie_store import cookie_jar, load_cookie_records
+from software_app.core.response_read import read_response_text, read_response_json
 
 from software_app.core.adapter import TaskCancelled
-from software_app.core.aria2_bt import Aria2Error, download_torrent_with_aria2
+from software_app.core.output_lock import output_path_lock
+from software_app.core.aria2_bt import Aria2Error, download_torrent_with_aria2, aria2_limits_from_options
 from software_app.core.events import CallbackSet
 from software_app.core.models import DownloadTask, FileRecord, ProgressEvent, TargetPreview, classify_file
 from software_app.core.torrent_metadata import parse_torrent
 from software_app.crawlers.common import (
     download_file,
     extension_from_url,
-    load_cookie_file,
     make_session,
     normalized_media_extension,
-    convert_media_file,
+    download_media_file,
     platform_output_root,
     safe_component,
 )
@@ -331,17 +337,23 @@ class EhentaiClient:
             # the image CDN or torrent tracker.  Name-only cookies loaded into
             # requests would otherwise be attached to every host in the session.
             cookie_domain = ".exhentai.org" if self.site == "exhentai" else ".e-hentai.org"
-            for name, value in load_cookie_file(cookie_file).items():
-                self.session.cookies.set(name, value, domain=cookie_domain, path="/", secure=True)
+            self.session.cookies = cookie_jar(load_cookie_records(cookie_file), default_domain=cookie_domain)
 
     def _get_text(self, url: str, *, timeout: tuple[int, int] = (10, 45)) -> str:
-        response = self.session.get(url, timeout=timeout)
+        response = request_get(self.session, url, timeout=timeout)
+        try:
+            return self._read_text(response, url)
+        finally:
+            response.close()
+
+    @staticmethod
+    def _read_text(response, url):
         if response.status_code == 429:
             raise RuntimeError("EH 请求过于频繁；官方搜索限制要求至少间隔约 3 秒")
         if response.status_code in {403, 451, 509}:
             raise RuntimeError(f"EH 返回 HTTP {response.status_code}；请检查代理、访问额度或站点限制")
         response.raise_for_status()
-        page = response.text
+        page = read_response_text(response)
         host = str(urlparse(url).hostname or "").casefold()
         if host.endswith("exhentai.org") and not page.strip():
             raise PermissionError("ExHentai 返回空白页；当前 Cookie 没有里站访问权限")
@@ -350,17 +362,37 @@ class EhentaiClient:
             raise PermissionError("EH 登录状态无效；请重新导入 Cookie")
         return page
 
+    def _post_once(self, url, *, accept_redirect_receipt=False, **kwargs):
+        validate_external_url(url)
+        HTTP_BACKOFF.wait(url)
+        response = self.session.post(url, allow_redirects=False, stream=True, **kwargs)
+        try:
+            record_http_backoff(response, url)
+            if response.status_code in {401, 403}:
+                raise PermissionError("EH 请求被拒绝；请重新获取当前站点 Cookie 或检查访问权限")
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = str(response.headers.get("Location") or "").strip()
+                if not location or not accept_redirect_receipt or url_origin(urljoin(url, location)) != url_origin(url):
+                    raise requests.HTTPError("EH POST 返回重定向，未重新发送；操作结果需重新读取确认", response=response)
+            response.raise_for_status()
+            return response
+        except BaseException:
+            response.close()
+            raise
+
     def gallery_metadata_many(self, targets: list[EhentaiTarget]) -> dict[str, dict]:
         pairs = [[int(item.gid), item.token] for item in targets[:25] if item.kind == "gallery"]
         if not pairs:
             return {}
-        response = self.session.post(
+        response = self._post_once(
             "https://api.e-hentai.org/api.php",
             json={"method": "gdata", "gidlist": pairs, "namespace": 1},
             timeout=(10, 45),
         )
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            payload = read_response_json(response)
+        finally:
+            response.close()
         rows = payload.get("gmetadata") if isinstance(payload, dict) else None
         if not isinstance(rows, list):
             raise RuntimeError("E-Hentai API 未返回画廊元数据列表")
@@ -422,8 +454,9 @@ class EhentaiClient:
             return {**before, "changed": False}
 
         endpoint = self._favorite_popup_url(target)
-        response = self.session.post(
+        response = self._post_once(
             endpoint,
+            accept_redirect_receipt=True,
             data={
                 "favcat": str(category) if desired_favorited else "favdel",
                 "favnote": normalized_note if desired_favorited else "",
@@ -433,11 +466,7 @@ class EhentaiClient:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=(10, 45),
         )
-        if response.status_code in {401, 403}:
-            raise PermissionError("EH 收藏修改被拒绝；请重新获取当前站点 Cookie")
-        if response.status_code == 429:
-            raise RuntimeError("EH 收藏修改请求过于频繁，请稍后重试")
-        response.raise_for_status()
+        response.close()
         after = self.favorite_state(target)
         verified = (
             after["favorited"]
@@ -519,7 +548,7 @@ class EhentaiClient:
             raise RuntimeError("EH 画廊没有返回可识别的图片阅读页链接")
         image_dir = folder / "images"
         for page_number, image_page_url in enumerate(page_links, 1):
-            if cancel_event.is_set():
+            if task_cancelled(cancel_event):
                 raise TaskCancelled("任务已取消")
             page = self._get_text(image_page_url)
             parsed = parse_image_page_html(page, image_page_url)
@@ -536,16 +565,13 @@ class EhentaiClient:
                 if output_suffix == source_suffix
                 else image_dir / f".{page_number:04d}.source{source_suffix}"
             )
-            try:
-                download_file(self.session, image_url, source_path, cancel_event, timeout=(10, 120))
-                with Image.open(source_path) as opened:
-                    opened.verify()
-                if source_path != destination:
-                    convert_media_file(source_path, destination, output_suffix)
-            finally:
-                if source_path != destination:
-                    source_path.unlink(missing_ok=True)
-            size = destination.stat().st_size
+            result = download_media_file(
+                self.session, image_url, source_path, destination, cancel_event, output_suffix,
+                timeout=(10, 120), verify_image=True,
+                conflict_policy=task.options.get("file_conflict", "reuse"),
+            )
+            size, _reused = result
+            destination = result.path
             callbacks.on_file(FileRecord(
                 destination.resolve(), task.module_id, task.task_id, "image", size,
                 title=title, source_url=image_page_url, source_id=target.gid,
@@ -664,7 +690,7 @@ class EhentaiClient:
         target = parse_ehentai_target(task.target)
         if target.kind != "gallery":
             raise ValueError("请先从 EH 搜索/收藏夹候选中选择具体画廊")
-        if cancel_event.is_set():
+        if task_cancelled(cancel_event):
             raise TaskCancelled("任务已取消")
         method = str(task.options.get("eh_download_method") or "metadata").casefold()
         if method == "archive":
@@ -737,18 +763,19 @@ class EhentaiClient:
         maximum = max(1, min(int(task.options.get("max_torrents") or 1), 10))
         torrent_dir = folder / "torrents"
         for index, url in enumerate(reversed(links[-maximum:]), 1):
-            if cancel_event.is_set():
+            if task_cancelled(cancel_event):
                 raise TaskCancelled("任务已取消")
             filename = safe_component(Path(urlparse(url).path).name or f"{target.gid}-{index}.torrent", max_length=100)
             if not filename.casefold().endswith(".torrent"):
                 filename += ".torrent"
             destination = torrent_dir / filename
-            size = download_file(self.session, url, destination, cancel_event, timeout=(10, 90))
-            try:
-                torrent_summary = parse_torrent(destination.read_bytes())
-            except (OSError, ValueError) as exc:
-                destination.unlink(missing_ok=True)
-                raise RuntimeError("EH 种子响应不是结构完整且安全的 BitTorrent 元数据") from exc
+            with output_path_lock(destination, cancel_event):
+                size = download_file(self.session, url, destination, cancel_event, timeout=(10, 90), overwrite=True)
+                try:
+                    torrent_summary = parse_torrent(destination.read_bytes())
+                except (OSError, ValueError) as exc:
+                    destination.unlink(missing_ok=True)
+                    raise RuntimeError("EH 种子响应不是结构完整且安全的 BitTorrent 元数据") from exc
             callbacks.on_file(FileRecord(
                 destination.resolve(), task.module_id, task.task_id, "other", size,
                 title=title, source_url=target.url, source_id=target.gid,
@@ -770,8 +797,11 @@ class EhentaiClient:
             if not bt_download_enabled:
                 continue
             bt_output = folder / "bt-content" / torrent_summary.info_hash
+            limits = aria2_limits_from_options(task.options)
             callbacks.on_progress(ProgressEvent(
-                task.task_id, task.module_id, "info", "已交给 aria2 下载种子内容；BT 下载期间可能产生上传流量",
+                task.task_id, task.module_id, "info", "已交给 aria2 下载种子内容；BT 下载期间可能产生上传流量；"
+                + (f"本进程下载上限 {limits.download_kib} KiB/s、上传上限 {limits.upload_kib} KiB/s"
+                   if limits.enabled else "本任务未启用 aria2 限速"),
             ))
             try:
                 result = download_torrent_with_aria2(
@@ -779,6 +809,7 @@ class EhentaiClient:
                     bt_output,
                     cancel_event,
                     configured_path=str(task.options.get("aria2_path") or ""),
+                    limits=limits,
                 )
             except Aria2Error as exc:
                 raise RuntimeError(str(exc)) from exc

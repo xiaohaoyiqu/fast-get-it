@@ -1,3 +1,7 @@
+
+from software_app.core.task_control import task_cancelled, task_wait
+from software_app.core.adapter import TaskCancelled
+from software_app.core.browser_session import raise_browser_failure
 import json
 import queue
 import re
@@ -5,11 +9,12 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 try:
     from .download_method import (
         DownloadStats,
+        PendingMediaTracker as PendingMediaTracker,
         download_audio,
         download_pic,
         download_video,
@@ -17,10 +22,11 @@ try:
         request_with_retries,
         safe_filename,
     )
-    from .json_process import get_max_bitrate_url, json_value_find
+    from .json_process import get_max_bitrate_url
 except ImportError:  # Preserve direct script execution.
     from download_method import (
         DownloadStats,
+        PendingMediaTracker as PendingMediaTracker,
         download_audio,
         download_pic,
         download_video,
@@ -28,7 +34,7 @@ except ImportError:  # Preserve direct script execution.
         request_with_retries,
         safe_filename,
     )
-    from json_process import get_max_bitrate_url, json_value_find
+    from json_process import get_max_bitrate_url
 
 
 DOWNLOADER_VERSION = "js-scan-v6"
@@ -138,7 +144,7 @@ def next_filename_base(filename_counters, media_type):
     return f"{label}_{filename_counters[media_type]:04d}"
 
 
-def enqueue_url(q, queued_urls, src, media_type, stats, filename_base=None, filename_counters=None):
+def enqueue_url(q, queued_urls, src, media_type, stats, filename_base=None, filename_counters=None, pending_tracker=None):
     if not src:
         stats.inc("empty_url")
         return False
@@ -156,6 +162,8 @@ def enqueue_url(q, queued_urls, src, media_type, stats, filename_base=None, file
     if filename_base:
         seen_filenames.add((media_type, filename_base))
     q.put((src, media_type, filename_base))
+    if pending_tracker is not None:
+        pending_tracker.add(src, media_type, filename_base)
     return True
 
 
@@ -210,7 +218,8 @@ def pop_first_cell_image_sources(driver):
 
 
 def enqueue_images_from_cell(driver, q, queued_urls, user_choice, stats, filename_counters,
-                             blocked_tweet_ids=None, blocked_handles=None, desired_tweet_id=None):
+                             blocked_tweet_ids=None, blocked_handles=None, desired_tweet_id=None,
+                             pending_tracker=None):
     image_sources = pop_first_cell_image_sources(driver)
     if image_sources is None:
         return 0, 0
@@ -245,7 +254,7 @@ def enqueue_images_from_cell(driver, q, queued_urls, user_choice, stats, filenam
         base_url = src.split("?", 1)[0]
         clean_url = base_url + "?format=png&name=large"
         filename_base = build_filename_base("image", tweet_id, media_index, created_at)
-        if enqueue_url(q, queued_urls, clean_url, "image", stats, filename_base, filename_counters):
+        if enqueue_url(q, queued_urls, clean_url, "image", stats, filename_base, filename_counters, pending_tracker):
             new_count += 1
 
     return 1, new_count
@@ -445,14 +454,14 @@ def extract_media_from_json(json_obj, user_choice, blocked_tweet_ids=None, block
     return media_items
 
 
-def fetch_syndication_tweet(tweet_id, cancel_event=None):
+def fetch_syndication_tweet(tweet_id, cancel_event=None, network_config=None):
     """Read one public status through the endpoint used by X embed widgets."""
     tweet_id = str(tweet_id or "").strip()
     if not tweet_id.isdigit():
         return {}
     response = request_with_retries(
         f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&token=a&lang=en",
-        cancel_event=cancel_event,
+        cancel_event=cancel_event, network_config=network_config,
     )
     if response is None:
         return {}
@@ -476,10 +485,12 @@ def download_status_from_syndication(
     config=None,
     cancel_event=None,
     on_media_result=None,
+    pending_tracker=None,
+    network_config=None,
 ):
     """Download an exact public status without depending on X's rendered DOM."""
     config = config or {}
-    payload = fetch_syndication_tweet(tweet_id, cancel_event)
+    payload = fetch_syndication_tweet(tweet_id, cancel_event, network_config=network_config)
     if not payload:
         return None
     media_items = extract_media_from_json(
@@ -500,38 +511,51 @@ def download_status_from_syndication(
     audio_folder = folder / "audio"
     stats = DownloadStats()
     for src, media_type, filename_base in media_items:
-        if cancel_event is not None and cancel_event.is_set():
+        if cancel_event is not None and task_cancelled(cancel_event):
             break
         stats.inc(f"queued_{media_type}")
+        if pending_tracker is not None:
+            pending_tracker.add(src, media_type, filename_base)
         display_name = media_display_name(src, media_type, filename_base, config)
         emit_media_result(on_media_result, media_type, "processing", display_name, "下载进行中")
         reported = [False]
-        def report(kind, status, path=None, reason=""):
+        def report(kind, status, path=None, reason="", *, reported=reported, src=src, media_type=media_type):
             reported[0] = True
+            if pending_tracker is not None:
+                if status in {"completed", "skipped"}:
+                    pending_tracker.complete(src, media_type)
+                elif status == "failed":
+                    pending_tracker.fail(src, reason or "下载失败", media_type)
             emit_media_result(on_media_result, kind, status, path, reason)
         if media_type == "image":
             download_pic(
                 src, folder, record, stats, failure_record, filename_base,
-                cancel_event=cancel_event, image_format=config.get("image_format", "png"),
+                cancel_event=cancel_event, network_config=network_config, image_format=config.get("image_format", "png"),
                 on_result=report,
+                rename_downloads=config.get("rename_downloads", True),
+                delete_source_after_rename=config.get("delete_source_after_rename", True),
             )
         elif media_type == "audio":
             download_audio(
                 src, audio_folder, record, stats, failure_record, filename_base,
-                cancel_event=cancel_event, audio_format=config.get("audio_format", "mp3"),
+                cancel_event=cancel_event, network_config=network_config, audio_format=config.get("audio_format", "mp3"),
                 on_result=report,
             )
         else:
             download_video(
                 src, video_folder, record, stats, media_type, failure_record, filename_base,
-                cancel_event=cancel_event,
+                cancel_event=cancel_event, network_config=network_config,
                 convert_gif=config.get("convert_gif", False),
                 keep_gif_mp4=config.get("keep_gif_mp4", True),
                 gif_fps=config.get("gif_fps", 12),
                 gif_width=config.get("gif_width", 0),
                 on_result=report,
+                rename_downloads=config.get("rename_downloads", True),
+                delete_source_after_rename=config.get("delete_source_after_rename", True),
             )
-        if not reported[0] and (cancel_event is None or not cancel_event.is_set()):
+        if not reported[0] and (cancel_event is None or not task_cancelled(cancel_event)):
+            if pending_tracker is not None:
+                pending_tracker.fail(src, "下载流程未返回结果", media_type)
             report(media_type, "failed", None, "下载流程未返回结果")
     return stats.snapshot()
 
@@ -553,6 +577,7 @@ def url_producer(
     blocked_author_ids=None,
     blocked_handles=None,
     desired_tweet_id=None,
+    pending_tracker=None,
 ):
     # 生产者线程函数，抓取图片URL并放入队列
     idle_rounds = 0
@@ -562,7 +587,7 @@ def url_producer(
     filename_counters = {}
     try:
         while True:
-            if cancel_event is not None and cancel_event.is_set():
+            if cancel_event is not None and task_cancelled(cancel_event):
                 break
             try:
                 processed_cells = 0
@@ -571,29 +596,31 @@ def url_producer(
                 for _ in range(cells_per_round):
                     processed, new_images = enqueue_images_from_cell(
                         driver, q, queued_urls, user_choice, stats, filename_counters,
-                        blocked_tweet_ids, blocked_handles, desired_tweet_id
+                        blocked_tweet_ids, blocked_handles, desired_tweet_id,
+                        pending_tracker=pending_tracker,
                     )
                     processed_cells += processed
                     new_urls += new_images
                     if not processed:
                         break
-                    if cancel_event is not None and cancel_event.wait(0.2):
+                    if cancel_event is not None and task_wait(cancel_event, 0.2):
                         break
                     time.sleep(0 if cancel_event is not None else 0.2)
 
                 new_urls += media_video(driver, q, user_choice, is_media, queued_urls, stats, filename_counters,
-                                        blocked_tweet_ids, blocked_author_ids, blocked_handles, desired_tweet_id)
+                                        blocked_tweet_ids, blocked_author_ids, blocked_handles, desired_tweet_id,
+                                        pending_tracker=pending_tracker)
 
                 if processed_cells == 0:
                     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                     if cancel_event is not None:
-                        cancel_event.wait(2)
+                        task_wait(cancel_event, 2)
                     else:
                         time.sleep(2)
                 else:
                     driver.execute_script("window.scrollBy(0, Math.floor(window.innerHeight * 0.8));")
                     if cancel_event is not None:
-                        cancel_event.wait(0.8)
+                        task_wait(cancel_event, 0.8)
                     else:
                         time.sleep(0.8)
                 after_state = page_state(driver)
@@ -622,20 +649,24 @@ def url_producer(
 
                 error_rounds = 0
             except Exception as error:
-                if cancel_event is not None and cancel_event.is_set():
+                if cancel_event is not None and task_cancelled(cancel_event):
                     break
+                raise_browser_failure(error, cancel_event, driver)
                 error_rounds += 1
                 print(f'抓取页面内容失败，重试 {error_rounds}/5: {short_error(error)}')
                 if error_rounds >= 5:
-                    break
-                time.sleep(1)
+                    raise
+                if cancel_event is not None:
+                    task_wait(cancel_event, 1)
+                else:
+                    time.sleep(1)
     finally:
         producer_done.set()
         for _ in range(worker_count):
             q.put(None)  # 生产者完成后给每个worker放入停止信号
 
 
-def download_worker(worker_id, q, folder, video_folder, audio_folder, record, stats, failure_record, options, cancel_event=None, on_media_result=None):
+def download_worker(worker_id, q, folder, video_folder, audio_folder, record, stats, failure_record, options, cancel_event=None, on_media_result=None, pending_tracker=None, network_config=None):
     while True:
         item = q.get()
         if item is None:
@@ -648,11 +679,16 @@ def download_worker(worker_id, q, folder, video_folder, audio_folder, record, st
             src, media_type = item
             filename_base = None
         reported = [False]
-        def report(kind, status, path=None, reason=""):
+        def report(kind, status, path=None, reason="", *, reported=reported, src=src, media_type=media_type):
             reported[0] = True
+            if pending_tracker is not None:
+                if status in {"completed", "skipped"}:
+                    pending_tracker.complete(src, media_type)
+                elif status == "failed":
+                    pending_tracker.fail(src, reason or "下载失败", media_type)
             emit_media_result(on_media_result, kind, status, path, reason)
         try:
-            if cancel_event is not None and cancel_event.is_set():
+            if cancel_event is not None and task_cancelled(cancel_event):
                 continue
             display_name = media_display_name(src, media_type, filename_base, options)
             emit_media_result(on_media_result, media_type, "processing", display_name, "下载进行中")
@@ -664,9 +700,11 @@ def download_worker(worker_id, q, folder, video_folder, audio_folder, record, st
                     stats,
                     failure_record,
                     filename_base,
-                    cancel_event=cancel_event,
+                    cancel_event=cancel_event, network_config=network_config,
                     image_format=options.get("image_format", "png"),
                     on_result=report,
+                    rename_downloads=options.get("rename_downloads", True),
+                    delete_source_after_rename=options.get("delete_source_after_rename", True),
                 )
             elif media_type == "audio":
                 download_audio(
@@ -676,7 +714,7 @@ def download_worker(worker_id, q, folder, video_folder, audio_folder, record, st
                     stats,
                     failure_record,
                     filename_base,
-                    cancel_event=cancel_event,
+                    cancel_event=cancel_event, network_config=network_config,
                     audio_format=options.get("audio_format", "mp3"),
                     on_result=report,
                 )
@@ -689,23 +727,28 @@ def download_worker(worker_id, q, folder, video_folder, audio_folder, record, st
                     media_type,
                     failure_record,
                     filename_base,
-                    cancel_event=cancel_event,
+                    cancel_event=cancel_event, network_config=network_config,
                     convert_gif=options.get("convert_gif", False),
                     keep_gif_mp4=options.get("keep_gif_mp4", True),
                     gif_fps=options.get("gif_fps", 12),
                     gif_width=options.get("gif_width", 0),
                     on_result=report,
+                    rename_downloads=options.get("rename_downloads", True),
+                    delete_source_after_rename=options.get("delete_source_after_rename", True),
                 )
         except Exception as error:
             print(f"下载worker {worker_id} 失败，跳过: {short_error(error)}")
             if not reported[0]:
+                if pending_tracker is not None:
+                    pending_tracker.fail(src, short_error(error), media_type)
                 report(media_type, "failed", None, short_error(error))
         finally:
             q.task_done()
 
 
 def media_video(driver, q, user_choice, is_media, queued_urls, stats, filename_counters,
-                blocked_tweet_ids=None, blocked_author_ids=None, blocked_handles=None, desired_tweet_id=None):
+                blocked_tweet_ids=None, blocked_author_ids=None, blocked_handles=None, desired_tweet_id=None,
+                pending_tracker=None):
     if "1" not in user_choice and "2" not in user_choice and "3" not in user_choice and "4" not in user_choice:
         return 0
 
@@ -724,6 +767,7 @@ def media_video(driver, q, user_choice, is_media, queued_urls, stats, filename_c
             return False
 
     variants_lists = []
+    media_counts = filename_counters.setdefault("_fallback_media_counts", {})
     new_count = 0
     for log in filter(log_filter, logs):
         request_id = log["params"]["requestId"]
@@ -731,6 +775,7 @@ def media_video(driver, q, user_choice, is_media, queued_urls, stats, filename_c
             res = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": request_id})['body']
             res = json.loads(res)
         except Exception as error:
+            raise_browser_failure(error, driver=driver)
             print(f"读取网络响应失败，跳过: {short_error(error)}")
             continue
 
@@ -738,7 +783,7 @@ def media_video(driver, q, user_choice, is_media, queued_urls, stats, filename_c
         for media_url, media_type, filename_base in extract_media_from_json(
             res, user_choice, blocked_tweet_ids, blocked_author_ids, blocked_handles, desired_tweet_id
         ):
-            if enqueue_url(q, queued_urls, media_url, media_type, stats, filename_base, filename_counters):
+            if enqueue_url(q, queued_urls, media_url, media_type, stats, filename_base, filename_counters, pending_tracker):
                 new_from_media_entities += 1
         new_count += new_from_media_entities
         if new_from_media_entities:
@@ -751,9 +796,9 @@ def media_video(driver, q, user_choice, is_media, queued_urls, stats, filename_c
              and (not desired_tweet_id or context.get("tweet_id") == str(desired_tweet_id))
              and context.get("author_id") not in (blocked_author_ids or ())
              and context.get("author_handle") not in (blocked_handles or ()))
-            if needs_context else ((variants, {}) for variants in json_value_find(res, "variants"))
+            if needs_context else iter_variants_with_tweet(res)
         )
-        for variants, _context in fallback_variants:
+        for variants, context in fallback_variants:
             if variants in variants_lists:
                 continue
 
@@ -762,14 +807,22 @@ def media_video(driver, q, user_choice, is_media, queued_urls, stats, filename_c
             if not media_url:
                 continue
 
+            fallback_tweet_id = str(context.get("tweet_id") or "")
+            fallback_created_at = context.get("created_at", "")
             if "2" in user_choice and 'pu' in media_url:
-                if enqueue_url(q, queued_urls, media_url, "video", stats, filename_counters=filename_counters):
+                fb_index = next_media_index(media_counts, "video", fallback_tweet_id)
+                fb_filename_base = build_filename_base("video", fallback_tweet_id, fb_index, fallback_created_at)
+                if enqueue_url(q, queued_urls, media_url, "video", stats, fb_filename_base, filename_counters, pending_tracker):
                     new_count += 1
             if "4" in user_choice and 'pu' in media_url:
-                if enqueue_url(q, queued_urls, media_url, "audio", stats, filename_counters=filename_counters):
+                fb_index = next_media_index(media_counts, "audio", fallback_tweet_id)
+                fb_filename_base = build_filename_base("audio", fallback_tweet_id, fb_index, fallback_created_at)
+                if enqueue_url(q, queued_urls, media_url, "audio", stats, fb_filename_base, filename_counters, pending_tracker):
                     new_count += 1
             if "3" in user_choice and 'pu' not in media_url:
-                if enqueue_url(q, queued_urls, media_url, "gif", stats, filename_counters=filename_counters):
+                fb_index = next_media_index(media_counts, "gif", fallback_tweet_id)
+                fb_filename_base = build_filename_base("gif", fallback_tweet_id, fb_index, fallback_created_at)
+                if enqueue_url(q, queued_urls, media_url, "gif", stats, fb_filename_base, filename_counters, pending_tracker):
                     new_count += 1
 
     return new_count
@@ -801,6 +854,10 @@ def download_media(
     desired_tweet_id=None,
     cancel_event=None,
     on_media_result=None,
+    pending_tracker=None,
+    rename_downloads=True,
+    delete_source_after_rename=True,
+    network_config=None,
 ):
     print(f"{folder} | downloader={DOWNLOADER_VERSION}")
     # 下载Twitter页面中的图片和视频
@@ -816,10 +873,24 @@ def download_media(
         "gif_width": gif_width,
         "audio_format": audio_format,
         "image_format": image_format,
+        "rename_downloads": bool(rename_downloads),
+        "delete_source_after_rename": bool(delete_source_after_rename),
     }
     time.sleep(0.1)
+    producer_errors = []
+
+    def produce(*args):
+        try:
+            url_producer(*args)
+        except BaseException as error:
+            producer_errors.append(error)
+            if not producer_done.is_set():
+                producer_done.set()
+                for _ in range(download_workers):
+                    q.put(None)
+
     producer_thread = threading.Thread(
-        target=url_producer,
+        target=produce,
         args=(
             driver,
             q,
@@ -837,13 +908,14 @@ def download_media(
             blocked_author_ids,
             blocked_handles,
             desired_tweet_id,
+            pending_tracker,
         ),
         name="url-producer",
     )
     worker_threads = [
         threading.Thread(
             target=download_worker,
-            args=(index + 1, q, folder, video_folder, audio_folder, record, stats, failure_record, options, cancel_event, on_media_result),
+            args=(index + 1, q, folder, video_folder, audio_folder, record, stats, failure_record, options, cancel_event, on_media_result, pending_tracker, network_config),
             name=f"download-worker-{index + 1}",
         )
         for index in range(download_workers)
@@ -856,4 +928,8 @@ def download_media(
     q.join()
     for thread in worker_threads:
         thread.join()
+    if cancel_event is not None and task_cancelled(cancel_event):
+        raise TaskCancelled("任务已取消")
+    if producer_errors:
+        raise producer_errors[0]
     return stats.snapshot()

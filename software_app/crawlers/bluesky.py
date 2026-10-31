@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import os
+
 import re
-import shutil
-import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,15 +9,19 @@ from urllib.parse import quote_plus, urlparse
 
 import requests
 
-from software_app.core.adapter import TaskCancelled
 from software_app.core.events import CallbackSet
 from software_app.core.external_tools import find_ffmpeg
+from software_app.core.hls_transfer import download_hls
 from software_app.core.models import DownloadTask, FileRecord, ProgressEvent, TargetPreview, classify_file
+from software_app.core.network_policy import HTTP_BACKOFF, record_http_backoff
+from software_app.crawlers.common import request_get
+from software_app.core.response_read import read_response_json
+from software_app.core.media_results import media_descriptor, retry_folder, refreshed_media, run_media_jobs
 from software_app.crawlers.common import (
-    convert_media_file,
-    download_file,
+    download_media_file,
     extension_from_url,
     make_session,
+    validate_external_url,
     normalized_media_extension,
     platform_output_root,
     safe_component,
@@ -141,15 +143,19 @@ class BlueskyClient:
         self.session = session or make_session(referer="https://bsky.app/", proxy_url=self.proxy_url)
 
     def get(self, endpoint: str, **params) -> dict:
-        response = self.session.get(f"{APPVIEW}/xrpc/{endpoint}", params=params, timeout=(10, 45))
-        if response.status_code == 429:
-            raise RuntimeError("Bluesky 请求过于频繁，请稍后重试")
-        if response.status_code == 403 and endpoint == "app.bsky.feed.searchPosts":
-            raise PermissionError("Bluesky 当前拒绝此网络出口的帖子全文搜索；用户、公开关注、作者动态和具体帖子仍可使用")
-        if response.status_code in {401, 403}:
-            raise PermissionError("Bluesky 当前拒绝这个公开 API 请求，请稍后重试或检查代理")
-        response.raise_for_status()
-        payload = response.json()
+        url = f"{APPVIEW}/xrpc/{endpoint}"
+        HTTP_BACKOFF.wait(url)
+        response = request_get(self.session, url, params=params, timeout=(10, 45))
+        try:
+            record_http_backoff(response, url)
+            if response.status_code == 403 and endpoint == "app.bsky.feed.searchPosts":
+                raise PermissionError("Bluesky 当前拒绝此网络出口的帖子全文搜索；用户、公开关注、作者动态和具体帖子仍可使用")
+            if response.status_code in {401, 403}:
+                raise PermissionError("Bluesky 当前拒绝这个公开 API 请求，请稍后重试或检查代理")
+            response.raise_for_status()
+            payload = read_response_json(response)
+        finally:
+            response.close()
         if not isinstance(payload, dict):
             raise ValueError("Bluesky 接口没有返回对象")
         return payload
@@ -251,6 +257,22 @@ class BlueskyClient:
         )
 
     def download(self, task: DownloadTask, callbacks: CallbackSet, cancel_event: threading.Event) -> None:
+        if "_retry_media" in task.options:
+            cache = {}
+
+            def retry(item):
+                target = parse_bluesky_target(item["target"])
+                if target.kind != "post":
+                    raise ValueError("失败记录没有有效的帖子地址")
+                if item["target"] not in cache:
+                    cache[item["target"]] = self.post(target.actor, target.post_id)
+                row = cache[item["target"]]
+                media = refreshed_media(row.get("media") or [], item)
+                return self._download_media(task, row, media, retry_folder(task, item), int(item["index"]), cancel_event, callbacks=callbacks)
+
+            run_media_jobs(task, callbacks, cancel_event,
+                           [(item, lambda item=item: retry(item)) for item in task.options["_retry_media"]])
+            return
         target = parse_bluesky_target(task.target)
         limit = int(task.options.get("max_works") or 100)
         if target.kind == "post":
@@ -264,33 +286,23 @@ class BlueskyClient:
             raise RuntimeError("没有找到可下载的 Bluesky 帖子")
         types = set(str(task.options.get("types") or "1234").replace(",", ""))
         root = platform_output_root(task.output_dir, "bluesky")
-        completed = 0
-        errors: list[str] = []
-        total = sum(len(row.get("media") or []) for row in rows)
+        jobs = []
         for row in rows:
             handle = str(row.get("handle") or row.get("author_name") or "unknown")
             folder = root / safe_component(handle) / safe_component(f"{row.get('id')}_{row.get('title')}", max_length=90)
             for index, media in enumerate(row.get("media") or [], 1):
-                if cancel_event.is_set():
-                    raise TaskCancelled("任务已取消")
                 kind = str(media.get("type") or "")
                 if (kind == "image" and "1" not in types) or (kind == "video" and "2" not in types):
                     continue
-                try:
-                    record = self._download_media(task, row, media, folder, index, cancel_event)
-                except (OSError, requests.RequestException, RuntimeError, ValueError) as exc:
-                    errors.append(str(exc))
-                    callbacks.on_progress(ProgressEvent(task.task_id, "bluesky", "warning", f"媒体 {index} 下载失败：{exc}"))
-                    continue
-                completed += 1
-                callbacks.on_file(record)
-                callbacks.on_progress(ProgressEvent(task.task_id, "bluesky", "info",
-                    f"已保存 {completed}/{total}：{record.path.name}", current=completed, total=total))
-        if not completed:
-            raise RuntimeError(errors[0] if errors else "目标没有符合下载类型的媒体")
+                item = media_descriptor(task, row["url"], index, kind, str(media.get("url") or ""), folder)
+                jobs.append((item, lambda row=row, media=media, folder=folder, index=index:
+                    self._download_media(task, row, media, folder, index, cancel_event, callbacks=callbacks)))
+        if not jobs:
+            raise ValueError("目标没有符合下载类型的媒体")
+        run_media_jobs(task, callbacks, cancel_event, jobs)
 
     def _download_media(self, task: DownloadTask, row: dict, media: dict, folder: Path, index: int,
-                        cancel_event: threading.Event) -> FileRecord:
+                        cancel_event: threading.Event, *, callbacks=None) -> FileRecord:
         url = _safe_media_url(media.get("url"))
         if not url:
             raise ValueError("Bluesky 返回了不受信任的媒体地址")
@@ -298,42 +310,42 @@ class BlueskyClient:
         stem = safe_component(f"{row.get('published_at') or 'unknown'}_{row.get('id')}_{index:02d}", max_length=100)
         if media.get("type") == "video":
             destination = folder / f"{stem}.mp4"
-            self._download_hls(url, destination, cancel_event)
+            def progress(done, total, reused):
+                if callbacks:
+                    callbacks.on_progress(ProgressEvent(task.task_id, task.module_id, "info",
+                        f"HLS 资源 {done}/{total}，条件复用 {reused} 项（含初始化片段）"))
+            destination, reused = self._download_hls_result(url, destination, cancel_event, task.options.get("file_conflict", "reuse"), progress=progress if callbacks else None)
         else:
             source_suffix = extension_from_url(url, ".jpg", {".jpg", ".jpeg", ".png", ".webp", ".gif"})
             output_suffix = normalized_media_extension("image/jpeg", source_suffix, "image", task.options)
             source = folder / f".{stem}.source{source_suffix}"
             destination = folder / f"{stem}{output_suffix}"
-            download_file(self.session, url, source, cancel_event)
-            convert_media_file(source, destination, output_suffix)
+            result = download_media_file(self.session, url, source, destination, cancel_event, output_suffix,
+                                         conflict_policy=task.options.get("file_conflict", "reuse"))
+            destination = result.path
+            reused = bool(result[1])
         return FileRecord(destination, "bluesky", task.task_id, classify_file(destination), destination.stat().st_size,
                           str(row.get("title") or ""), url, str(row.get("id") or ""),
                           str(row.get("author_id") or row.get("handle") or ""), str(row.get("author_name") or ""),
-                          published_at=str(row.get("published_at") or ""), metadata={"post_url": row.get("url") or ""})
+                          published_at=str(row.get("published_at") or ""), metadata={"post_url": row.get("url") or "", "reused": reused})
 
-    def _download_hls(self, url: str, destination: Path, cancel_event: threading.Event) -> None:
+    def _download_hls(self, url: str, destination: Path, cancel_event: threading.Event, policy="reuse") -> None:
+        return self._download_hls_result(url, destination, cancel_event, policy)[0]
+
+    def _download_hls_result(self, url, destination, cancel_event, policy, *, progress=None):
+        from software_app.core.file_conflict import reuse_existing, media_output
+
+        with media_output(destination, policy, cancel_event) as destination:
+            reused = reuse_existing(destination, policy)
+            if not reused:
+                if progress is None:
+                    self._download_hls_locked(url, destination, cancel_event)
+                else:
+                    self._download_hls_locked(url, destination, cancel_event, progress=progress)
+            return destination, reused
+
+    def _download_hls_locked(self, url: str, destination: Path, cancel_event: threading.Event, *, progress=None):
         ffmpeg = find_ffmpeg()
         if not ffmpeg:
             raise RuntimeError("下载 Bluesky 视频需要 FFmpeg")
-        temporary = destination.with_name(destination.name + ".part.mp4")
-        env = os.environ.copy()
-        if self.proxy_url:
-            proxy = self.proxy_url if "://" in self.proxy_url else f"http://{self.proxy_url}"
-            env.update({"HTTP_PROXY": proxy, "HTTPS_PROXY": proxy})
-        process = subprocess.Popen(
-            [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", url, "-c", "copy", str(temporary)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env,
-        )
-        try:
-            while process.poll() is None:
-                if cancel_event.wait(0.2):
-                    process.terminate()
-                    raise TaskCancelled("任务已取消")
-            stderr = process.stderr.read() if process.stderr else ""
-            if process.returncode != 0 or not temporary.is_file():
-                raise RuntimeError((stderr.strip().splitlines() or ["FFmpeg 下载视频失败"])[-1])
-            os.replace(temporary, destination)
-        finally:
-            if process.poll() is None:
-                process.kill()
-            temporary.unlink(missing_ok=True)
+        return download_hls(self.session, url, destination, cancel_event, ffmpeg=ffmpeg, validate_url=validate_external_url, progress=progress)

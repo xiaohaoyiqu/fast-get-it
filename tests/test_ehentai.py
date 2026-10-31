@@ -36,8 +36,10 @@ class Response:
     def __init__(self, *, text: str = "", payload: dict | None = None, content: bytes | None = None,
                  url: str = "", status_code: int = 200, headers: dict | None = None) -> None:
         self.text = text
+        self.encoding = "utf-8"
         self._payload = payload
-        self.content = content if content is not None else text.encode("utf-8")
+        self.content = content if content is not None else (json.dumps(payload).encode("utf-8")
+                                                           if payload is not None else text.encode("utf-8"))
         self.url = url
         self.status_code = status_code
         self.headers = headers or {}
@@ -54,6 +56,9 @@ class Response:
     def iter_content(self, chunk_size: int = 128 * 1024):
         del chunk_size
         yield self.content
+
+    def close(self) -> None:
+        pass
 
     def __enter__(self):
         return self
@@ -162,6 +167,13 @@ class FavoriteSession(Session):
 
 
 class EhentaiTests(unittest.TestCase):
+    def setUp(self):
+        validation = patch("software_app.crawlers.common.validate_external_url", side_effect=lambda url: url)
+        validation.start()
+        self.addCleanup(validation.stop)
+        post_validation = patch("software_app.crawlers.ehentai.client.validate_external_url", side_effect=lambda url: url)
+        post_validation.start()
+        self.addCleanup(post_validation.stop)
     def test_target_routing_rejects_lookalike_hosts(self) -> None:
         target = parse_ehentai_target(GALLERY_URL)
         self.assertEqual((target.kind, target.site, target.gid, target.token),
@@ -207,7 +219,10 @@ class EhentaiTests(unittest.TestCase):
         files = []
         session = Session()
         session.metadata["filecount"] = "2"
-        with tempfile.TemporaryDirectory() as directory:
+        # The fake CDN is served by Session below, not by real DNS or HTTP.
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "software_app.crawlers.common._resolve_host_ips", return_value=["8.8.8.8"],
+        ):
             EhentaiClient(session=session).download(
                 DownloadTask(
                     "eh-images", "ehentai", GALLERY_URL, Path(directory),
@@ -417,8 +432,8 @@ class EhentaiTests(unittest.TestCase):
                 (adapter.runtime_data_dir / "e-hentai-cookies.json").read_text(encoding="utf-8"), before
             )
             self.assertNotEqual(
-                json.loads(before)["ipb_member_id"],
-                json.loads((adapter.runtime_data_dir / "exhentai-cookies.json").read_text(encoding="utf-8"))[
+                {item["name"]: item["value"] for item in json.loads(before)}["ipb_member_id"],
+                {item["name"]: item["value"] for item in json.loads((adapter.runtime_data_dir / "exhentai-cookies.json").read_text(encoding="utf-8"))}[
                     "ipb_member_id"
                 ],
             )

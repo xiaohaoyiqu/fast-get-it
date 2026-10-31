@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from software_app.core.task_control import task_wait
+
 import hashlib
 import io
 import os
 import platform
 import shutil
 import subprocess
-import time
 import urllib.request
 import urllib.error
 import zipfile
@@ -17,6 +18,7 @@ from typing import Callable
 
 from .adapter import TaskCancelled
 from .settings import INSTALL_ROOT, PROJECT_ROOT, SOFTWARE_TOOLS_DIR, ensure_data_dirs
+from .tool_install import staged_tool_payload
 
 
 ARIA2_VERSION = "1.37.0"
@@ -46,6 +48,41 @@ class BtDownloadResult:
     output_dir: Path
     files: tuple[Path, ...]
     total_size: int
+
+
+@dataclass(frozen=True)
+class Aria2Limits:
+    enabled: bool = False
+    download_kib: int = 1024
+    upload_kib: int = 128
+
+    def options(self):
+        return {"aria2_limit_enabled": self.enabled, "aria2_download_kib": self.download_kib,
+                "aria2_upload_kib": self.upload_kib}
+
+
+def validate_aria2_limits(enabled, download_kib, upload_kib):
+    try:
+        down, up = int(str(download_kib)), int(str(upload_kib))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("aria2 下载和上传上限须为 1–1048576 KiB/s 的整数") from exc
+    if not isinstance(enabled, bool) or not all(1 <= value <= 1048576 for value in (down, up)):
+        raise ValueError("aria2 限速开关须为布尔值，下载和上传上限须为 1–1048576 KiB/s 的整数")
+    return Aria2Limits(enabled, down, up)
+
+
+def aria2_limits_from_options(options):
+    defaults = Aria2Limits()
+    return validate_aria2_limits(options.get("aria2_limit_enabled", defaults.enabled),
+                                 options.get("aria2_download_kib", defaults.download_kib),
+                                 options.get("aria2_upload_kib", defaults.upload_kib))
+
+
+def saved_aria2_limits(settings):
+    try:
+        return aria2_limits_from_options(settings)
+    except ValueError:
+        return Aria2Limits()
 
 
 def aria2_executable_name() -> str:
@@ -167,24 +204,17 @@ def _install_archive_payload(payload: bytes) -> Aria2Status:
     except (zipfile.BadZipFile, OSError) as exc:
         raise Aria2Error("aria2 安装包无法读取") from exc
     target = bundled_aria2_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(f".{target.name}.installing")
-    try:
-        temporary.write_bytes(selected["aria2c.exe"])
+    with staged_tool_payload(target, selected["aria2c.exe"], executable=True) as temporary:
+        status = aria2_status(temporary)
+        for name, content in selected.items():
+            if name.casefold() == "aria2c.exe":
+                continue
+            destination = target.parent / name
+            with staged_tool_payload(destination, content) as document_temporary:
+                document_temporary.replace(destination)
+        # Validation and accompanying documents must succeed before committing.
         temporary.replace(target)
-    finally:
-        temporary.unlink(missing_ok=True)
-    for name, content in selected.items():
-        if name.casefold() == "aria2c.exe":
-            continue
-        destination = target.parent / name
-        document_temporary = destination.with_name(f".{destination.name}.installing")
-        try:
-            document_temporary.write_bytes(content)
-            document_temporary.replace(destination)
-        finally:
-            document_temporary.unlink(missing_ok=True)
-    return aria2_status(target)
+    return Aria2Status(target.resolve(), status.version, status.source, status.message)
 
 
 def install_aria2_from_archive(archive_path: str | Path) -> Aria2Status:
@@ -203,10 +233,15 @@ def install_aria2(timeout: int = 180) -> Aria2Status:
     return _install_archive_payload(_download_archive(ARIA2_WINDOWS_X64_URL, timeout))
 
 
-def build_aria2_command(executable: Path, torrent_path: Path, output_dir: Path) -> list[str]:
+def build_aria2_command(executable: Path, torrent_path: Path, output_dir: Path, *, limits=None) -> list[str]:
+    limits = limits if limits is not None else Aria2Limits()
+    limits = validate_aria2_limits(limits.enabled, limits.download_kib, limits.upload_kib)
     return [
         str(executable),
+        "--no-conf=true",
         "--dir=" + str(output_dir),
+        "--max-overall-download-limit=" + str(limits.download_kib * 1024 if limits.enabled else 0),
+        "--max-overall-upload-limit=" + str(limits.upload_kib * 1024 if limits.enabled else 0),
         "--seed-time=0",
         "--seed-ratio=0.0",
         "--continue=true",
@@ -233,6 +268,7 @@ def download_torrent_with_aria2(
     *,
     configured_path: str | Path | None = None,
     on_wait: Callable[[], None] | None = None,
+    limits: Aria2Limits | None = None,
 ) -> BtDownloadResult:
     torrent_path = Path(torrent_path).resolve(strict=True)
     output_dir = Path(output_dir).resolve()
@@ -240,7 +276,7 @@ def download_torrent_with_aria2(
     executable, _source = find_aria2c(configured_path)
     if executable is None:
         raise Aria2Error("未找到 aria2c；请先在设置页检测或安装 aria2")
-    command = build_aria2_command(executable, torrent_path, output_dir)
+    command = build_aria2_command(executable, torrent_path, output_dir, limits=limits)
     try:
         process = subprocess.Popen(
             command,
@@ -254,7 +290,7 @@ def download_torrent_with_aria2(
         raise Aria2Error("无法启动 aria2c") from exc
     try:
         while process.poll() is None:
-            if cancel_event.wait(0.25):
+            if task_wait(cancel_event, 0.25):
                 process.terminate()
                 try:
                     process.wait(timeout=5)
@@ -286,6 +322,7 @@ def download_torrent_with_aria2(
 
 
 __all__ = [
+    "Aria2Limits", "validate_aria2_limits", "aria2_limits_from_options", "saved_aria2_limits",
     "ARIA2_VERSION", "Aria2Error", "Aria2Status", "BtDownloadResult", "aria2_status",
     "build_aria2_command", "bundled_aria2_path", "download_torrent_with_aria2", "find_aria2_archive",
     "find_aria2c", "install_aria2", "install_aria2_from_archive",

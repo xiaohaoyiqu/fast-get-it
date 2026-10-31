@@ -17,6 +17,9 @@ class Response:
     def json(self) -> dict:
         return self.payload
 
+    def close(self):
+        pass
+
 
 class Session:
     def __init__(self, following_uri: str = "") -> None:

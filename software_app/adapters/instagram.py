@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import json
 import threading
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
-from software_app.core.adapter import CrawlerAdapter
+from software_app.core.adapter import CrawlerAdapter, TaskCancelled
 from software_app.core.events import CallbackSet
 from software_app.core.models import DownloadTask, ModuleInfo, ProgressEvent, TargetPreview
 from software_app.core.settings import INSTAGRAM_DATA_DIR
@@ -19,6 +18,7 @@ INSTAGRAM_MEDIA_HOSTS = ("cdninstagram.com", "fbcdn.net")
 
 
 class InstagramNativeAdapter(CrawlerAdapter):
+    supports_media_retry = True
     max_concurrency = 2
 
     def __init__(self) -> None:
@@ -56,7 +56,11 @@ class InstagramNativeAdapter(CrawlerAdapter):
         target = parse_instagram_target(raw_target)
         try:
             return self._client(options).preview(target, live=bool(options.get("live")))
-        except RuntimeError:
+        except TaskCancelled:
+            raise
+        except RuntimeError as exc:
+            if getattr(exc, "_media_transfer_failure", False) or "_retry_media" in options:
+                raise
             if not bool(options.get("live")):
                 raise
             browser_options = self._browser_options(options)
@@ -93,7 +97,11 @@ class InstagramNativeAdapter(CrawlerAdapter):
         try:
             self._client(task.options).download(task, callbacks, cancel_event)
             return
-        except RuntimeError as primary_error:
+        except TaskCancelled:
+            raise
+        except RuntimeError as exc:
+            if getattr(exc, "_media_transfer_failure", False) or "_retry_media" in task.options:
+                raise
             callbacks.on_progress(ProgressEvent(
                 task.task_id, task.module_id, "warning",
                 "Instagram 静态资料不可用，正在改用登录浏览器渲染页面",
@@ -112,6 +120,8 @@ class InstagramNativeAdapter(CrawlerAdapter):
                     callbacks,
                     cancel_event,
                 )
+            except TaskCancelled:
+                raise
             except Exception as fallback_error:
                 raise RuntimeError(
                     "Instagram 静态资料和浏览器渲染均未取得可下载媒体；请重新获取登录 Cookie 或使用具体帖子/Reels 链接"
@@ -137,15 +147,11 @@ class InstagramNativeAdapter(CrawlerAdapter):
         cookies = load_cookie_file(source)
         if not cookies:
             raise ValueError("Cookie 文件为空或格式无效；支持 JSON、Netscape cookies.txt 或复制的 Cookie 请求头")
-        self.runtime_data_dir.mkdir(parents=True, exist_ok=True)
-        destination = self.runtime_data_dir / "cookies.json"
-        temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
-        try:
-            temporary.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
-            temporary.replace(destination)
-        finally:
-            temporary.unlink(missing_ok=True)
-        return len(cookies)
+        from dataclasses import replace
+        from software_app.core.browser_cookie_capture import cookie_capture_spec, import_cookie_file
+
+        spec = replace(cookie_capture_spec("Instagram"), destination=self.runtime_data_dir / "cookies.json")
+        return import_cookie_file(spec, source).cookie_count
 
     def cookie_status(self) -> dict[str, object]:
         cookies = load_cookie_file(self.runtime_data_dir / "cookies.json")

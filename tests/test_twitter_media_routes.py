@@ -25,6 +25,8 @@ from software_app.crawlers.twitter.manga_downloader import (
     normalize_photo_url,
 )
 from software_app.crawlers.twitter.download_method import DownloadStats
+from software_app.crawlers.twitter.download_method import PendingMediaTracker
+from software_app.crawlers.twitter.manga_downloader import media_video
 from software_app.crawlers.twitter.twitter_Crawler_2 import (
     DEFAULT_CONFIG,
     build_media_page_tasks,
@@ -35,6 +37,58 @@ from software_app.crawlers.twitter.twitter_Crawler_2 import (
 
 
 class MediaPageRouteTests(unittest.TestCase):
+    def test_browser_workers_receive_disabled_rename_options(self):
+        from software_app.crawlers.twitter import manga_downloader as downloader
+
+        def producer(*args, **kwargs):
+            del kwargs
+            pending = args[1]
+            pending.put(("https://pbs.twimg.com/media/Test.jpg", "image", "date_id_img01"))
+            pending.put(None)
+
+        config = download_method.configure_downloads(proxy_url="http://127.0.0.1:7891", max_retries=2)
+        with patch.object(downloader, "url_producer", side_effect=producer), patch.object(
+            downloader, "download_pic"
+        ) as picture:
+            downloader.download_media(
+                None, Path.cwd(), Path.cwd(), Path.cwd(), "1", True,
+                download_workers=1, rename_downloads=False, delete_source_after_rename=False,
+                network_config=config,
+            )
+        self.assertFalse(picture.call_args.kwargs["rename_downloads"])
+        self.assertFalse(picture.call_args.kwargs["delete_source_after_rename"])
+        self.assertIs(picture.call_args.kwargs["network_config"], config)
+
+    def test_browser_network_media_is_queued_and_tracked(self):
+        import json
+        from unittest.mock import Mock
+
+        url = "https://video.twimg.com/ext_tw_video/pu/video.mp4"
+        driver = Mock()
+        driver.get_log.return_value = [{"message": json.dumps({"message": {
+            "method": "Network.responseReceived", "params": {"requestId": "one", "response": {
+                "mimeType": "application/json", "url": "https://x.com/i/api/graphql/xxx/UserMedia"
+            }}
+        }})}]
+        driver.execute_cdp_cmd.return_value = {"body": json.dumps({
+            "rest_id": "1234567890", "legacy": {
+                "created_at": "Sat Jul 18 12:09:07 +0000 2026", "full_text": "example",
+                "variants": [{"bitrate": 100, "content_type": "video/mp4", "url": url}],
+            }
+        })}
+        pending = PendingMediaTracker()
+        items = queue.Queue()
+        count = media_video(driver, items, "24", True, set(), DownloadStats(), {}, pending_tracker=pending)
+        self.assertEqual(count, 2)
+        video, audio = items.get_nowait(), items.get_nowait()
+        self.assertEqual((video[1], audio[1]), ("video", "audio"))
+        self.assertTrue(video[2].startswith("20260718_120907_1234567890_"))
+        self.assertEqual(len(pending.snapshot()), 2)
+        pending.fail(url, "audio conversion failed", "audio")
+        pending.complete(url, "video")
+        self.assertEqual(pending.snapshot()[0]["media_type"], "audio")
+        self.assertEqual(pending.snapshot()[0]["reason"], "audio conversion failed")
+
     def test_non_200_response_uses_status_before_closing(self):
         class FakeResponse:
             status_code = 429

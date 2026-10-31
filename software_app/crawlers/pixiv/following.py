@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from software_app.core.task_control import task_cancelled
+
 import html
 import re
 import threading
@@ -249,7 +251,7 @@ def collect_following_pages(
     total: int | None = None
 
     while page <= max_pages:
-        if cancel_event.is_set():
+        if task_cancelled(cancel_event):
             stopped_reason = "cancelled"
             break
         if on_status:

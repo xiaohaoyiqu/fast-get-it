@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from software_app.core.task_control import task_cancelled, task_wait
+
 import ipaddress
 import mimetypes
 import os
@@ -12,8 +14,12 @@ from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse, urlunparse
 
 import requests
+from http.cookiejar import CookieJar
 
 from software_app.core.adapter import TaskCancelled
+from software_app.core.file_conflict import media_output
+from software_app.core.network_policy import HTTP_BACKOFF, retry_after_seconds
+from software_app.core.bandwidth import limited_chunks
 from software_app.core.blocklist import BlocklistStore, work_from_target
 from software_app.core.events import CallbackSet
 from software_app.core.models import DownloadTask, FileRecord, ProgressEvent, TargetPreview, classify_file
@@ -110,6 +116,7 @@ def _request_public_url(
     *,
     timeout: tuple[int, int],
     headers: dict[str, str] | None = None,
+    cancel_event=None,
 ) -> requests.Response:
     """Fetch a public URL while validating every redirect before following it."""
     current_url = _validate_public_destination(raw_url)
@@ -117,6 +124,7 @@ def _request_public_url(
     original = urlparse(current_url)
     original_origin = (original.scheme, str(original.hostname or "").casefold(), original.port)
     for redirect_count in range(MAX_HTTP_REDIRECTS + 1):
+        HTTP_BACKOFF.wait(current_url, cancel_event)
         response = session.get(
             current_url,
             stream=True,
@@ -125,6 +133,8 @@ def _request_public_url(
             headers=request_headers,
         )
         if response.status_code not in HTTP_REDIRECT_STATUSES:
+            if response.status_code in {429, 503}:
+                HTTP_BACKOFF.defer(current_url, retry_after_seconds(response.headers.get("Retry-After"), 1.0))
             return response
         location = str(response.headers.get("Location") or "").strip()
         response.close()
@@ -137,7 +147,12 @@ def _request_public_url(
         next_origin = (next_parts.scheme, str(next_parts.hostname or "").casefold(), next_parts.port)
         if next_origin != original_origin:
             sensitive_headers = {"authorization", "proxy-authorization", "cookie"}
-            if session.auth or any(
+            cookies = getattr(session, "cookies", None)
+            unscoped_cookies = (
+                bool(cookies) if isinstance(cookies, dict)
+                else isinstance(cookies, CookieJar) and any(not cookie.domain for cookie in cookies)
+            )
+            if session.auth or unscoped_cookies or any(
                 str(key).casefold() in sensitive_headers for key in session.headers
             ) or any(
                 str(key).casefold() in sensitive_headers for key in request_headers
@@ -332,7 +347,7 @@ class WebPageCrawler:
         skipped = 0
         last_error = ""
         for index, candidate in enumerate(candidates[:max_files], 1):
-            if cancel_event.is_set():
+            if task_cancelled(cancel_event):
                 raise TaskCancelled("任务已取消")
             media_retries = max(1, min(int(task.options.get("media_retries") or 3), 6))
             record = None
@@ -348,6 +363,7 @@ class WebPageCrawler:
                             max_file_bytes,
                             task,
                             final_url,
+                            cancel_event=cancel_event,
                         )
                     else:
                         record = self._download_candidate(
@@ -376,8 +392,8 @@ class WebPageCrawler:
                             f"资源下载失败，重试 {attempt}/{media_retries}: {candidate.url} | {exc}",
                         )
                     )
-                    if cancel_event.wait(min(5.0, 0.8 * (2 ** (attempt - 1)))):
-                        raise TaskCancelled("任务已取消")
+                    if task_wait(cancel_event, min(5.0, 0.8 * (2 ** (attempt - 1)))):
+                        raise TaskCancelled("任务已取消") from None
             if record is None:
                 skipped += 1
                 callbacks.on_progress(
@@ -411,13 +427,13 @@ class WebPageCrawler:
         cancel_event: threading.Event,
         options: dict | None = None,
     ) -> tuple[str, str]:
-        if cancel_event.is_set():
+        if task_cancelled(cancel_event):
             raise TaskCancelled("任务已取消")
         options = options or {}
         connect_timeout = max(10, min(int(options.get("page_connect_timeout") or 20), 120))
         read_timeout = max(30, min(int(options.get("page_read_timeout") or 60), 600))
         with _request_public_url(
-            session, url, timeout=(connect_timeout, read_timeout)
+            session, url, timeout=(connect_timeout, read_timeout), cancel_event=cancel_event
         ) as response:
             response.raise_for_status()
             final_url = normalize_page_url(response.url)
@@ -427,7 +443,7 @@ class WebPageCrawler:
             chunks: list[bytes] = []
             size = 0
             for chunk in response.iter_content(chunk_size=64 * 1024):
-                if cancel_event.is_set():
+                if task_cancelled(cancel_event):
                     raise TaskCancelled("任务已取消")
                 if not chunk:
                     continue
@@ -457,6 +473,7 @@ class WebPageCrawler:
         with _request_public_url(
             session,
             candidate.url,
+            cancel_event=cancel_event,
             timeout=(connect_timeout, read_timeout),
             headers=headers,
         ) as response:
@@ -480,28 +497,33 @@ class WebPageCrawler:
             destination.parent.mkdir(parents=True, exist_ok=True)
             source_temporary = destination.with_name(destination.stem + f".source{suffix}.part")
             conversion_source = source_temporary.with_suffix("")
-            size = 0
-            try:
-                with source_temporary.open("wb") as output:
-                    for chunk in response.iter_content(chunk_size=128 * 1024):
-                        if cancel_event.is_set():
-                            raise TaskCancelled("任务已取消")
-                        if not chunk:
-                            continue
-                        size += len(chunk)
-                        if size > max_bytes:
-                            raise ValueError("资源超过单文件大小限制")
-                        output.write(chunk)
-                os.replace(source_temporary, conversion_source)
-                convert_media_file(conversion_source, destination, final_suffix)
-                size = destination.stat().st_size
-            finally:
-                for temporary in (source_temporary, conversion_source):
-                    if temporary.exists():
-                        try:
-                            temporary.unlink()
-                        except OSError:
-                            pass
+            with media_output(destination, task.options.get("file_conflict", "reuse"), cancel_event,
+                              related_paths=(conversion_source,)) as destination:
+                from software_app.core.file_conflict import reuse_existing
+                reused = reuse_existing(destination, task.options.get("file_conflict", "reuse"))
+                size = destination.stat().st_size if reused else 0
+                try:
+                    if not reused:
+                        with source_temporary.open("wb") as output:
+                            for chunk in limited_chunks(response, cancel_event):
+                                if task_cancelled(cancel_event):
+                                    raise TaskCancelled("任务已取消")
+                                if not chunk:
+                                    continue
+                                size += len(chunk)
+                                if size > max_bytes:
+                                    raise ValueError("资源超过单文件大小限制")
+                                output.write(chunk)
+                        os.replace(source_temporary, conversion_source)
+                        convert_media_file(conversion_source, destination, final_suffix, cancel_event=cancel_event)
+                    size = destination.stat().st_size
+                finally:
+                    for temporary in (source_temporary, conversion_source):
+                        if temporary.exists():
+                            try:
+                                temporary.unlink()
+                            except OSError:
+                                pass
         return FileRecord(
             path=destination.resolve(),
             module_id=task.module_id,
@@ -523,7 +545,11 @@ class WebPageCrawler:
         max_bytes: int,
         task: DownloadTask,
         page_url: str,
+        *, cancel_event=None,
     ) -> FileRecord:
+        cancel_event = cancel_event if cancel_event is not None else threading.Event()
+        if task_cancelled(cancel_event):
+            raise TaskCancelled("任务已取消")
         data = bytes(getattr(payload, "data", b""))
         content_type = str(getattr(payload, "content_type", "") or "").split(";", 1)[0].strip().lower()
         final_media_url = normalize_page_url(str(getattr(payload, "final_url", "") or candidate.url))
@@ -543,17 +569,21 @@ class WebPageCrawler:
         destination.parent.mkdir(parents=True, exist_ok=True)
         source_temporary = destination.with_name(destination.stem + f".source{suffix}.part")
         conversion_source = source_temporary.with_suffix("")
-        try:
-            source_temporary.write_bytes(data)
-            os.replace(source_temporary, conversion_source)
-            convert_media_file(conversion_source, destination, final_suffix)
-        finally:
-            for temporary in (source_temporary, conversion_source):
-                if temporary.exists():
-                    try:
-                        temporary.unlink()
-                    except OSError:
-                        pass
+        with media_output(destination, task.options.get("file_conflict", "reuse"), cancel_event,
+                          related_paths=(conversion_source,)) as destination:
+            from software_app.core.file_conflict import reuse_existing
+            try:
+                if not reuse_existing(destination, task.options.get("file_conflict", "reuse")):
+                    source_temporary.write_bytes(data)
+                    os.replace(source_temporary, conversion_source)
+                    convert_media_file(conversion_source, destination, final_suffix, cancel_event=cancel_event)
+            finally:
+                for temporary in (source_temporary, conversion_source):
+                    if temporary.exists():
+                        try:
+                            temporary.unlink()
+                        except OSError:
+                            pass
         return FileRecord(
             path=destination.resolve(),
             module_id=task.module_id,

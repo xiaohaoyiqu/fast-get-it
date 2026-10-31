@@ -2,7 +2,6 @@ import ast
 import io
 import json
 import sqlite3
-import sys
 import tempfile
 import threading
 import time
@@ -69,6 +68,10 @@ from software_app.adapters.twitter import TwitterNativeAdapter, normalize_target
 
 
 class NativeCrawlerTargetTests(unittest.TestCase):
+    def setUp(self):
+        validation = patch("software_app.crawlers.common.validate_external_url", side_effect=lambda url: url)
+        validation.start()
+        self.addCleanup(validation.stop)
     class _Link:
         def __init__(self, href: str, text: str = "", **attributes):
             self.text = text
@@ -170,7 +173,9 @@ class NativeCrawlerTargetTests(unittest.TestCase):
         )
         payload = io.BytesIO()
         Image.new("RGB", (4, 4), (10, 20, 30)).save(payload, format="PNG")
-        crawler._get_response = lambda _url, timeout: type("Response", (), {"content": payload.getvalue()})()
+        crawler._get_response = lambda _url, timeout, **_kwargs: type("Response", (), {
+            "iter_content": lambda self, **kwargs: iter([payload.getvalue()]), "close": lambda self: None,
+        })()
         records = []
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             task = DownloadTask("jm-image", "jmcomic", "123", Path(directory),
@@ -477,12 +482,12 @@ class NativeCrawlerTargetTests(unittest.TestCase):
                 options={"input_kind": "work", "image_format": "original", "filter_ai": False},
             )
 
-            def fake_download(_session, _url, destination, _cancel_event):
+            def fake_download(_session, _url, destination, _cancel_event, **_kwargs):
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes(b"image")
-                return 5
+                Image.new("RGB", (8, 8), "blue").save(destination, format="JPEG")
+                return destination.stat().st_size
 
-            with patch("software_app.crawlers.pixiv.client.download_file", side_effect=fake_download):
+            with patch("software_app.crawlers.common.download_file", side_effect=fake_download):
                 crawler.download(
                     task,
                     CallbackSet(on_progress=progress.append, on_file=files.append),
@@ -504,7 +509,7 @@ class NativeCrawlerTargetTests(unittest.TestCase):
                     Image.new("RGB", (8, 8), color).save(image_bytes, format="JPEG")
                     archive.writestr(filename, image_bytes.getvalue())
 
-            def fake_download(_session, _url, destination, _cancel_event):
+            def fake_download(_session, _url, destination, _cancel_event, **_kwargs):
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(archive_bytes.getvalue())
                 return destination.stat().st_size
@@ -560,7 +565,8 @@ class NativeCrawlerTargetTests(unittest.TestCase):
             adapter = PixivNativeAdapter()
             adapter.runtime_data_dir = root / "runtime"
             self.assertEqual(adapter.import_cookie_file(source), 2)
-            saved = json.loads((adapter.runtime_data_dir / "cookies.json").read_text(encoding="utf-8"))
+            records = json.loads((adapter.runtime_data_dir / "cookies.json").read_text(encoding="utf-8"))
+            saved = {item["name"]: item["value"] for item in records}
             self.assertEqual(saved["PHPSESSID"], "12345_token")
             self.assertEqual(adapter.cookie_account_id(), "12345")
             self.assertFalse(any("Pixiv PHPSESSID" in warning for warning in adapter.validate()))
@@ -773,6 +779,12 @@ class NativeCrawlerTargetTests(unittest.TestCase):
             headers = {"Content-Type": "text/html; charset=utf-8"}
             text = "<!doctype html><html><title>Just a moment</title></html>"
 
+            def iter_content(self, **_kwargs):
+                yield self.text.encode("utf-8")
+
+            def close(self):
+                pass
+
             @staticmethod
             def raise_for_status():
                 return None
@@ -800,6 +812,10 @@ class NativeCrawlerTargetTests(unittest.TestCase):
 
         class UnauthorizedResponse:
             status_code = 401
+            headers = {}
+
+            def close(self):
+                pass
 
         client.session.get = lambda *_args, **_kwargs: UnauthorizedResponse()
         with self.assertRaisesRegex(PermissionError, "AVS 已失效"):
@@ -827,6 +843,9 @@ class NativeCrawlerTargetTests(unittest.TestCase):
         crawler = object.__new__(JmComicCrawler)
         crawler._get_response = lambda _url, timeout: type("Response", (), {
             "text": "<html>Restricted Access!</html>", "apparent_encoding": "utf-8", "encoding": "",
+            "headers": {}, "raise_for_status": lambda self: None,
+            "iter_content": lambda self, **kwargs: iter([self.text.encode("utf-8")]),
+            "close": lambda self: None,
         })()
         with self.assertRaisesRegex(PermissionError, "更换可用域名"):
             crawler._get_text("https://18comic.test/")
@@ -835,6 +854,7 @@ class NativeCrawlerTargetTests(unittest.TestCase):
         class Response:
             def __init__(self, status_code):
                 self.status_code = status_code
+                self.headers = {}
                 self.closed = False
 
             def close(self):
@@ -930,8 +950,17 @@ class NativeCrawlerTargetTests(unittest.TestCase):
         self.assertEqual(rows[-1]["handle"], "OpenAI")
         self.assertEqual(rows[-1]["source"], "direct_handle")
 
-    def test_twitter_online_preview_uses_current_python_runtime(self):
-        self.assertIs(twitter_adapter_module.sys, sys)
+    def test_twitter_online_preview_runs_in_process(self):
+        adapter = TwitterNativeAdapter()
+        payload = {"handle": "example"}
+        with patch.object(adapter, "_ensure_runtime_files"), patch.object(
+            twitter_adapter_module, "collect_profile_preview", return_value=payload
+        ) as collect:
+            result = adapter.fetch_profile_preview("example", timeout_seconds=45, proxy_url="http://127.0.0.1:7890")
+        self.assertEqual(result["source"], "live_profile")
+        self.assertEqual(collect.call_args.kwargs["target"], "example")
+        self.assertEqual(collect.call_args.kwargs["page_load_timeout"], 30)
+        self.assertEqual(collect.call_args.kwargs["proxy_url"], "http://127.0.0.1:7890")
 
     def test_twitter_home_is_not_mistaken_for_a_user_named_home(self):
         self.assertEqual(target_to_handle("https://x.com/home"), "")
@@ -2125,7 +2154,9 @@ class TaskLifecycleTests(unittest.TestCase):
 
             self.assertNotEqual(restarted.task_id, failed.task_id)
             self.assertEqual(restarted.target, "target")
-            self.assertEqual(restarted.options, {"types": "1"})
+            self.assertEqual(restarted.options, {**failed.options, "_retry_of": failed.task_id})
+            self.assertEqual(restarted.options["types"], "1")
+            self.assertEqual(restarted.options["_task_concurrency_total"], 1)
             self.assertEqual(completed, [(restarted.task_id, "completed")])
 
     def test_retried_task_accepts_current_output_format_overrides(self):

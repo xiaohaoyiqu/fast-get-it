@@ -11,12 +11,14 @@ from urllib.parse import urlparse
 
 import requests
 
-from software_app.core.adapter import TaskCancelled
 from software_app.core.events import CallbackSet
-from software_app.core.models import DownloadTask, FileRecord, ProgressEvent, TargetPreview, classify_file
+from software_app.core.models import DownloadTask, FileRecord, TargetPreview, classify_file
+from software_app.core.network_policy import HTTP_BACKOFF, record_http_backoff
+from software_app.crawlers.common import request_get
+from software_app.core.response_read import read_response_text
+from software_app.core.media_results import media_descriptor, retry_folder, refreshed_media, run_media_jobs
 from software_app.crawlers.common import (
-    convert_media_file,
-    download_file,
+    download_media_file,
     extension_from_url,
     make_session,
     normalized_media_extension,
@@ -38,7 +40,8 @@ class InstagramTarget:
     @property
     def url(self) -> str:
         if self.kind in {"post", "reel", "tv"}:
-            return f"https://www.instagram.com/{self.kind}/{self.shortcode}/"
+            route = "p" if self.kind == "post" else self.kind
+            return f"https://www.instagram.com/{route}/{self.shortcode}/"
         return f"https://www.instagram.com/{self.username}/"
 
 
@@ -198,12 +201,15 @@ class InstagramClient:
         )
 
     def fetch(self, target: InstagramTarget) -> dict:
-        response = self.session.get(target.url, timeout=(10, 45))
-        if response.status_code == 429:
-            raise RuntimeError("Instagram 请求过于频繁，请稍后重试")
-        response.raise_for_status()
-        page = response.text
-        final_path = urlparse(str(response.url)).path.lower()
+        HTTP_BACKOFF.wait(target.url)
+        response = request_get(self.session, target.url, timeout=(10, 45))
+        try:
+            record_http_backoff(response, target.url)
+            response.raise_for_status()
+            page = read_response_text(response)
+            final_path = urlparse(str(response.url)).path.lower()
+        finally:
+            response.close()
         if "/accounts/login" in final_path or 'name="login"' in page[:300000].lower():
             raise PermissionError("Instagram 要求登录；请导入当前浏览器的 Instagram Cookie")
         if "challenge" in final_path:
@@ -242,6 +248,24 @@ class InstagramClient:
                  "title": preview.title, "source": f"Instagram {mode}", "input_kind": target.kind}]
 
     def download(self, task: DownloadTask, callbacks: CallbackSet, cancel_event: threading.Event) -> None:
+        if "_retry_media" in task.options:
+            cache = {}
+
+            def retry(item):
+                target = parse_instagram_target(item["target"])
+                if item["target"] not in cache:
+                    cache[item["target"]] = self.fetch(target)
+                payload = cache[item["target"]]
+                media = refreshed_media(payload.get("media") or [], item)
+                author = str(payload.get("username") or target.username or media.get("author") or "unknown")
+                url = _safe_media_url(media.get("url"))
+                if not url:
+                    raise ValueError("原媒体地址不受信任")
+                return self._download_media(task, media, url, retry_folder(task, item), int(item["index"]), author, target, cancel_event)
+
+            run_media_jobs(task, callbacks, cancel_event,
+                           [(item, lambda item=item: retry(item)) for item in task.options["_retry_media"]])
+            return
         target = parse_instagram_target(task.target)
         payload = self.fetch(target)
         media = list(payload.get("media") or [])
@@ -254,30 +278,23 @@ class InstagramClient:
         root = platform_output_root(task.output_dir, "instagram")
         author = str(payload.get("username") or target.username or media[0].get("author") or "unknown")
         folder = root / safe_component(author) / safe_component(target.shortcode or "profile", max_length=80)
-        completed = 0
-        errors: list[str] = []
+        jobs = []
         for index, item in enumerate(media[:limit], 1):
-            if cancel_event.is_set():
-                raise TaskCancelled("任务已取消")
             kind = str(item.get("type") or "")
             if (kind == "image" and "1" not in types) or (kind == "video" and "2" not in types):
                 continue
             url = _safe_media_url(item.get("url"))
-            if not url:
-                continue
-            try:
-                record = self._download_media(task, item, url, folder, index, author, target, cancel_event)
-            except (OSError, requests.RequestException, RuntimeError, ValueError) as exc:
-                errors.append(str(exc))
-                callbacks.on_progress(ProgressEvent(task.task_id, "instagram", "warning", f"媒体 {index} 下载失败：{exc}"))
-                continue
-            completed += 1
-            callbacks.on_file(record)
-            callbacks.on_progress(ProgressEvent(task.task_id, "instagram", "info",
-                f"已保存 {completed}/{min(len(media), limit)}：{record.path.name}", current=completed,
-                total=min(len(media), limit)))
-        if not completed:
-            raise RuntimeError(errors[0] if errors else "目标没有符合下载类型的媒体")
+            descriptor = media_descriptor(task, target.url, index, kind, str(item.get("url") or ""), folder)
+
+            def download(item=item, url=url, index=index):
+                if not url:
+                    raise ValueError("Instagram 返回了不受信任的媒体地址")
+                return self._download_media(task, item, url, folder, index, author, target, cancel_event)
+
+            jobs.append((descriptor, download))
+        if not jobs:
+            raise ValueError("目标没有符合下载类型的媒体")
+        run_media_jobs(task, callbacks, cancel_event, jobs)
 
     def _download_media(self, task: DownloadTask, item: dict, url: str, folder: Path, index: int,
                         author: str, target: InstagramTarget, cancel_event: threading.Event) -> FileRecord:
@@ -292,12 +309,13 @@ class InstagramClient:
         stem = safe_component(f"{item.get('published_at') or 'unknown'}_{target.shortcode or item.get('post_id') or 'media'}_{index:02d}")
         source = folder / f".{stem}.source{source_suffix}"
         destination = folder / f"{stem}{output_suffix}"
-        download_file(self.session, url, source, cancel_event)
-        convert_media_file(source, destination, output_suffix)
+        result = download_media_file(self.session, url, source, destination, cancel_event, output_suffix,
+                                     conflict_policy=task.options.get("file_conflict", "reuse"))
+        destination = result.path
         return FileRecord(destination, "instagram", task.task_id, classify_file(destination), destination.stat().st_size,
                           str(item.get("label") or payload_title(author, target)), url,
                           target.shortcode or str(item.get("post_id") or ""), str(item.get("author_id") or author), author,
-                          published_at=str(item.get("published_at") or ""), metadata={"post_url": target.url})
+                          published_at=str(item.get("published_at") or ""), metadata={"post_url": target.url, "reused": bool(result[1])})
 
 
 def payload_title(author: str, target: InstagramTarget) -> str:

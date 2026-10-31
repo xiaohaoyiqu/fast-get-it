@@ -2,24 +2,29 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import tkinter as tk
-import time
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from software_app.core.security import redact_sensitive_data
-from software_app.ui.desktop_support import retry_route_for_task
+from software_app.core.security import redact_sensitive_data, safe_error_message
+from software_app.core.adapter import TaskCancelled
+from software_app.core.collection_plan import collection_label
+from software_app.core.person_config import settings_source
+from software_app.ui.desktop_support import retry_route_for_task, bounded_int as _bounded_int
 from software_app.ui.platform_config import PLATFORM_CONTENT_SCOPES, TASK_STATUS_LABELS
 
 
 class TaskQueueTabMixin:
     def _build_tasks_tab(self) -> None:
+        self._media_export_cancel = None
         self._task_follow_order: list[str] = []
         self._task_programmatic_selection: set[str] = set()
         self._task_detail_refresh_pending = False
         self._last_task_detail_render_at = 0.0
         self._task_active_media: dict[str, int] = {}
         self._task_last_activity: dict[str, str] = {}
+        self._task_progress_state: dict[str, dict] = {}  # task_id -> {"current": int, "total": int, "status": str}
         self.task_activity_var = tk.StringVar(value="当前操作：等待任务")
         self.task_log_level_var = tk.StringVar(value="全部")
         self.task_log_search_var = tk.StringVar(value="")
@@ -31,6 +36,7 @@ class TaskQueueTabMixin:
         ttk.Label(task_header, text="下载任务", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(task_header, textvariable=self.task_summary_var, style="Small.TLabel").grid(row=0, column=1, sticky="e", padx=(8, 8))
         ttk.Button(task_header, text="刷新", command=self._refresh_tasks).grid(row=0, column=2, sticky="e")
+        ttk.Button(task_header, text="恢复中断任务", command=self._restore_interrupted_tasks).grid(row=0, column=3, padx=(6, 0))
         ttk.Progressbar(task_header, variable=self.task_progress_var, maximum=100, mode="determinate").grid(row=1, column=0, columnspan=3, sticky="ew", pady=(7, 0))
 
         task_panes = ttk.Panedwindow(self.tasks_tab, orient=tk.VERTICAL)
@@ -38,22 +44,26 @@ class TaskQueueTabMixin:
         task_list_panel = ttk.Frame(task_panes, style="Panel.TFrame")
         task_list_panel.columnconfigure(0, weight=1)
         task_list_panel.rowconfigure(0, weight=1)
-        columns = ("status", "module", "target", "updated")
+        columns = ("status", "module", "target", "activity", "updated")
         task_tree_frame, self.task_tree = self._create_scrollable_tree(task_list_panel, columns)
         self.task_tree.configure(selectmode="extended")
         self.task_tree.heading("status", text="状态")
         self.task_tree.heading("module", text="模块")
         self.task_tree.heading("target", text="目标")
+        self.task_tree.heading("activity", text="当前操作")
         self.task_tree.heading("updated", text="更新时间")
         self.task_tree.column("status", width=110, stretch=False)
         self.task_tree.column("module", width=120, stretch=False)
         self.task_tree.column("target", width=420)
+        self.task_tree.column("activity", width=300, minwidth=160)
         self.task_tree.column("updated", width=150, stretch=False)
         self.task_tree.tag_configure("running", background=self.palette["soft"])
+        self.task_tree.tag_configure("paused", background="#fef9c3")
         self.task_tree.tag_configure("cancelling", background="#fff7ed")
         self.task_tree.tag_configure("failed", background="#fef2f2")
         self.task_tree.tag_configure("cancelled", background="#f5f5f4")
         self.task_tree.tag_configure("completed", background="#f0fdf4")
+        self.task_tree.tag_configure("partial", background="#fff7ed")
         self.task_tree.bind("<<TreeviewSelect>>", self._task_selection_changed)
         self.task_tree.bind("<Double-Button-1>", self._use_double_clicked_task)
         task_tree_frame.grid(row=0, column=0, sticky="nsew")
@@ -65,7 +75,7 @@ class TaskQueueTabMixin:
         detail_header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         detail_header.columnconfigure(0, weight=1)
         ttk.Label(detail_header, textvariable=self.task_detail_var, style="Small.TLabel").grid(row=0, column=0, sticky="w")
-        self.task_retry_button = ttk.Button(detail_header, text="批量重试", style="Compact.TButton", command=self._retry_selected_task)
+        self.task_retry_button = ttk.Button(detail_header, text="按原设置重试", style="Compact.TButton", command=self._retry_selected_task)
         self.task_retry_button.grid(row=0, column=1, padx=(6, 0))
         self.task_cancel_button = ttk.Button(detail_header, text="批量取消", style="Compact.TButton", command=self._cancel_selected_task)
         self.task_cancel_button.grid(row=0, column=2, padx=(6, 0))
@@ -75,8 +85,24 @@ class TaskQueueTabMixin:
         self.task_use_button.grid(row=0, column=4, padx=(6, 0))
         self.task_folder_button = ttk.Button(detail_header, text="打开输出目录", style="Compact.TButton", command=self._open_selected_task_folder)
         self.task_folder_button.grid(row=0, column=5, padx=(6, 0))
+        self.task_pause_button = ttk.Button(detail_header, text="批量暂停", style="Compact.TButton", command=self._pause_selected_tasks)
+        self.task_pause_button.grid(row=1, column=1, padx=(6, 0), pady=(5, 0))
+        self.task_resume_button = ttk.Button(detail_header, text="批量恢复", style="Compact.TButton", command=self._resume_selected_tasks)
+        self.task_resume_button.grid(row=1, column=2, padx=(6, 0), pady=(5, 0))
+        ttk.Button(detail_header, text="按当前设置重试", style="Compact.TButton",
+                   command=lambda: self._retry_selected_task(use_current_settings=True)).grid(
+                       row=2, column=1, columnspan=2, sticky="w", padx=(6, 0), pady=(5, 0))
+        ttk.Button(detail_header, text="仅补未完成媒体", style="Compact.TButton",
+                   command=self._retry_unfinished_media).grid(row=1, column=3, padx=(6, 0), pady=(5, 0))
+        self.media_export_button = ttk.Button(detail_header, text="导出失败清单", style="Compact.TButton",
+                                             command=self._export_unfinished_media)
+        self.media_export_button.grid(row=1, column=4, padx=(6, 0), pady=(5, 0))
+        ttk.Button(detail_header, text="查看逐媒体结果", style="Compact.TButton",
+                   command=self._open_media_results).grid(row=1, column=5, padx=(6, 0), pady=(5, 0))
         for button in (
             self.task_retry_button,
+            self.task_pause_button,
+            self.task_resume_button,
             self.task_cancel_button,
             self.task_delete_button,
             self.task_use_button,
@@ -181,22 +207,30 @@ class TaskQueueTabMixin:
             task_id = str(row_data["task_id"])
             self.task_rows[task_id] = row_data
             status = str(row["status"])
+            if task_id in self._task_progress_state:
+                self._task_progress_state[task_id]["status"] = status
             counts[status] = counts.get(status, 0) + 1
             target = row["normalized_target"] or row["target"]
             self.task_tree.insert(
                 "",
                 tk.END,
                 iid=task_id,
-                values=(TASK_STATUS_LABELS.get(status, status), row["module_id"], target, row["updated_at"]),
+                values=(
+                    TASK_STATUS_LABELS.get(status, status),
+                    row["module_id"],
+                    target,
+                    self._task_activity_cell_text(task_id, status),
+                    row["updated_at"],
+                ),
                 tags=(status,),
             )
-        active = counts.get("queued", 0) + counts.get("running", 0) + counts.get("cancelling", 0)
         if not rows:
             self.task_summary_var.set("暂无任务")
         else:
             self.task_summary_var.set(
-                f"共 {len(rows)} · 进行中 {active} · 完成 {counts.get('completed', 0)} · "
-                f"失败 {counts.get('failed', 0)} · 已取消 {counts.get('cancelled', 0)}"
+                f"共 {len(rows)} · 运行 {counts.get('running', 0)} · 停止中 {counts.get('cancelling', 0)} · "
+                f"排队 {counts.get('queued', 0)} · 暂停 {counts.get('paused', 0)} · 完成 {counts.get('completed', 0)} · "
+                f"部分完成 {counts.get('partial', 0)} · 失败 {counts.get('failed', 0)} · 已取消 {counts.get('cancelled', 0)}"
             )
         if rows:
             restored = [task_id for task_id in selected_task_ids if task_id in self.task_rows]
@@ -207,6 +241,7 @@ class TaskQueueTabMixin:
             self.task_tree.focus(restored[0])
             self.task_tree.yview_moveto(max(0.0, min(scroll_fraction, 1.0)))
         self._render_selected_task()
+        self._recompute_task_progress()
         self._focus_followed_task()
 
     def _refresh_task_statuses(self) -> None:
@@ -224,6 +259,8 @@ class TaskQueueTabMixin:
             row_data = dict(row)
             task_id = str(row_data["task_id"])
             status = str(row_data.get("status") or "")
+            if task_id in self._task_progress_state:
+                self._task_progress_state[task_id]["status"] = status
             counts[status] = counts.get(status, 0) + 1
             previous = self.task_rows.get(task_id, {})
             if task_id in selected_before and str(previous.get("status") or "") != status:
@@ -233,20 +270,34 @@ class TaskQueueTabMixin:
                 TASK_STATUS_LABELS.get(status, status),
                 row_data.get("module_id") or "-",
                 row_data.get("normalized_target") or row_data.get("target") or "-",
+                self._task_activity_cell_text(task_id, status),
                 row_data.get("updated_at") or "",
             )
             if self.task_tree.exists(task_id):
                 self.task_tree.item(task_id, values=values, tags=(status,))
 
-        active = counts.get("queued", 0) + counts.get("running", 0) + counts.get("cancelling", 0)
         if not rows:
             self.task_summary_var.set("暂无任务")
         else:
-            self.task_summary_var.set(
-                f"共 {len(rows)} · 进行中 {active} · 完成 {counts.get('completed', 0)} · "
-                f"失败 {counts.get('failed', 0)} · 已取消 {counts.get('cancelled', 0)}"
+            summary_parts = [
+                f"共 {len(rows)}",
+                f"运行 {counts.get('running', 0)}",
+                f"等待 {counts.get('queued', 0)}",
+                f"暂停 {counts.get('paused', 0)}",
+            ]
+            if counts.get("cancelling", 0):
+                summary_parts.append(f"停止 {counts['cancelling']}")
+            summary_parts.extend(
+                (
+                    f"完成 {counts.get('completed', 0)}",
+                    f"部分完成 {counts.get('partial', 0)}",
+                    f"失败 {counts.get('failed', 0)}",
+                    f"取消 {counts.get('cancelled', 0)}",
+                )
             )
+            self.task_summary_var.set(" · ".join(summary_parts))
 
+        self._recompute_task_progress()
         self._focus_followed_task()
         selected_after = {str(task_id) for task_id in self.task_tree.selection()}
         if selected_status_changed and selected_after == selected_before:
@@ -277,15 +328,19 @@ class TaskQueueTabMixin:
             return
         rows = [self.task_rows.get(task_id) for task_id in self._task_follow_order]
         active = [
-            task_id for task_id, row in zip(self._task_follow_order, rows)
+            task_id for task_id, row in zip(self._task_follow_order, rows, strict=True)
             if row and str(row.get("status") or "") in {"running", "cancelling"}
         ]
         queued = [
-            task_id for task_id, row in zip(self._task_follow_order, rows)
+            task_id for task_id, row in zip(self._task_follow_order, rows, strict=True)
             if row and str(row.get("status") or "") == "queued"
         ]
-        if active or queued:
-            task_id = (active or queued)[0]
+        paused = [
+            task_id for task_id, row in zip(self._task_follow_order, rows, strict=True)
+            if row and str(row.get("status") or "") == "paused"
+        ]
+        if active or queued or paused:
+            task_id = (active or queued or paused)[0]
         else:
             # Keep the final task visible after the batch finishes.
             task_id = next(
@@ -329,7 +384,7 @@ class TaskQueueTabMixin:
 
     def _task_can_retry(self, row: dict) -> bool:
         status = str(row.get("status") or "")
-        if status in {"failed", "cancelled"}:
+        if status in {"partial", "failed", "cancelled"}:
             return True
         if status != "completed" or str(row.get("module_id") or "") != "website":
             return False
@@ -345,6 +400,8 @@ class TaskQueueTabMixin:
             self._write_text(self.task_detail_text, "任务队列为空，或尚未选择任务。")
             for button in (
                 self.task_retry_button,
+                self.task_pause_button,
+                self.task_resume_button,
                 self.task_cancel_button,
                 self.task_delete_button,
                 self.task_use_button,
@@ -358,7 +415,9 @@ class TaskQueueTabMixin:
             return
 
         retryable = [row for row in rows if self._task_can_retry(row)]
-        cancellable = [row for row in rows if str(row.get("status")) in {"queued", "running", "cancelling"}]
+        cancellable = [row for row in rows if str(row.get("status")) in {"queued", "running", "cancelling", "paused"}]
+        self.task_pause_button.state(["!disabled"] if any(row.get("status") in {"queued", "running"} for row in rows) else ["disabled"])
+        self.task_resume_button.state(["!disabled"] if any(row.get("status") == "paused" for row in rows) else ["disabled"])
         selected_modules = {str(row.get("module_id") or "") for row in rows}
         self.task_retry_button.state(["!disabled"] if retryable else ["disabled"])
         self.task_cancel_button.state(["!disabled"] if cancellable else ["disabled"])
@@ -408,16 +467,29 @@ class TaskQueueTabMixin:
             f"目标: {target}",
             f"原始输入: {row.get('target') or '-'}",
             f"输出目录: {row.get('output_dir') or '-'}",
+            f"设置来源: {settings_source(options)}",
             f"创建: {row.get('created_at') or '-'}",
             f"开始: {row.get('started_at') or '-'}",
             f"结束: {row.get('finished_at') or '-'}",
         ]
         error = str(row.get("error") or "").strip()
+        summary = self.storage.media_summary(task_id)
+        try:
+            collection = self.storage.collection_plan(task_id)
+            if collection:
+                label = collection_label(collection["kind"])
+                lines.append(f"{label}范围快照：{len(collection['ids'])} 个作品；按原设置重试沿用，按当前设置重试重新发现")
+                lines.append("作品 ID：" + ", ".join(collection["ids"]))
+        except (ValueError, TypeError):
+            lines.append("集合范围快照损坏：恢复或按原设置重试时将拒绝使用，请重新创建任务")
+        if summary:
+            lines.append(f"媒体结果：保存 {summary.get('saved', 0)} / 复用 {summary.get('reused', 0)} / "
+                         f"失败 {summary.get('failed', 0)} / 待处理 {summary.get('pending', 0)} / 已补全 {summary.get('repaired', 0)}")
         if error:
             lines.extend(("", "错误:", error))
         visible_options = {
             key: value for key, value in options.items()
-            if not str(key).startswith("_task_concurrency_")
+            if not str(key).startswith("_task_concurrency_") and key not in {"_retry_media", "_media_retry_of"}
         }
         lines.extend(("", "参数:", json.dumps(redact_sensitive_data(visible_options), ensure_ascii=False, indent=2)))
         lines.extend(("", f"日志（显示 {len(filtered_logs)} / {len(logs)}）:"))
@@ -458,11 +530,47 @@ class TaskQueueTabMixin:
             self._task_last_activity[task_id] = message
         elif message:
             self._task_last_activity[task_id] = message
+        row = self.task_rows.get(task_id)
+        status = str(row.get("status") or getattr(event, "status", "running")) if row else str(
+            getattr(event, "status", "running")
+        )
+        if self.task_tree.exists(task_id):
+            values = list(self.task_tree.item(task_id, "values"))
+            if len(values) >= 5:
+                values[3] = self._task_activity_cell_text(task_id, status, event=event)
+                self.task_tree.item(task_id, values=values)
         if task_id in {str(value) for value in self.task_tree.selection()}:
-            status = str(self.task_rows.get(task_id, {}).get("status") or "running")
             self._update_task_activity_label(task_id, status)
 
+    def _task_activity_cell_text(self, task_id: str, status: str, event=None) -> str:
+        if status == "paused":
+            return "已暂停；当前请求或转换到达检查点后停下"
+        active = self._task_active_media.get(task_id, 0)
+        latest = self._task_last_activity.get(task_id, "").replace("\n", " ").strip()
+        if event is not None:
+            current = getattr(event, "current", None)
+            total = getattr(event, "total", None)
+            percent = getattr(event, "percent", None)
+            if current is not None and total:
+                latest = f"{current}/{total} · {latest}" if latest else f"{current}/{total}"
+            elif percent is not None:
+                latest = f"{max(0.0, min(float(percent), 100.0)):.0f}% · {latest}" if latest else f"{percent:.0f}%"
+        if len(latest) > 150:
+            latest = latest[:147] + "…"
+        if active:
+            return f"下载/处理 {active} 项 · {latest}" if latest else f"下载/处理 {active} 项"
+        if latest:
+            return latest
+        if status == "queued":
+            return "等待平台并发槽位"
+        if status == "running":
+            return "任务已启动"
+        return TASK_STATUS_LABELS.get(status, status)
+
     def _update_task_activity_label(self, task_id: str, status: str) -> None:
+        if status == "paused":
+            self.task_activity_var.set("当前操作：已请求暂停；可恢复或取消任务")
+            return
         active = self._task_active_media.get(task_id, 0)
         latest = self._task_last_activity.get(task_id, "").replace("\n", " ").strip()
         if len(latest) > 180:
@@ -478,6 +586,29 @@ class TaskQueueTabMixin:
         else:
             text = f"当前操作：{TASK_STATUS_LABELS.get(status, status)}"
         self.task_activity_var.set(text)
+
+    def _recompute_task_progress(self) -> None:
+        """Aggregate progress across queued/running/paused tasks, retaining paused progress.
+
+        Each task that reports current/total contributes to the aggregate.
+        Tasks without detailed progress fall back to 3% (queued) or 8% (running).
+        """
+        active = [
+            s for s in self._task_progress_state.values()
+            if s.get("status") in {"queued", "running", "paused"}
+        ]
+        if not active:
+            return
+        total_current = sum(float(s.get("current", 0) or 0) for s in active)
+        total_total = sum(float(s.get("total", 0) or 0) for s in active)
+        if total_total > 0:
+            pct = min(100.0, total_current / total_total * 100.0)
+            self.task_progress_var.set(max(3.0, pct))
+        else:
+            if all(s.get("status") == "paused" for s in active):
+                return
+            any_running = any(s.get("status") == "running" for s in active)
+            self.task_progress_var.set(8.0 if any_running else 3.0)
 
     def _clear_selected_task_logs(self) -> None:
         rows = self._selected_task_rows()
@@ -544,7 +675,7 @@ class TaskQueueTabMixin:
         self.status_var.set(f"已导出 {len(safe_logs)} 条日志：{path}")
         self._append_log(f"任务日志已导出：task={task_id}, count={len(safe_logs)}")
 
-    def _retry_selected_task(self) -> None:
+    def _retry_selected_task(self, *, use_current_settings: bool = False) -> None:
         rows = [row for row in self._selected_task_rows() if self._task_can_retry(row)]
         if not rows:
             messagebox.showwarning("未选择任务", "请先选择失败、已取消，或旧版零文件完成的相似图片任务")
@@ -573,6 +704,8 @@ class TaskQueueTabMixin:
             "确认批量重试",
             f"将为 {len(rows)} 个可重试任务新建下载任务：\n\n{summary}\n\n"
             f"目标：\n{chr(10).join(target_lines)}\n\n"
+            + ("将使用当前保存设置，并重新匹配人物配置（人物目录也可能变化）。\n" if use_current_settings else
+             "将沿用每个原任务的参数、人物配置快照和输出目录。\n") +
             "任务会重新进入队列，并按各平台并发设置运行。可能再次下载已有文件；是否继续？",
             parent=self,
         ):
@@ -582,14 +715,45 @@ class TaskQueueTabMixin:
         failures: list[str] = []
         callbacks = self._task_callbacks()
         seen: set[tuple[str, str, str]] = set()
+
+        def claim_retry(module_id, target, output_dir, _options):
+            key = (module_id, target.strip().casefold(), str(output_dir).casefold())
+            if key in seen or self.manager.has_active_task(*key):
+                raise ValueError("相同目标和实际输出目录已有运行中或本批重试任务")
+            seen.add(key)
+
         for row in rows:
             try:
+                if not use_current_settings:
+                    task = self.manager.retry_task(
+                        str(row["task_id"]), callbacks,
+                        allow_empty_completed=str(row.get("status")) == "completed",
+                        before_start=claim_retry,
+                    )
+                    created.append(task.task_id)
+                    self.current_task_id = task.task_id
+                    self.current_task_ids.add(task.task_id)
+                    self._append_log(f"按原设置重试 {row['task_id']} -> {task.task_id}")
+                    continue
                 original_module = str(row.get("module_id") or "")
                 target = str(row.get("target") or row.get("normalized_target") or "")
-                original_options = self._decode_task_options(row.get("options_json"))
+                original_options = json.loads(str(row.get("options_json") or "{}"))
+                if not isinstance(original_options, dict):
+                    raise ValueError("历史任务参数损坏，未重试")
+                for name in ("_person_config", "_settings_binding", "_task_override", "_keep_task_settings"):
+                    original_options.pop(name, None)
                 routed_module, options = retry_route_for_task(original_module, target, original_options)
                 format_options = self._saved_format_options()
-                common_postprocess_options = {**format_options, **self._saved_archive_options()}
+                common_postprocess_options = {
+                    **format_options,
+                    **self._saved_archive_options(),
+                    "types": self._selected_types(),
+                    "proxy_url": str(self.storage.get_setting("proxy_url", "") or ""),
+                    "retries": _bounded_int(self.storage.get_setting("task_retries", 1), 1, 0, 5),
+                    "save_unfinished_txt": bool(self.storage.get_setting("save_unfinished_txt", False)),
+                    "rename_downloads": bool(self.storage.get_setting("rename_downloads", True)),
+                    "delete_source_after_rename": bool(self.storage.get_setting("delete_source_after_rename", True)),
+                }
                 options.update(common_postprocess_options)
                 retry_overrides = dict(common_postprocess_options)
                 if routed_module == "pixiv":
@@ -640,28 +804,12 @@ class TaskQueueTabMixin:
                         }
                     )
                     options.update(retry_overrides)
-                output_dir = Path(str(row.get("output_dir") or self.output_dir_var.get()))
-                retry_key = (routed_module, target.strip().casefold(), str(output_dir).casefold())
-                if retry_key in seen or self.manager.has_active_task(*retry_key):
-                    failures.append(f"{row['task_id']}: 相同目标已有运行中或本批重试任务")
-                    continue
-                seen.add(retry_key)
-                if routed_module != original_module or options != original_options:
-                    options.setdefault("types", self._selected_types())
-                    task = self.manager.start_task(
-                        routed_module,
-                        target,
-                        output_dir,
-                        options,
-                        callbacks,
-                    )
-                else:
-                    task = self.manager.retry_task(
-                        str(row["task_id"]),
-                        callbacks,
-                        allow_empty_completed=str(row.get("status")) == "completed",
-                        option_overrides=retry_overrides,
-                    )
+                task = self.manager.retry_task(
+                    str(row["task_id"]), callbacks,
+                    allow_empty_completed=str(row.get("status")) == "completed",
+                    option_overrides=options, use_current_settings=True,
+                    before_start=claim_retry,
+                )
             except Exception as exc:  # noqa: BLE001
                 failures.append(f"{row['task_id']}: {exc}")
                 continue
@@ -675,19 +823,161 @@ class TaskQueueTabMixin:
         self.task_progress_var.set(3.0)
         self.status_var.set(f"已重新创建 {len(created)} 个任务")
         self._refresh_tasks()
+        # 显式选中第一个新任务并立即渲染详情，确保重试任务的日志从一开始就实时显示；
+        # 之后由 _follow_task_batch 维持跟随行为。
+        first_new = str(created[0])
+        if self.task_tree.exists(first_new) and set(self.task_tree.selection()) != {first_new}:
+            self._task_programmatic_selection = {first_new}
+            self.task_tree.selection_set(first_new)
+            self.task_tree.focus(first_new)
+            self._render_selected_task()
         self._follow_task_batch(created)
         if failures:
             self._append_log(f"另有 {len(failures)} 个任务重试失败：{failures[0]}")
 
+    def _retry_unfinished_media(self) -> None:
+        rows = self._selected_task_rows()
+        created, errors = [], []
+        for row in rows:
+            try:
+                target = str(row["target"])
+                if self.manager.has_active_task(str(row["module_id"]), target, str(row["output_dir"])):
+                    raise ValueError("相同目标已有运行中的任务")
+                task = self.manager.retry_task(str(row["task_id"]), self._task_callbacks(), failed_only=True)
+                created.append(task.task_id)
+                self.current_task_ids.add(task.task_id)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{row['task_id']}: {safe_error_message(exc)}")
+        if created:
+            self.current_task_id = created[0]
+            self._refresh_tasks()
+            self._follow_task_batch(created)
+            self.status_var.set(f"已创建 {len(created)} 个补下任务；仅处理已记录的未完成媒体")
+        if errors or not rows:
+            messagebox.showwarning("补下未完成媒体", "\n".join(errors[:8]) if errors else "请先选择任务")
+
+    def _open_media_results(self):
+        from software_app.ui.media_results import MediaResultsDialog
+
+        rows = self._selected_task_rows()
+        if len(rows) != 1:
+            messagebox.showinfo("逐媒体结果", "请选择一个任务查看媒体明细")
+            return
+        MediaResultsDialog(self, str(rows[0]["task_id"]))
+
+    def _retry_media_subset(self, task_id, keys):
+        row = self.storage.get_task(task_id)
+        if row is None:
+            raise ValueError("原任务记录已被清理")
+        if self.manager.has_active_task(str(row["module_id"]), str(row["target"]), str(row["output_dir"])):
+            raise ValueError("相同目标已有运行中的任务，请结束后再补下")
+        task = self.manager.retry_task(task_id, self._task_callbacks(), failed_only=True, media_keys=keys)
+        self.current_task_id = task.task_id
+        self.current_task_ids.add(task.task_id)
+        self._refresh_tasks()
+        self._follow_task_batch([task.task_id])
+        return task
+
+    def _export_unfinished_media(self) -> None:
+        if self._media_export_cancel is not None:
+            self._media_export_cancel.set()
+            self.media_export_button.configure(text="正在取消…", state="disabled")
+            return
+        identifiers = [str(row["task_id"]) for row in self._selected_task_rows()]
+        if not identifiers:
+            messagebox.showinfo("失败清单", "请先选择要导出清单的任务")
+            return
+        file_type = tk.StringVar(master=self, value="文本文件")
+        path = filedialog.asksaveasfilename(title="导出失败清单", defaultextension="", typevariable=file_type,
+                                          initialfile="未完成媒体清单", filetypes=[("文本文件", "*.txt"), ("CSV 表格", "*.csv")])
+        if not path:
+            return
+        if not Path(path).suffix:
+            path += ".csv" if file_type.get() == "CSV 表格" else ".txt"
+            if Path(path).exists() and not messagebox.askyesno("替换导出文件", f"文件已存在，是否替换？\n{path}", parent=self):
+                return
+        cancel_event = threading.Event()
+        self._media_export_cancel = cancel_event
+        self.media_export_button.configure(text="取消清单导出")
+        self.status_var.set("正在后台读取未完成媒体清单…")
+        storage, ui_queue = self.storage, self.ui_queue
+
+        def worker():
+            result = {"path": path}
+            try:
+                from software_app.core.media_export import export_unfinished_media
+
+                result["count"] = export_unfinished_media(storage, identifiers, path, cancel_event=cancel_event,
+                    on_progress=lambda current, total: ui_queue.put(("media_export_progress", (current, total))))
+            except TaskCancelled:
+                result["cancelled"] = True
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = safe_error_message(exc)
+            ui_queue.put(("media_export_done", result))
+
+        try:
+            threading.Thread(target=worker, name="media-export", daemon=True).start()
+        except RuntimeError as exc:
+            self._finish_media_export({"error": safe_error_message(exc)})
+
+    def _finish_media_export(self, result):
+        self._media_export_cancel = None
+        self.media_export_button.configure(text="导出失败清单", state="normal")
+        if result.get("error"):
+            self.status_var.set("失败清单导出未完成")
+            messagebox.showwarning("导出失败", result["error"])
+        elif result.get("cancelled"):
+            self.status_var.set("已取消失败清单导出")
+        else:
+            self.status_var.set(f"已导出 {result['count']} 项未完成媒体：{result['path']}")
+
     def _cancel_selected_task(self) -> None:
-        rows = [row for row in self._selected_task_rows() if str(row.get("status")) in {"queued", "running"}]
+        rows = [row for row in self._selected_task_rows() if str(row.get("status")) in {"queued", "running", "paused"}]
         if not rows:
-            messagebox.showwarning("未选择任务", "请先选择一个排队中或运行中的任务")
+            messagebox.showwarning("未选择任务", "请先选择一个排队中、运行中或已暂停的任务")
             return
         for row in rows:
             self.manager.cancel(str(row["task_id"]))
         self.status_var.set(f"正在取消 {len(rows)} 个任务")
         self._append_log(f"已请求批量取消 {len(rows)} 个所选任务")
+        self._refresh_tasks()
+
+    def _pause_selected_tasks(self) -> None:
+        self._change_selected_task_pause(paused=True)
+
+    def _restore_interrupted_tasks(self) -> None:
+        rows = self.storage.interrupted_tasks()
+        if not rows:
+            messagebox.showinfo("恢复中断任务", "没有可恢复的中断任务。主动取消的任务可用批量重试重新下载。")
+            return
+        if not messagebox.askyesno("恢复中断任务", f"恢复上次退出时中断的 {len(rows)} 个任务？\n\n"
+                                  "沿用原任务、参数和保存位置，重新读取目标；已有成品和可验证的续传文件会按原参数处理。"
+                                  "原暂停任务仍保持暂停。"):
+            return
+        restored, errors = [], []
+        for row in rows:
+            try:
+                task = self.manager.restore_interrupted_task(row["task_id"], self._task_callbacks())
+                restored.append(task.task_id)
+            except Exception as exc:
+                from software_app.core.security import safe_error_message
+                errors.append(safe_error_message(exc))
+        self._refresh_tasks()
+        self.status_var.set(f"已恢复 {len(restored)} 个中断任务")
+        if errors:
+            messagebox.showwarning("部分任务未恢复", f"已恢复 {len(restored)} 个，另有 {len(errors)} 个未恢复：\n{errors[0]}")
+
+    def _resume_selected_tasks(self) -> None:
+        self._change_selected_task_pause(paused=False)
+
+    def _change_selected_task_pause(self, *, paused: bool) -> None:
+        allowed = {"queued", "running"} if paused else {"paused"}
+        rows = [row for row in self._selected_task_rows() if row.get("status") in allowed]
+        action = self.manager.pause if paused else self.manager.resume
+        count = sum(bool(action(str(row["task_id"]))) for row in rows)
+        label = "暂停" if paused else "恢复"
+        self.status_var.set(f"已{label} {count} 个任务")
+        self._append_log(f"已{label} {count} 个所选任务")
         self._refresh_tasks()
 
     def _delete_selected_tasks(self) -> None:
@@ -711,8 +1001,9 @@ class TaskQueueTabMixin:
         self._refresh_tasks()
         self._refresh_library(scan=False)
         self.status_var.set(
-            f"已删除 {len(inactive)} 个任务记录"
+            f"已删除 {counts['tasks']} 个任务记录"
             + (f"；{len(active)} 个运行中任务停止后自动移除" if active else "")
+            + (f"；{len(inactive) - counts['tasks']} 个受保护或已变化的记录未删除" if len(inactive) > counts['tasks'] else "")
         )
         self._append_log(f"删除任务记录: tasks={len(inactive)}, pending={len(active)}, db={counts}")
 

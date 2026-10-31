@@ -9,6 +9,8 @@ from tkinter import filedialog, messagebox, ttk
 from urllib.parse import urlparse
 
 from software_app.core.blocklist import work_from_target
+from software_app.core.adapter import TaskCancelled
+from software_app.core.security import safe_error_message
 from software_app.core.exports import export_url_candidates
 from software_app.core.models import IMAGE_EXTENSIONS
 from software_app.crawlers.webpage import check_page_availability
@@ -801,14 +803,18 @@ class GoogleSearchTabMixin:
                 if cancel_event.is_set():
                     break
                 try:
-                    result = check_page_availability(url, proxy_url=proxy_url)
+                    result = check_page_availability(url, proxy_url=proxy_url, cancel_event=cancel_event)
+                except TaskCancelled:
+                    break
                 except Exception as exc:  # noqa: BLE001
                     result = {
                         "availability": "unknown",
                         "status_code": None,
                         "final_url": url,
-                        "message": str(exc).splitlines()[0],
+                        "message": safe_error_message(exc).splitlines()[0],
                     }
+                if cancel_event.is_set():
+                    break
                 checked += 1
                 missing += int(result.get("availability") == "missing")
                 restricted += int(result.get("availability") == "restricted")

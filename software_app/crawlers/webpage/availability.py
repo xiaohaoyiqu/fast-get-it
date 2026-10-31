@@ -5,7 +5,10 @@ from typing import Any
 import requests
 
 from software_app.crawlers.common import make_session
-from software_app.crawlers.webpage.client import normalize_page_url
+from software_app.crawlers.webpage.client import normalize_page_url, _request_public_url
+from software_app.core.adapter import TaskCancelled
+from software_app.core.security import safe_error_message
+from software_app.core.task_control import task_cancelled
 
 
 AVAILABILITY_LABELS = {
@@ -23,14 +26,17 @@ def check_page_availability(
     session: requests.Session | None = None,
     proxy_url: str = "",
     timeout: tuple[int, int] = (8, 15),
+    cancel_event=None,
 ) -> dict[str, Any]:
     """Classify definite HTTP absence without treating login/rate limits as deletion."""
 
+    if cancel_event is not None and task_cancelled(cancel_event):
+        raise TaskCancelled("候选链接检查已取消")
     url = normalize_page_url(raw_url)
-    client = session or make_session(proxy_url=proxy_url)
+    client = session if session is not None else make_session(proxy_url=proxy_url)
     response = None
     try:
-        response = client.get(url, stream=True, allow_redirects=True, timeout=timeout)
+        response = _request_public_url(client, url, timeout=timeout, cancel_event=cancel_event)
         status_code = int(response.status_code)
         final_url = str(response.url or url)
         if status_code in {404, 410}:
@@ -52,7 +58,7 @@ def check_page_availability(
             "final_url": final_url,
             "error": "",
         }
-    except requests.RequestException as exc:
+    except (requests.RequestException, ValueError) as exc:
         return {
             "availability": "unknown",
             "state": "unknown",
@@ -60,8 +66,12 @@ def check_page_availability(
             "status_code": None,
             "url": url,
             "final_url": "",
-            "error": str(exc),
+            "error": safe_error_message(exc),
         }
     finally:
-        if response is not None:
-            response.close()
+        try:
+            if response is not None:
+                response.close()
+        finally:
+            if session is None:
+                client.close()

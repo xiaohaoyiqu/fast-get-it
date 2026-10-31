@@ -15,7 +15,7 @@ from software_app.core.events import CallbackSet
 from software_app.core.models import DownloadTask, ModuleInfo, TargetPreview
 from software_app.core.settings import JMCOMIC_DATA_DIR, JMCOMIC_ROOT
 from software_app.crawlers.jmcomic import JmComicCrawler
-from software_app.crawlers.jmcomic.client import decode_scrambled_image, jm_response_text, segmentation_count
+from software_app.crawlers.jmcomic.client import decode_scrambled_image, segmentation_count
 from software_app.crawlers.common import load_cookie_file, load_request_header_profile
 
 
@@ -65,15 +65,16 @@ class JmComicNativeAdapter(CrawlerAdapter):
 
     def connection_status(self, options: dict | None = None) -> dict[str, str]:
         client = self._client(options)
-        response = client._get_response(client.domain + "/", timeout=(10, 45))
-        page = jm_response_text(response)
-        if "<html" not in page.casefold():
-            raise RuntimeError("JMComic 站点没有返回网页；请检查当前域名或代理")
-        if "Restricted Access!" in page:
-            raise PermissionError("JMComic 拒绝当前地区或网络访问；请更换可用域名或代理")
-        if "Could not connect to mysql!" in page:
-            raise RuntimeError("JMComic 服务器内部错误；请稍后重试")
-        effective = urlparse(str(response.url or client.domain))
+        probe = client.check_connection()
+        if not probe["ok"]:
+            error = str(probe.get("error") or "连接失败")
+            error_type = str(probe.get("error_type") or "")
+            if error_type in {"cloudflare_403", "cloudflare_503"}:
+                raise PermissionError(error)
+            if error_type in {"proxy_error", "connect_timeout", "read_timeout", "timeout", "connection_error"}:
+                raise TimeoutError(error)
+            raise RuntimeError(error)
+        effective = urlparse(str(probe.get("effective_url") or client.domain))
         effective_origin = f"{effective.scheme}://{effective.netloc}" if effective.scheme and effective.netloc else client.domain
         route = (
             f"入口 {client.domain}，实际访问 {effective_origin}"
@@ -81,7 +82,8 @@ class JmComicNativeAdapter(CrawlerAdapter):
             else client.domain
         )
         status = self.cookie_status()
-        return {"message": f"JMComic 站点已返回网页：{route}；{status['message']}", "effective_domain": effective_origin}
+        cf_note = "；Cloudflare 验证已通过" if probe.get("cloudflare_challenge") else ""
+        return {"message": f"JMComic 站点已连通：{route}（HTTP {probe['status_code']}{cf_note}）；{status['message']}", "effective_domain": effective_origin}
 
     def fetch_preview_image_bytes(
         self, url: str, options: dict | None = None, *, photo_id: str = "", scramble_id: str = ""

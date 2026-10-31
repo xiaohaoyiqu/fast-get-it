@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from software_app.core.task_control import task_cancelled
+
 import os
 import re
 import shutil
@@ -9,12 +11,15 @@ import time
 import unicodedata
 import uuid
 import zipfile
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
 
 from .adapter import TaskCancelled
 from .models import DownloadTask, FileRecord, classify_file
+from .file_conflict import media_output, reuse_existing, replace_output
+from .output_lock import output_paths_lock
 
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -28,10 +33,11 @@ _WINDOWS_RESERVED = {
 class ArchivePostprocessResult:
     records: list[FileRecord] = field(default_factory=list)
     removed_sources: list[Path] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 def _check_cancel(cancel_event: threading.Event | None) -> None:
-    if cancel_event is not None and cancel_event.is_set():
+    if cancel_event is not None and task_cancelled(cancel_event):
         raise TaskCancelled("归档后处理已取消")
 
 
@@ -51,7 +57,12 @@ def _existing_sources(source_files: Iterable[Path | str], destination: Path, bas
     sources: list[Path] = []
     seen: set[str] = set()
     for value in source_files:
-        path = Path(value).expanduser().resolve()
+        path = Path(os.path.abspath(Path(value).expanduser()))
+        if path.is_symlink():
+            continue
+        resolved = path.resolve()
+        if os.path.normcase(str(path)) != os.path.normcase(str(resolved)):
+            continue  # Do not archive or delete through linked parent directories.
         key = os.path.normcase(str(path))
         if key in seen or path == final:
             continue
@@ -66,6 +77,76 @@ def _existing_sources(source_files: Iterable[Path | str], destination: Path, bas
     return sources
 
 
+def _signature(value):
+    # Windows stat/lstat may expose creation time as ctime, while fstat exposes
+    # metadata change time (CPython #157671). Compare birth time across APIs;
+    # older Windows Python builds use creation time for both ctime fields.
+    timestamp = getattr(value, "st_birthtime_ns", value.st_ctime_ns) if os.name == "nt" else value.st_ctime_ns
+    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, timestamp)
+
+
+def _stream_signature(value):
+    # Within one API, retain change-time detection as well, including writes
+    # which restore mtime. Never compare this field to a path stat on Windows.
+    return (*_signature(value), value.st_ctime_ns)
+
+
+def _source_snapshot(path):
+    value = path.lstat()
+    if not stat.S_ISREG(value.st_mode) or path.resolve() != path:
+        raise ValueError(f"源文件已变为链接或非普通文件：{path.name}")
+    return _signature(value)
+
+
+def _digest_stream(stream, cancel_event):
+    digest = hashlib.sha256()
+    while True:
+        _check_cancel(cancel_event)
+        chunk = stream.read(1024 * 1024)
+        if not chunk:
+            return digest.digest()
+        digest.update(chunk)
+
+
+def _hash_source(path, expected, cancel_event):
+    if _source_snapshot(path) != expected:
+        raise ValueError(f"源文件已变化：{path.name}")
+    with path.open("rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if _signature(opened) != expected:
+            raise ValueError(f"源文件已被替换：{path.name}")
+        digest = _digest_stream(stream, cancel_event)
+        if _stream_signature(os.fstat(stream.fileno())) != _stream_signature(opened):
+            raise ValueError(f"源文件在读取时变化：{path.name}")
+    if _source_snapshot(path) != expected:
+        raise ValueError(f"源文件已被替换：{path.name}")
+    return digest
+
+
+def _cleanup_sources(sources, snapshots, digests, cancel_event, removed, warn):
+    # Preflight the entire set before deleting any source. Stat identity plus a
+    # content digest catches replacement and same-size/timestamp-preserving edits.
+    try:
+        for source in sources:
+            if _hash_source(source, snapshots[source], cancel_event) != digests[source]:
+                raise ValueError(f"源文件内容已变化：{source.name}")
+    except (OSError, ValueError) as exc:
+        warn(f"归档已保留；源文件复核失败，未执行本组清理：{exc}")
+        return
+    _check_cancel(cancel_event)
+    # Once deletion begins, finish this exact set. Keep changed or busy files and
+    # report only successful removals so the caller never drops their indexes.
+    for source in sources:
+        try:
+            if _source_snapshot(source) != snapshots[source]:
+                warn(f"源文件再次变化，已保留：{source.name}")
+                continue
+            source.unlink()
+            removed.append(source)
+        except (OSError, ValueError) as exc:
+            warn(f"源文件未清理，已保留文件索引：{source.name}（{exc}）")
+
+
 def create_verified_zip(
     source_files: Iterable[Path | str],
     destination: Path | str,
@@ -74,49 +155,83 @@ def create_verified_zip(
     cleanup_sources: bool = False,
     cancel_event: threading.Event | None = None,
     on_progress: ProgressCallback | None = None,
+    file_conflict: str = "reuse",
+    removed_sources: list[Path] | None = None,
+    warnings: list[str] | None = None,
 ) -> Path:
     """Create an atomic ZIP, verify every member, then optionally remove exact sources."""
-    final = Path(destination).expanduser().resolve()
+    requested = Path(destination).expanduser()
+    final = requested.parent.resolve() / requested.name
     root = Path(base_dir).expanduser().resolve()
     sources = _existing_sources(source_files, final, root)
     final.parent.mkdir(parents=True, exist_ok=True)
-    partial = final.with_name(f"{final.name}.partial-{uuid.uuid4().hex[:8]}")
-    try:
+    removed = removed_sources if removed_sources is not None else []
+
+    def warn(message):
+        if warnings is not None:
+            warnings.append(message)
+        elif on_progress is not None:
+            on_progress(len(sources), len(sources), message)
+
+    with media_output(final, file_conflict, cancel_event, related_paths=sources) as final:
         _check_cancel(cancel_event)
-        with zipfile.ZipFile(
-            partial, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True
-        ) as archive:
-            for index, source in enumerate(sources, 1):
-                _check_cancel(cancel_event)
-                arcname = source.relative_to(root).as_posix()
-                archive.write(source, arcname)
-                if on_progress is not None:
-                    on_progress(index, len(sources), f"正在压缩 {source.name}")
-        _check_cancel(cancel_event)
-        with zipfile.ZipFile(partial, "r") as archive:
-            broken = archive.testzip()
-            if broken:
-                raise ValueError(f"压缩包校验失败：{broken}")
-            if len([item for item in archive.infolist() if not item.is_dir()]) != len(sources):
-                raise ValueError("压缩包文件数量校验失败")
-        for attempt in range(5):
-            try:
-                partial.replace(final)
-                break
-            except PermissionError as exc:
-                if getattr(exc, "winerror", None) not in {32, 33} or attempt == 4:
-                    raise
-                time.sleep(0.1 * (attempt + 1))
-        if cleanup_sources:
-            # Cancellation is honored before cleanup starts. Once deletion begins, finish the
-            # exact verified source set so a late click cannot leave a half-cleaned directory.
+        snapshots = {source: _source_snapshot(source) for source in sources}
+        if reuse_existing(final, file_conflict):
+            with zipfile.ZipFile(final, "r") as archive:
+                if archive.testzip():
+                    raise ValueError("已有归档校验失败，未清理源文件")
+                if cleanup_sources:
+                    wanted = {source.relative_to(root).as_posix() for source in sources}
+                    members = [info.filename for info in archive.infolist() if not info.is_dir()]
+                    if len(members) != len(wanted) or set(members) != wanted:
+                        warn("复用归档的文件列表与本次源文件不一致，未清理源文件")
+                        return final
+                    digests = {}
+                    for source in sources:
+                        with archive.open(source.relative_to(root).as_posix()) as stream:
+                            digests[source] = _digest_stream(stream, cancel_event)
+                    _cleanup_sources(sources, snapshots, digests, cancel_event, removed, warn)
+            return final
+        partial = final.with_name(f"{final.name}.partial-{uuid.uuid4().hex[:8]}")
+        digests = {}
+        try:
+            with zipfile.ZipFile(partial, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+                for index, source in enumerate(sources, 1):
+                    _check_cancel(cancel_event)
+                    if _source_snapshot(source) != snapshots[source]:
+                        raise ValueError(f"源文件在压缩期间变化：{source.name}")
+                    info = zipfile.ZipInfo.from_file(source, source.relative_to(root).as_posix())
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    digest = hashlib.sha256()
+                    with source.open("rb") as stream, archive.open(info, "w", force_zip64=True) as output:
+                        opened = os.fstat(stream.fileno())
+                        if _signature(opened) != snapshots[source]:
+                            raise ValueError(f"源文件已被替换：{source.name}")
+                        while True:
+                            _check_cancel(cancel_event)
+                            chunk = stream.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            output.write(chunk)
+                            digest.update(chunk)
+                        if _stream_signature(os.fstat(stream.fileno())) != _stream_signature(opened):
+                            raise ValueError(f"源文件在压缩期间变化：{source.name}")
+                    digests[source] = digest.digest()
+                    if on_progress is not None:
+                        on_progress(index, len(sources), f"正在压缩 {source.name}")
             _check_cancel(cancel_event)
+            with zipfile.ZipFile(partial, "r") as archive:
+                if archive.testzip() or len(archive.infolist()) != len(sources):
+                    raise ValueError("压缩包内容或数量校验失败")
             for source in sources:
-                source.unlink()
-        return final
-    except Exception:
-        partial.unlink(missing_ok=True)
-        raise
+                if _source_snapshot(source) != snapshots[source]:
+                    raise ValueError(f"源文件在归档提交前变化：{source.name}")
+            replace_output(partial, final, cancel_event)
+            if cleanup_sources:
+                _cleanup_sources(sources, snapshots, digests, cancel_event, removed, warn)
+            return final
+        finally:
+            partial.unlink(missing_ok=True)
 
 
 def _validated_members(
@@ -168,12 +283,23 @@ def extract_zip_safely(
     max_files: int = 10_000,
     max_uncompressed_bytes: int = 2 * 1024 * 1024 * 1024,
 ) -> list[Path]:
+    source = Path(archive_path).expanduser()
+    source = source.parent.resolve() / source.name
+    target = Path(destination).expanduser()
+    target = target.parent.resolve() / target.name
+    with output_paths_lock((source, target), cancel_event):
+        return _extract_zip_locked(source, target, cancel_event=cancel_event, on_progress=on_progress,
+                                   max_files=max_files, max_uncompressed_bytes=max_uncompressed_bytes)
+
+
+def _extract_zip_locked(
+    source: Path, final_root: Path, *, cancel_event=None, on_progress=None,
+    max_files=10_000, max_uncompressed_bytes=2 * 1024 * 1024 * 1024,
+) -> list[Path]:
     """Extract a ZIP into a new directory without traversal, links, or partial results."""
-    source = Path(archive_path).expanduser().resolve()
-    final_root = Path(destination).expanduser().resolve()
     if not source.is_file() or source.is_symlink():
         raise ValueError("待解压文件不存在或不是普通文件")
-    if final_root.exists():
+    if final_root.exists() or final_root.is_symlink():
         raise FileExistsError(f"解压目录已存在：{final_root}")
     final_root.parent.mkdir(parents=True, exist_ok=True)
     partial_root = final_root.with_name(f"{final_root.name}.partial-{uuid.uuid4().hex[:8]}")
@@ -209,6 +335,8 @@ def extract_zip_safely(
         _check_cancel(cancel_event)
         for attempt in range(10):
             try:
+                if final_root.exists() or final_root.is_symlink():
+                    raise FileExistsError(f"解压目录已出现，未覆盖：{final_root}")
                 partial_root.replace(final_root)
                 break
             except PermissionError as exc:
@@ -250,7 +378,8 @@ def run_archive_postprocess(
     if bool(task.options.get("extract_archives", False)):
         for record in list(current_records):
             path = record.path.expanduser().resolve()
-            if path.suffix.casefold() != ".zip" or path.name.casefold().endswith(".ugoira.zip"):
+            if (path.suffix.casefold() != ".zip" or record.metadata.get("pixiv_type") == "ugoira"
+                    or re.search(r"\.ugoira(?: \(\d+\))?\.zip$", path.name, re.IGNORECASE)):
                 continue
             if not path.is_relative_to(output_root):
                 continue
@@ -302,6 +431,7 @@ def run_archive_postprocess(
         _check_cancel(cancel_event)
         archive_name = f"{_safe_label(group_label)}_归档_{task.task_id}.zip"
         destination = base_dir / archive_name
+        removed_in_group = []
         archive_path = create_verified_zip(
             [record.path for record in group],
             destination,
@@ -309,6 +439,9 @@ def run_archive_postprocess(
             cleanup_sources=cleanup_sources,
             cancel_event=cancel_event,
             on_progress=on_progress,
+            file_conflict=task.options.get("file_conflict", "reuse"),
+            removed_sources=removed_in_group,
+            warnings=result.warnings,
         )
         result.records.append(
             FileRecord(
@@ -324,13 +457,13 @@ def run_archive_postprocess(
                     "archive_scope": mode,
                     "source_count": len(group),
                     "cleanup_sources": cleanup_sources,
+                    "removed_source_count": len(removed_in_group),
                     "group": index,
                     "group_count": len(groups),
                 },
             )
         )
-        if cleanup_sources:
-            result.removed_sources.extend(record.path.expanduser().resolve() for record in group)
+        result.removed_sources.extend(removed_in_group)
     return result
 
 

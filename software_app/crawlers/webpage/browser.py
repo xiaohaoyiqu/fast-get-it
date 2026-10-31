@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from software_app.core.task_control import task_cancelled, task_wait
+
 import base64
 import json
 import threading
@@ -11,10 +13,12 @@ from urllib.parse import parse_qsl, urlencode, urlparse
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver import ChromeOptions
-from selenium.webdriver.chrome.service import Service
+from software_app.core.browser_process import ManagedChromeService as Service
 
 from software_app.core.adapter import TaskCancelled
 from software_app.core.browser_driver import ensure_chromedriver
+from software_app.core.browser_pool import BROWSER_POOL
+from software_app.core.browser_session import raise_browser_failure
 
 from .client import MediaCandidate, normalize_page_url
 
@@ -154,6 +158,12 @@ class DynamicPageBrowser:
         self._lock = threading.Lock()
 
     def collect(
+        self, task_id: str, url: str, cancel_event: threading.Event, options: dict | None = None,
+    ) -> BrowserPageResult:
+        with BROWSER_POOL.session(cancel_event):
+            return self._collect(task_id, url, cancel_event, options)
+
+    def _collect(
         self,
         task_id: str,
         url: str,
@@ -176,7 +186,7 @@ class DynamicPageBrowser:
                 try:
                     payload = driver.execute_script(COLLECT_RENDERED_MEDIA_SCRIPT, url) or {}
                 except WebDriverException as exc:
-                    if cancel_event.is_set():
+                    if task_cancelled(cancel_event):
                         raise TaskCancelled("任务已取消") from exc
                     raise RuntimeError("候选网页浏览器已关闭，任务不能继续") from exc
                 candidates = media_candidates_from_browser_payload(payload)
@@ -187,12 +197,16 @@ class DynamicPageBrowser:
                     return self._build_result(driver, payload, url, candidates, options, cancel_event)
                 try:
                     driver.execute_script("window.scrollBy(0, Math.max(500, window.innerHeight * 0.7));")
-                except WebDriverException:
+                except WebDriverException as error:
+                    raise_browser_failure(error, cancel_event, driver)
                     pass
-                cancel_event.wait(0.6)
+                task_wait(cancel_event, 0.6)
 
             candidates = media_candidates_from_browser_payload(payload)
             return self._build_result(driver, payload, url, candidates, options, cancel_event)
+        except Exception as error:
+            raise_browser_failure(error, cancel_event, driver)
+            raise
         finally:
             with self._lock:
                 self._drivers.pop(task_id, None)
@@ -230,7 +244,8 @@ class DynamicPageBrowser:
             script_timeout = max(30, min(int(options.get("media_read_timeout") or 120), 1200))
             try:
                 driver.set_script_timeout(script_timeout)
-            except WebDriverException:
+            except WebDriverException as error:
+                raise_browser_failure(error, cancel_event, driver)
                 pass
             for candidate in candidates[:max_files]:
                 self._check_cancel(cancel_event)
@@ -246,7 +261,8 @@ class DynamicPageBrowser:
                         content_type=str(raw.get("contentType") or "").split(";", 1)[0].strip().lower(),
                         final_url=normalize_page_url(str(raw.get("finalUrl") or candidate.url)),
                     )
-                except (ValueError, WebDriverException):
+                except (ValueError, WebDriverException) as error:
+                    raise_browser_failure(error, cancel_event, driver)
                     continue
         return BrowserPageResult(final_url, str(payload.get("title") or ""), candidates, media_payloads)
 
@@ -273,11 +289,18 @@ class DynamicPageBrowser:
             chrome_options.add_argument(f"--proxy-server={proxy_url}")
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
         driver = webdriver.Chrome(service=Service(str(driver_path)), options=chrome_options)
-        driver.set_page_load_timeout(max(10, min(int(options.get("page_load_timeout") or 30), 120)))
-        driver.execute_cdp_cmd(
-            "Page.addScriptToEvaluateOnNewDocument",
-            {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"},
-        )
+        try:
+            driver.set_page_load_timeout(max(10, min(int(options.get("page_load_timeout") or 30), 120)))
+            driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"},
+            )
+        except BaseException:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            raise
         return driver
 
     @staticmethod
@@ -331,5 +354,5 @@ class DynamicPageBrowser:
 
     @staticmethod
     def _check_cancel(cancel_event: threading.Event) -> None:
-        if cancel_event.is_set():
+        if task_cancelled(cancel_event):
             raise TaskCancelled("任务已取消")

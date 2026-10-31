@@ -13,6 +13,7 @@ env/
 .vscode/
 .continue/
 .codex/
+.ruff_cache/
 
 # Build and packaging output
 build/
@@ -25,6 +26,8 @@ dist/
 *.temp
 
 # Local databases and runtime state
+.yuqiuda-http-*/
+.yuqiuda-hls-*/
 *.db
 *.sqlite
 *.sqlite3
@@ -45,3 +48,6 @@ data/software_app/browser/*_profile/
 
 # Separately versioned userscript repository
 /油猴脚本/
+
+# Local screenshots not used by repository documentation
+/图片/

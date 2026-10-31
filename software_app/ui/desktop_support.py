@@ -7,6 +7,7 @@ import unicodedata
 from pathlib import Path
 
 from software_app.core.models import IMAGE_EXTENSIONS
+from software_app.core.task_routing import retry_route_for_task as retry_route_for_task
 
 
 GOOGLE_BATCH_IMAGE_LIMIT = 20
@@ -104,18 +105,3 @@ def download_types_for_discovered_target(
     """Choose media types according to how a target was discovered."""
     del source_module_id, target_module_id
     return str(selected_types or "").strip()
-
-
-def retry_route_for_task(module_id: str, target: str, options: dict) -> tuple[str, dict]:
-    """Preserve discovery semantics when recreating old and current tasks."""
-    del target
-    updated = dict(options or {})
-    is_discovered_page = updated.get("discovery_source") == "google_image"
-    # Older candidate tasks had these page limits but no discovery marker and
-    # were sometimes persisted under a platform downloader.
-    is_legacy_discovered_page = "max_files" in updated and "page_read_timeout" in updated
-    if is_discovered_page or is_legacy_discovered_page:
-        updated["discovery_source"] = "google_image"
-        updated["browser_render"] = True
-        return "website", updated
-    return module_id, updated

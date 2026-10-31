@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 import requests
 
 from software_app.crawlers.common import make_session
+from .network_policy import HTTP_BACKOFF, record_http_backoff
 
 
 PUBLIC_APPVIEW = "https://public.api.bsky.app"
@@ -27,13 +28,14 @@ class BlueskyAccountManager:
         self.pds = DEFAULT_PDS
 
     def _json(self, method: str, url: str, **kwargs) -> dict:
+        HTTP_BACKOFF.wait(url)
         response = self.session.request(method, url, timeout=(10, 30), **kwargs)
-        if response.status_code in {401, 403}:
-            raise PermissionError("Bluesky 认证失败；请检查账号、应用密码或登录权限")
-        if response.status_code == 429:
-            raise RuntimeError("Bluesky 请求过于频繁，请稍后重试")
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            record_http_backoff(response, url)
+            response.raise_for_status()
+            payload = response.json()
+        finally:
+            response.close()
         if not isinstance(payload, dict):
             raise ValueError("Bluesky 接口没有返回对象")
         if payload.get("error"):

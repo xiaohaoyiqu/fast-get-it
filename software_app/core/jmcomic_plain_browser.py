@@ -33,6 +33,8 @@ SAFE_REQUEST_HEADERS = {
     "sec-ch-ua", "sec-ch-ua-arch", "sec-ch-ua-bitness", "sec-ch-ua-full-version",
     "sec-ch-ua-full-version-list", "sec-ch-ua-mobile", "sec-ch-ua-model", "sec-ch-ua-platform",
     "sec-ch-ua-platform-version",
+    "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "sec-fetch-user",
+    "upgrade-insecure-requests", "priority",
 }
 
 
@@ -137,9 +139,12 @@ def _chrome_user_agent() -> str:
     version = chrome_version().strip()
     if not version:
         return ""
-    major = version.split(".", 1)[0]
-    if not major.isdigit():
+    parts = version.split(".")
+    if not parts or not parts[0].isdigit():
         return ""
+    # Use the real full version (e.g. 128.0.6613.119) so cf_clearance
+    # browser-fingerprint checks match the Chrome that obtained it.
+    chrome_ver = version if len(parts) == 4 else f"{parts[0]}.0.0.0"
     system = platform.system()
     if system == "Windows":
         platform_text = "Windows NT 10.0; Win64; x64"
@@ -149,7 +154,7 @@ def _chrome_user_agent() -> str:
         platform_text = "X11; Linux x86_64"
     return (
         f"Mozilla/5.0 ({platform_text}) AppleWebKit/537.36 "
-        f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+        f"(KHTML, like Gecko) Chrome/{chrome_ver} Safari/537.36"
     )
 
 
@@ -167,6 +172,11 @@ def chrome_request_headers(origin: str, user_agent: str) -> dict[str, str]:
         "referer": str(origin or "").rstrip("/") + "/",
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+        "sec-fetch-user": "?1",
+        "upgrade-insecure-requests": "1",
         "user-agent": str(user_agent or "").strip(),
     }
     if major:
@@ -398,7 +408,7 @@ def capture_jmcomic_plain_chrome(
     """Read AVS directly from the manual profile, updating saved state only on success."""
     from selenium import webdriver
     from selenium.webdriver import ChromeOptions
-    from selenium.webdriver.chrome.service import Service
+    from .browser_process import ManagedChromeService as Service
 
     origin, configured_host = _origin(domain)
     account = str(username or "").strip().lstrip("@").strip("/")

@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from software_app.core.blocklist import account_from_target, work_from_target
 from software_app.core.bluesky_account import BlueskyAccountManager
 from software_app.core.candidate_lists import export_candidate_list, import_candidate_list
+from software_app.core.security import safe_error_message
 from software_app.crawlers.pixiv import parse_pixiv_target
 from software_app.crawlers.pixiv.catalog import filter_bookmark_candidates
 from software_app.ui.desktop_support import (
@@ -804,14 +805,19 @@ class FollowingTabMixin:
             self._refresh_platform_tabs()
             payload = adapter.load_bookmark_payload(kind)
             updated_at = str(payload.get("updated_at") or "尚未在线更新")
-            cache_state = "完整" if payload.get("complete") else "部分或旧版"
-            if payload.get("account") and adapter.cookie_account_id() and payload.get("account") != adapter.cookie_account_id():
+            cache_state = "所选范围完整" if payload.get("complete") else "部分或旧版"
+            from software_app.crawlers.pixiv.bookmark_discovery import bookmark_cache_details
+
+            details = bookmark_cache_details(payload)
+            if payload.get("account") and payload.get("account") != adapter.cookie_account_id():
                 cache_state = "其他账号的缓存，未展示"
+                details = "当前账号与缓存账号不同，未展示缓存详情。"
             self.status_var.set(f"已读取本地 Pixiv 收藏 {len(rows)} 个（{cache_state}缓存）")
             messagebox.showinfo(
                 "Pixiv 本地收藏",
                 f"已读取当前账号的{'小说' if kind == 'novel' else '作品'}收藏 {len(rows)} 个。\n"
                 f"缓存状态：{cache_state}；更新时间：{updated_at}\n\n"
+                f"{details}\n\n"
                 "这里只读取本地缓存，不访问网站，也不会自动下载。",
             )
         else:
@@ -1457,7 +1463,11 @@ class FollowingTabMixin:
 
         json_counts: dict[str, int] = {}
         if module_id == "twitter":
-            json_counts = self.manager.get_adapter("twitter").clear_selected_download_records(rows)
+            try:
+                json_counts = self.manager.get_adapter("twitter").clear_selected_download_records(rows)
+            except Exception as exc:
+                messagebox.showerror("清理推特历史失败", safe_error_message(exc) + "\n软件任务和文件索引尚未清理。")
+                return
         elif module_id == "pixiv":
             account_targets = {
                 str(row.get("target") or "") for row in rows if row.get("source") == "账号浏览历史"
@@ -1744,9 +1754,12 @@ class FollowingTabMixin:
             self.status_var.set("正在更新全部关注；滚动到底后会自动完成")
             self._append_log("开始更新全部 Twitter 关注账号（完成后同步移除已取关账号）")
 
+        proxy_url = str(self.storage.get_setting("proxy_url", "") or "")
+
         def worker() -> None:
             try:
                 payload = self.manager.get_adapter("twitter").fetch_following(
+                    proxy_url=proxy_url,
                     timeout_seconds=0,
                     update_mode=self.following_refresh_mode,
                     known_overlap=30,
@@ -1969,25 +1982,31 @@ class FollowingTabMixin:
         self._refresh_platform_tabs()
         self.status_var.set(f"本地收藏筛选后显示 {len(self.current_candidate_rows)} 个")
 
-    def _current_target_options(self, target: str = "") -> dict:
-        module_id = self.module_var.get()
-        scope = self.content_scope_var.get()
+    def _current_target_options(self, target: str = "", *, module_id: str | None = None,
+                                scope: str | None = None, settings: dict | None = None,
+                                use_view_filters: bool = True) -> dict:
+        settings = self.storage.get_settings() if settings is None else settings
+        module_id = self.module_var.get() if module_id is None else module_id
+        scope = self.content_scope_var.get() if scope is None else scope
         options = {
             "types": self._selected_types(),
-            **self._saved_format_options(),
-            **self._saved_archive_options(),
+            **self._saved_format_options(settings),
+            **self._saved_archive_options(settings),
             "content_scope": scope,
             "search_mode": scope,
-            "proxy_url": str(self.storage.get_setting("proxy_url", "") or ""),
-            "retries": _bounded_int(self.storage.get_setting("task_retries", 1), 1, 0, 5),
-            "page_read_timeout": _bounded_int(self.storage.get_setting("webpage_read_timeout", 60), 60, 30, 600),
+            "proxy_url": str(settings.get("proxy_url", "") or ""),
+            "retries": _bounded_int(settings.get("task_retries", 1), 1, 0, 5),
+            "page_read_timeout": _bounded_int(settings.get("webpage_read_timeout", 60), 60, 30, 600),
+            "save_unfinished_txt": bool(settings.get("save_unfinished_txt", False)),
+            "rename_downloads": bool(settings.get("rename_downloads", True)),
+            "delete_source_after_rename": bool(settings.get("delete_source_after_rename", True)),
         }
         if target and module_id == "pixiv":
             options["max_works"] = _bounded_int(
-                self.storage.get_setting("pixiv_max_works", 20), 20, 1, 100
+                settings.get("pixiv_max_works", 20), 20, 1, 100
             )
 
-            options["filter_ai"] = bool(self.storage.get_setting("pixiv_filter_ai", True))
+            options["filter_ai"] = bool(settings.get("pixiv_filter_ai", True))
             if scope in {"作者 ID", "关注画师"}:
                 options["input_kind"] = "user"
             elif scope == "作品 ID":
@@ -2019,26 +2038,26 @@ class FollowingTabMixin:
                 options["input_kind"] = "fanbox"
             elif scope == "Sketch":
                 options["input_kind"] = "sketch"
-            options["pixiv_visibility"] = str(self.storage.get_setting("pixiv_visibility", "show") or "show")
-            options["start_date"] = str(self.storage.get_setting("pixiv_start_date", "") or "")
-            options["end_date"] = str(self.storage.get_setting("pixiv_end_date", "") or "")
-            if scope in {"作品收藏", "小说收藏"} and self.__dict__.get("bookmark_filter_start_var") is not None:
+            options["pixiv_visibility"] = str(settings.get("pixiv_visibility", "show") or "show")
+            options["start_date"] = str(settings.get("pixiv_start_date", "") or "")
+            options["end_date"] = str(settings.get("pixiv_end_date", "") or "")
+            if use_view_filters and scope in {"作品收藏", "小说收藏"} and self.__dict__.get("bookmark_filter_start_var") is not None:
                 options["start_date"] = self.bookmark_filter_start_var.get().strip()
                 options["end_date"] = self.bookmark_filter_end_var.get().strip()
             options["minimum_bookmarks"] = _bounded_int(
-                self.storage.get_setting("pixiv_minimum_bookmarks", 0), 0, 0, 100000000
+                settings.get("pixiv_minimum_bookmarks", 0), 0, 0, 100000000
             )
-            options["age_mode"] = str(self.storage.get_setting("pixiv_age_mode", "all") or "all")
-            options["bookmark_tag"] = str(self.storage.get_setting("pixiv_bookmark_tag", "") or "")
+            options["age_mode"] = str(settings.get("pixiv_age_mode", "all") or "all")
+            options["bookmark_tag"] = str(settings.get("pixiv_bookmark_tag", "") or "")
             options["bookmark_date_basis"] = (
                 "published"
-                if self.__dict__.get("bookmark_date_basis_var") is not None
+                if use_view_filters and self.__dict__.get("bookmark_date_basis_var") is not None
                 and self.bookmark_date_basis_var.get() == "发布时间"
                 else "bookmarked"
             )
-            options["author_match_mode"] = str(self.storage.get_setting("pixiv_author_match_mode", "partial") or "partial")
+            options["author_match_mode"] = str(settings.get("pixiv_author_match_mode", "partial") or "partial")
             options["history_limit"] = _bounded_int(
-                self.storage.get_setting("pixiv_history_limit", 100), 100, 1, 10000
+                settings.get("pixiv_history_limit", 100), 100, 1, 10000
             )
             if target.startswith(("http://", "https://")):
                 kind_scopes = {
@@ -2059,17 +2078,17 @@ class FollowingTabMixin:
                     options["search_mode"] = actual_scope
                     options["input_kind"] = parsed_kind
         elif target and module_id == "jmcomic":
-            options["domain"] = str(self.storage.get_setting("jmcomic_domain", "https://18comic.vip") or "https://18comic.vip")
-            options["user_agent"] = str(self.storage.get_setting("jmcomic_user_agent", "") or "")
-            options["order_by"] = str(self.storage.get_setting("jmcomic_order_by", "mr") or "mr")
-            options["time_range"] = str(self.storage.get_setting("jmcomic_time_range", "a") or "a")
-            options["category"] = str(self.storage.get_setting("jmcomic_category", "0") or "0")
-            options["favorite_username"] = str(self.storage.get_setting("jmcomic_favorite_username", "") or "")
-            options["favorite_folder_id"] = str(self.storage.get_setting("jmcomic_favorite_folder_id", "0") or "0")
-            options["novel_favorite_folder_id"] = str(self.storage.get_setting("jmcomic_novel_favorite_folder_id", "0") or "0")
-            options["match_mode"] = str(self.storage.get_setting("jmcomic_match_mode", "fuzzy") or "fuzzy")
-            options["jm_postprocess"] = str(self.storage.get_setting("jmcomic_postprocess", "none") or "none")
-            options["jm_download_cover"] = bool(self.storage.get_setting("jmcomic_download_cover", True))
+            options["domain"] = str(settings.get("jmcomic_domain", "https://18comic.vip") or "https://18comic.vip")
+            options["user_agent"] = str(settings.get("jmcomic_user_agent", "") or "")
+            options["order_by"] = str(settings.get("jmcomic_order_by", "mr") or "mr")
+            options["time_range"] = str(settings.get("jmcomic_time_range", "a") or "a")
+            options["category"] = str(settings.get("jmcomic_category", "0") or "0")
+            options["favorite_username"] = str(settings.get("jmcomic_favorite_username", "") or "")
+            options["favorite_folder_id"] = str(settings.get("jmcomic_favorite_folder_id", "0") or "0")
+            options["novel_favorite_folder_id"] = str(settings.get("jmcomic_novel_favorite_folder_id", "0") or "0")
+            options["match_mode"] = str(settings.get("jmcomic_match_mode", "fuzzy") or "fuzzy")
+            options["jm_postprocess"] = str(settings.get("jmcomic_postprocess", "none") or "none")
+            options["jm_download_cover"] = bool(settings.get("jmcomic_download_cover", True))
             if scope == "章节 ID / 链接":
                 options["input_kind"] = "photo"
             elif scope == "漫画 ID / 链接":
@@ -2078,8 +2097,11 @@ class FollowingTabMixin:
             options["filter_ai"] = True
             options["eh_download_method"] = "images"
             options["eh_download_images"] = True
-            options["eh_download_torrent"] = bool(self.storage.get_setting("eh_download_torrent", False))
-            options["eh_bt_download_enabled"] = bool(self.storage.get_setting("eh_bt_download_enabled", False))
+            options["eh_download_torrent"] = bool(settings.get("eh_download_torrent", False))
+            options["eh_bt_download_enabled"] = bool(settings.get("eh_bt_download_enabled", False))
+            from software_app.core.aria2_bt import saved_aria2_limits
+
+            options.update(saved_aria2_limits(settings).options())
             options["max_torrents"] = 1
         return options
 
@@ -2087,8 +2109,12 @@ class FollowingTabMixin:
         if not messagebox.askyesno("清理推特下载记录", "会清空推特 downloaded/failed JSON 和软件任务记录，不删除本地媒体文件。"):
             return
         adapter = self.manager.get_adapter("twitter")
-        adapter.clear_selected_download_records(list(self.twitter_history_rows))
-        record_counts = adapter.clear_download_records()
+        try:
+            adapter.clear_selected_download_records(list(self.twitter_history_rows))
+            record_counts = adapter.clear_download_records()
+        except Exception as exc:
+            messagebox.showerror("清理推特下载记录失败", safe_error_message(exc) + "\n软件任务和文件索引尚未清理。")
+            return
         task_ids = {
             str(row["task_id"])
             for row in self.storage.list_tasks(limit=10000)
