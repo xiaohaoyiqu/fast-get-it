@@ -7,9 +7,9 @@
 ## 使用步骤
 
 1. 打开 **设置 → 浏览器登录与 Cookie**。
-2. 在平台下拉框选择 Twitter/X、Pixiv、FANBOX、Instagram、E-Hentai 表站或 ExHentai 里站。
+2. 在平台下拉框选择 Twitter/X、Pixiv、FANBOX、Instagram、HentaiPaw、E-Hentai 表站或 ExHentai 里站。
 3. 如需代理，先确认设置页上方的 **代理 URL**。登录窗口会直接使用输入框中的当前值，例如 `http://127.0.0.1:6987`。
-4. 普通平台点击 **打开登录浏览器并获取**。EH 仅支持 **手动填写 EH Cookie** 或 **导入 Cookie 文件**。
+4. 普通平台点击 **打开登录浏览器并获取**。EH 使用 **手动填写 EH Cookie** 或 **导入 Cookie 文件**；HentaiPaw 使用 **导入 Cookie 文件**，没有自动登录获取入口。
 5. 普通平台在弹出的官网窗口中自行登录并完成验证，不要把密码输入欲求达。EH 则在日常浏览器登录，从下述存储列表复制对应值。
 6. 普通平台检测到必需 Cookie 后会保存会话、关闭临时窗口。EH 保存只检查本地格式，需联网检查时单独点击 **验证 EH 登录（联网）**。
 
@@ -17,22 +17,25 @@
 
 **EH 手动获取说明：** 打开 **F12 → Application（应用/应用程序）→ Storage（存储）→ Cookies**，选择表站 `e-hentai.org` 或里站 `exhentai.org`，读取名称和值，点“手动填写 EH Cookie”逐项粘贴保存；也可用“导入 Cookie 文件”读取 Cookie JSON／Netscape 文件。这是浏览器存储列表，不是 Console 或 Network；“请求头 TXT → JSON”只适用于实际 Cookie 请求头。EH 自动浏览器获取已移除。字段要求与详细步骤见 [EH 使用与登录](E-Hentai使用与登录.md#手动查看浏览器中保存的-cookie)。
 
-登录窗口使用代理输入框中的当前值；Twitter 下载、在线资料、批量资料、关注刷新和头像缓存使用已保存的代理配置。修改代理后先点“保存设置”，再启动后续操作，使两者保持相同出口。Chrome 下载浏览器会收到显式代理参数；留空时保留系统代理行为。
+登录窗口和设置页的联网检查使用代理输入框中的当前值；搜索、在线资料和下载使用已保存的代理配置，已创建任务继续使用自己的参数副本。修改代理后先点“保存设置”，再创建新任务，使两者保持相同出口。Chrome 浏览器留空时遵循系统网络配置；EH、Pixiv、HentaiPaw 等 HTTP 请求留空时直连，JMComic 可读取 Windows 系统代理。设置检查会说明本次网络方式，配置尚未保存时提醒。
 
-如果平台拒绝自动化浏览器登录，可以在平时使用的 Chrome 或 Edge 完成登录，再使用 **请求头 TXT → JSON**。Twitter/X、Pixiv、FANBOX、Instagram、E-Hentai 表站和 ExHentai 里站都在通用登录卡片中提供该按钮；JMComic 在自己的登录卡片中提供同名按钮。把 Network 中同一个成功请求的完整请求标头复制到 TXT，即使后面同时附有响应头也可以：软件只提取 Cookie，先检查当前平台的必要字段，再在 TXT 旁生成不会覆盖旧文件的 Cookie JSON，并询问是否立即导入。
+如果平台拒绝自动化浏览器登录，可以在平时使用的 Chrome 或 Edge 完成登录，再使用 **请求头 TXT → JSON**。Twitter/X、Pixiv、FANBOX、Instagram、HentaiPaw、E-Hentai 表站和 ExHentai 里站都在通用登录卡片中提供该按钮；JMComic 在自己的登录卡片中提供同名按钮。把 Network 中同一个成功请求的完整请求标头复制到 TXT，即使后面同时附有响应头也可以：软件只提取 Cookie，先检查当前平台的必要字段，再在 TXT 旁生成不会覆盖旧文件的 Cookie JSON，并询问是否立即导入。
 
-生成的 JSON 和原始 TXT 都含明文登录凭证，不要分享，用完应自行妥善删除。EH 导入保留原始 TXT 中可用的 User-Agent，保存不联网；JMComic 会从原始 TXT 同时保留允许列表内的安全请求头。导入后可使用连接检查确认会话。原有 **导入 Cookie 文件** 仍支持浏览器扩展导出的 JSON、Netscape `cookies.txt`、`Cookie: ...` 文本，以及名称和值分成相邻两行的格式。
+生成的 JSON 和原始 TXT 都含明文登录凭证，不要分享，用完应自行妥善删除。EH 导入保留原始 TXT 中可用的 User-Agent，保存不联网；JMComic 会从原始 TXT 同时保留允许列表内的安全请求头。文件导入只检查本地格式和必要字段，不验证账号身份；保存后再使用对应平台的验证或在线读取入口。原有 **导入 Cookie 文件** 仍支持浏览器扩展导出的 JSON、Netscape `cookies.txt`、`Cookie: ...` 文本，以及名称和值分成相邻两行的格式。
 
 “导入 Cookie 文件”的文件处理在后台运行，导入期间按钮暂时禁用，结果返回后恢复。EH 的“验证 EH 登录（联网）”也在后台单独运行，连接超时不会阻止本地保存。导入成功与站点会话有效是两项检查。
 
+检查和 Cookie 操作结果显示在运行日志，并写入本机日志数据库；联网检查记录耗时。切换 Cookie 平台后，较早返回的结果保留在日志中，不覆盖当前平台提示。网络超时不能证明 Cookie 失效，403 还可能涉及站点验证或网络出口，Cookie 格式与本地文件错误会保留对应原因。
+
 ## 各平台保存规则
 
-| 平台 | 完成标志 | 保存与后续用途 |
+| 平台 | 浏览器获取或手动保存要求 | 保存与后续用途 |
 | --- | --- | --- |
 | Twitter/X | `auth_token`、`ct0` | 保存为下载器使用的完整 Selenium Cookie 列表，用于主页、关注和帖子读取。X 经常拒绝 WebDriver 登录，推荐从普通浏览器导入。 |
 | Pixiv | `PHPSESSID`，且账号接口验证成功 | 保存 Pixiv 会话，并保留已有 FANBOX Cookie；用于收藏、私密关注、R-18 和账号历史等登录功能。 |
 | FANBOX | `FANBOXSESSID`，且支持方案接口验证成功 | 保存 FANBOX 会话，并保留已有 Pixiv Cookie；用于登录限定和已支持的付费帖子读取。 |
 | Instagram | `sessionid` | 保存 Instagram 网页会话；用于公开页面被登录墙拦截或登录限定页面。 |
+| HentaiPaw | 导入本站 Cookie，不假定存在固定登录字段 | 单独保存为 `hentaipaw/cookies.json`；访问检查只确认公共页面及 Cookie 配置，不验证账号身份。浏览器本地收藏需另行导入。 |
 | E-Hentai 表站 | `ipb_member_id`、`ipb_pass_hash`；保存后可手动验证 | 手动填写或导入，保存为 `e-hentai-cookies.json`，只用于表站及表站收藏夹。 |
 | ExHentai 里站 | `ipb_member_id`、`ipb_pass_hash`、`igneous`；保存后可手动验证 | 手动填写或导入，保存为 `exhentai-cookies.json`，只用于里站及里站收藏夹。 |
 

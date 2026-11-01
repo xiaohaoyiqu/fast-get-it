@@ -16,7 +16,7 @@
 | E-Hentai / ExHentai | 独立登录、搜索、收藏、展示图及可选种子下载 |
 | Google 相似图片 | 单图或文件夹查询、候选核对与网页下载转交 |
 | 普通网页 | 静态资源提取与浏览器页面媒体发现 |
-| HentaiPaw | 作品预览、关键词搜索、阅读器原图下载、独立 Cookie 导入 |
+| HentaiPaw | 作品预览、关键词搜索、分类与排行榜、原图下载、收藏导入导出、独立 Cookie 与访问检查 |
 
 平台页面、登录状态和访问限制会影响可用性。Instagram 帖子／Reels、Google 人机验证及 JM 会话等场景仍有实际使用限制，不能把接口接入视为所有业务均已验证。
 
@@ -49,6 +49,8 @@ python -m venv .venv
 
 通过设置页填写或导入所需登录资料。E-Hentai 与 ExHentai 分别保存 Cookie；保存和联网验证为独立操作。
 
+Cookie 文件导入只做本地检查。HentaiPaw 的访问检查不验证账号身份，浏览器收藏也不包含在 Cookie 中。设置检查和登录窗口使用当前输入值，后续搜索与下载使用已保存值；修改后请点“保存设置”。详细规则见 [浏览器登录与 Cookie](文档/平台/浏览器登录与Cookie.md)。
+
 程序数据保存在 `data/software_app/`，下载目录可在界面修改。更新程序时保留数据目录。Cookie、数据库、浏览器资料和下载记录不应公开上传。
 
 ## 打包
@@ -60,6 +62,14 @@ python -m venv .venv
 ```
 
 输出为 `dist/欲求达.exe` 和 `dist/欲求达-cli.exe`。替换旧文件前关闭对应程序，保留账号数据和下载目录。
+
+以上路径相对于应用源码根目录。若沿用外层仓库的 `dist/`，增加 `--distpath ..\dist --workpath ..\build`；已有外层虚拟环境则使用 `..\.venv\Scripts\python.exe`。建议先输出到独立目录，完成验收后再替换两个 EXE。成品验收会检查 CLI、九个平台加载、HentaiPaw 本地入口及 GUI 打开和正常退出：
+
+```powershell
+.\.venv\Scripts\python.exe tests/manual/verify_package_smoke.py dist --gui
+```
+
+验收使用隔离数据目录。旧账号数据继续放在最终 EXE 同级的 `data/software_app/`，不打进程序，也不提交源码仓库。
 
 ## 开发检查
 

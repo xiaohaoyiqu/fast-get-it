@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 import requests
 
 from software_app.core.events import CallbackSet
-from software_app.core.models import DownloadTask, FileRecord, TargetPreview, classify_file
+from software_app.core.models import DownloadTask, FileRecord, ProgressEvent, TargetPreview, classify_file
 from software_app.core.network_policy import HTTP_BACKOFF, record_http_backoff
 from software_app.crawlers.common import request_get
 from software_app.core.response_read import read_response_text
@@ -248,6 +248,8 @@ class InstagramClient:
                  "title": preview.title, "source": f"Instagram {mode}", "input_kind": target.kind}]
 
     def download(self, task: DownloadTask, callbacks: CallbackSet, cancel_event: threading.Event) -> None:
+        callbacks.on_progress(ProgressEvent(task.task_id, task.module_id, "info", "Instagram 正在读取页面与媒体列表",
+                                            metadata={"phase": "discover"}))
         if "_retry_media" in task.options:
             cache = {}
 

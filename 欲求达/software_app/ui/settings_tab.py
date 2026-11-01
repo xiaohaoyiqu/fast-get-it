@@ -4,10 +4,11 @@ import os
 import re
 import sqlite3
 import threading
+import time
 import tkinter as tk
 import webbrowser
 from pathlib import Path
-from datetime import date
+from datetime import date, datetime
 from tkinter import filedialog, messagebox, ttk
 from urllib.parse import urlparse
 
@@ -34,6 +35,8 @@ from software_app.core.recent_directories import recent_directories
 from software_app.core.browser_pool import browser_limit, apply_browser_settings
 from software_app.core.resource_pressure import validate_memory_policy
 from software_app.core.aria2_bt import validate_aria2_limits
+from software_app.core.security import safe_error_message
+from software_app.ui.feedback import friendly_error
 
 
 IMAGE_FORMAT_LABELS = {"PNG": "png", "JPEG": "jpg", "WebP": "webp", "保留原格式": "original"}
@@ -71,6 +74,73 @@ def plugin_purpose(plugin_id: str) -> str:
 
 
 class SettingsTabMixin:
+    def _record_settings_operation(self, platform, message, *, error=False, metadata=None):
+        message = safe_error_message(message)
+        module_id = {
+            "Twitter/X": "twitter", "Pixiv": "pixiv", "FANBOX": "pixiv", "JMComic": "jmcomic",
+            "Instagram": "instagram", "E-Hentai 表站": "ehentai", "ExHentai 里站": "ehentai",
+            "HentaiPaw": "hentaipaw",
+        }.get(platform, platform)
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._append_log(f"[{stamp}] {message}")
+        try:
+            self.storage.add_log("", module_id, "error" if error else "info", message, metadata)
+        except sqlite3.Error as exc:
+            self._append_log(f"操作结果已显示，但日志未能保存：{safe_error_message(exc)}")
+
+    def _settings_check_note(self, platform, *, browser=False):
+        proxy = self.proxy_var.get().strip()
+        route = "使用当前填写的代理" if proxy else (
+            "代理留空，浏览器使用系统网络配置" if browser else
+            "代理留空，按 JMComic 规则使用系统代理或直连" if platform == "JMComic" else "代理留空，直连"
+        )
+        changed = proxy != str(self.storage.get_setting("proxy_url", "") or "").strip()
+        if platform == "JMComic":
+            changed = changed or (
+                self.jm_domain_var.get().strip().rstrip("/")
+                != str(self.storage.get_setting("jmcomic_domain", "https://18comic.vip")).rstrip("/")
+                or self.jm_user_agent_var.get().strip()
+                != str(self.storage.get_setting("jmcomic_user_agent", "") or "").strip()
+            )
+        return f"本次{route}。" + ("当前配置尚未保存，后续下载使用已保存值；请点击“保存设置”。" if changed else "")
+
+    def _start_settings_check(self, platform, button, status_var, check):
+        note = self._settings_check_note(platform)
+        button.state(["disabled"])
+        status_var.set(f"正在检查 {platform}… {note}")
+        self._record_settings_operation(platform, f"开始检查 {platform}；{note}")
+        started = time.monotonic()
+
+        def worker():
+            try:
+                result = check()
+                error = False
+            except Exception as exc:  # noqa: BLE001
+                result, error = friendly_error(exc, f"{platform} 连接检查"), True
+            self.ui_queue.put(("settings_check_finished", (platform, result, error, note, time.monotonic() - started)))
+
+        try:
+            threading.Thread(target=worker, name=f"{platform}-connection-check", daemon=True).start()
+        except RuntimeError as exc:
+            self._finish_settings_check((platform, safe_error_message(exc), True, note, time.monotonic() - started))
+
+    def _finish_settings_check(self, payload):
+        platform, result, error, note, elapsed = payload
+        button_name, status_name = {
+            "Pixiv": ("pixiv_connection_button", "pixiv_connection_status_var"),
+            "FANBOX": ("fanbox_check_button", "fanbox_status_var"),
+            "JMComic": ("jm_connection_button", "jm_connection_status_var"),
+        }[platform]
+        button, status_var = getattr(self, button_name), getattr(self, status_name)
+        button.state(["!disabled"])
+        detail = result.get("message") if isinstance(result, dict) else result
+        message = safe_error_message(f"{detail or platform + ' 检查完成'} · 耗时 {elapsed:.1f} 秒。{note}")
+        status_var.set(message)
+        self.status_var.set(f"{platform} 检查{'失败' if error else '完成'}")
+        self._record_settings_operation(platform, message, error=error, metadata={"elapsed_seconds": round(elapsed, 2)})
+        if platform == "JMComic":
+            self._refresh_jm_auth_status()
+
     def _remember_output_dir(self, _event=None, *, show_errors: bool = False) -> bool:
         """Remember a committed directory edit independently of other settings."""
         text = self.output_dir_var.get().strip()
@@ -184,7 +254,7 @@ class SettingsTabMixin:
         ttk.Entry(body, textvariable=self.proxy_var).grid(row=1, column=1, columnspan=2, sticky="ew", pady=(10, 0))
         ttk.Label(
             body,
-            text="支持 http、https、socks5、socks5h；EH 留空时直连，不自动使用系统代理。修改后点“保存设置”用于后续下载；不要填写含用户名或密码的代理。",
+            text="支持 http、https、socks5、socks5h。连接检查和登录窗口使用输入框当前值，后续搜索与下载使用已保存值，修改后请点“保存设置”。EH、Pixiv 等 HTTP 读取留空时直连；Twitter、JMComic 可使用系统代理。不要填写含用户名或密码的代理。",
             style="Small.TLabel",
             wraplength=680,
         ).grid(row=2, column=1, columnspan=2, sticky="w", pady=(3, 0))
@@ -599,6 +669,9 @@ class SettingsTabMixin:
         self.eh_validate_button = ttk.Button(cookie_actions, text="验证 EH 登录（联网）", command=self._validate_eh_cookie)
         self.eh_validate_button.grid(row=0, column=1, sticky="w", padx=(8, 0))
         self.eh_validate_button.grid_remove()
+        self.hentaipaw_access_button = ttk.Button(cookie_actions, text="检查站点访问（联网）", command=self._check_hentaipaw_access)
+        self.hentaipaw_access_button.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.hentaipaw_access_button.grid_remove()
         self.header_convert_button = ttk.Button(
             cookie_actions, text="请求头 TXT → JSON", command=self._convert_header_txt,
         )
@@ -1083,38 +1156,14 @@ class SettingsTabMixin:
 
 
     def _check_fanbox_status(self) -> None:
-        self.fanbox_check_button.state(["disabled"])
-        self.fanbox_status_var.set("正在读取 FANBOX 订阅状态…")
-
         proxy_url = self.proxy_var.get().strip()
-
-        def worker() -> None:
-            try:
-                adapter = self.manager.get_adapter("pixiv")
-                status = adapter.fanbox_supporting_status({"proxy_url": proxy_url})
-            except Exception as exc:  # noqa: BLE001
-                self.ui_queue.put(("fanbox_status_error", str(exc)))
-                return
-            self.ui_queue.put(("fanbox_status_loaded", status))
-
-        threading.Thread(target=worker, name="fanbox-support-status", daemon=True).start()
+        self._start_settings_check("FANBOX", self.fanbox_check_button, self.fanbox_status_var,
+                                  lambda: self.manager.get_adapter("pixiv").fanbox_supporting_status({"proxy_url": proxy_url}))
 
     def _check_pixiv_connection(self) -> None:
-        self.pixiv_connection_button.state(["disabled"])
-        self.pixiv_connection_status_var.set("正在检查 Pixiv 资料接口和头像图片…")
-
         proxy_url = self.proxy_var.get().strip()
-
-        def worker() -> None:
-            try:
-                adapter = self.manager.get_adapter("pixiv")
-                result = adapter.connection_status({"proxy_url": proxy_url})
-            except Exception as exc:  # noqa: BLE001
-                self.ui_queue.put(("pixiv_connection_error", str(exc)))
-                return
-            self.ui_queue.put(("pixiv_connection_loaded", result))
-
-        threading.Thread(target=worker, name="pixiv-connection-status", daemon=True).start()
+        self._start_settings_check("Pixiv", self.pixiv_connection_button, self.pixiv_connection_status_var,
+                                  lambda: self.manager.get_adapter("pixiv").connection_status({"proxy_url": proxy_url}))
 
     def _check_jm_connection(self) -> None:
         domain = self.jm_domain_var.get().strip().rstrip("/")
@@ -1126,21 +1175,11 @@ class SettingsTabMixin:
         if not valid:
             messagebox.showwarning("JMComic 域名无效", "请先输入完整的 http/https 站点 URL")
             return
-        self.jm_connection_button.state(["disabled"])
-        self.jm_connection_status_var.set("正在检查 JMComic 站点…")
         proxy_url = self.proxy_var.get().strip()
         user_agent = self.jm_user_agent_var.get().strip()
-
-        def worker() -> None:
-            try:
-                adapter = self.manager.get_adapter("jmcomic")
-                result = adapter.connection_status({"domain": domain, "proxy_url": proxy_url, "user_agent": user_agent})
-            except Exception as exc:  # noqa: BLE001
-                self.ui_queue.put(("jm_connection_error", str(exc)))
-                return
-            self.ui_queue.put(("jm_connection_loaded", result))
-
-        threading.Thread(target=worker, name="jm-connection-status", daemon=True).start()
+        self._start_settings_check("JMComic", self.jm_connection_button, self.jm_connection_status_var,
+                                  lambda: self.manager.get_adapter("jmcomic").connection_status(
+                                      {"domain": domain, "proxy_url": proxy_url, "user_agent": user_agent}))
 
     def _open_jm_plain_browser(self) -> None:
         domain = self.jm_domain_var.get().strip().rstrip("/")
@@ -1384,6 +1423,7 @@ class SettingsTabMixin:
             "Pixiv": "登录后还会调用 Pixiv 账号接口确认会话有效；保存时保留已有 FANBOX Cookie。",
             "FANBOX": "通过 Pixiv 账号登录，并以 FANBOX 支持方案接口确认会话；保存时保留已有 Pixiv Cookie。",
             "Instagram": "登录完成后检测 sessionid；可以在页面内完成验证码或双重验证。",
+            "JMComic": "AVS 表示账号会话，cf_clearance 只表示通过站点验证；个人列表还需要正确的个人主页用户名。",
             "HentaiPaw": "可导入浏览器导出的 Cookie JSON、cookies.txt 或 Cookie 请求头。只保存本站 Cookie；配置成功不代表账号已验证。匿名可读的作品无需 Cookie。",
             "E-Hentai 表站": "仅手动填写或导入：在已登录浏览器的 F12 → Application → Storage → Cookies → e-hentai.org 查看 ipb_member_id、ipb_pass_hash。保存不联网，需验证时再点“验证 EH 登录（联网）”。",
             "ExHentai 里站": "仅手动填写或导入：确认里站页面正常，在 F12 → Application → Storage → Cookies → exhentai.org 查看 ipb_member_id、ipb_pass_hash、igneous。保存不联网，验证和下载需可用的网络／代理。",
@@ -1410,6 +1450,8 @@ class SettingsTabMixin:
             self.cookie_capture_help_label.grid_remove()
         if platform == "HentaiPaw":
             self.cookie_capture_button.grid_remove()
+        if hasattr(self, "hentaipaw_access_button"):
+            self.hentaipaw_access_button.grid() if platform == "HentaiPaw" else self.hentaipaw_access_button.grid_remove()
         self.header_convert_button.grid()
         self.cookie_capture_status_var.set(
             hints.get(platform, "选择平台后打开独立登录窗口；软件不会保存账号密码。")
@@ -1451,26 +1493,35 @@ class SettingsTabMixin:
             return
         proxy = self.proxy_var.get().strip()
         self.eh_validate_button.state(["disabled"])
-        route = "通过已填写的代理" if proxy else "直连（代理 URL 为空，不使用系统代理）"
-        self.cookie_capture_status_var.set(f"正在验证 {platform}，本次{route}；验证不改写 Cookie…")
+        note = self._settings_check_note(platform)
+        self.cookie_capture_status_var.set(f"正在验证 {platform}；{note}")
+        self._record_settings_operation(platform, f"开始验证 {platform} 登录；{note}")
+        started = time.monotonic()
 
         def worker():
             try:
                 validate_saved_ehentai_cookies(platform, proxy_url=proxy)
             except Exception as exc:  # noqa: BLE001
-                self.ui_queue.put(("eh_validation_error", (platform, eh_validation_failure(exc, proxy_url=proxy))))
+                detail = eh_validation_failure(exc, proxy_url=proxy)
+                self.ui_queue.put(("eh_validation_error", (platform, f"{detail} · 耗时 {time.monotonic() - started:.1f} 秒。{note}")))
                 return
-            self.ui_queue.put(("eh_validation_done", (platform, f"本次{route}。")))
+            self.ui_queue.put(("eh_validation_done", (platform, f"耗时 {time.monotonic() - started:.1f} 秒。{note}")))
 
-        threading.Thread(target=worker, name="eh-cookie-validation", daemon=True).start()
+        try:
+            threading.Thread(target=worker, name="eh-cookie-validation", daemon=True).start()
+        except RuntimeError as exc:
+            self._finish_eh_validation((platform, safe_error_message(exc)), error=True)
 
     def _finish_eh_validation(self, payload, *, error: bool) -> None:
         self.eh_validate_button.state(["!disabled"])
         platform, message = payload
-        self.cookie_capture_status_var.set(
+        message = safe_error_message(
             f"{platform} 验证未通过：{message}"
             if error else f"{platform} 当前登录验证通过。{message}"
         )
+        if self.cookie_capture_platform_var.get().strip() == platform:
+            self.cookie_capture_status_var.set(message)
+        self._record_settings_operation(platform, message, error=error)
 
 
 
@@ -1499,7 +1550,9 @@ class SettingsTabMixin:
         try:
             converted = convert_header_capture_to_cookie_json(spec, source)
         except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("请求头转换失败", str(exc), parent=self)
+            message = safe_error_message(exc)
+            self._record_settings_operation(platform, f"{platform} 请求头转换失败：{message}", error=True)
+            messagebox.showerror("请求头转换失败", message, parent=self)
             return
         warning = (
             f"已提取 {converted.cookie_count} 个 Cookie 并生成：\n{converted.destination}\n\n"
@@ -1542,7 +1595,34 @@ class SettingsTabMixin:
                 return
             self.ui_queue.put(("header_import_done", (platform, converted, count, verified)))
 
-        threading.Thread(target=worker, name="header-json-import", daemon=True).start()
+        try:
+            threading.Thread(target=worker, name="header-json-import", daemon=True).start()
+        except RuntimeError as exc:
+            self._finish_header_import((platform, converted.destination, safe_error_message(exc)), error=True)
+
+    def _finish_header_import(self, payload, *, error):
+        self.header_convert_button.state(["!disabled"])
+        self.jm_header_convert_button.state(["!disabled"])
+        if error:
+            platform, destination, raw_message = payload
+            message = f"{platform} JSON 已生成但未导入：{Path(destination).name}；{safe_error_message(raw_message)}"
+        else:
+            platform, converted, count, verified = payload
+            message = (
+                f"{platform} 请求头已转换为 {converted.destination.name}，并导入 {count} 个 Cookie。"
+                + ("已完成目标站点在线验证。" if verified else "已保存，尚未联网验证；请通过对应平台的验证或在线读取入口检查。")
+            )
+            if platform == "HentaiPaw":
+                message += "公开页面可访问不代表账号已登录，Cookie 不包含浏览器收藏。"
+        message = safe_error_message(message)
+        if self.cookie_capture_platform_var.get().strip() == platform:
+            self.cookie_capture_status_var.set(message)
+            self.status_var.set(f"{platform} Cookie {'导入失败' if error else '已导入'}")
+        if platform == "JMComic":
+            self._refresh_jm_auth_status()
+        self._record_settings_operation(platform, message, error=error)
+        if not error:
+            self._refresh_platform_tabs()
 
 
 
@@ -1577,9 +1657,9 @@ class SettingsTabMixin:
             "浏览器登录与 Cookie 说明",
             "【使用步骤】\n"
             "1. 打开设置 → 浏览器登录与 Cookie。\n"
-            "2. 选择平台：Twitter/X、Pixiv、FANBOX、Instagram、E-Hentai 表站或 ExHentai 里站。\n"
+            "2. 选择平台：Twitter/X、Pixiv、FANBOX、Instagram、JMComic、HentaiPaw 或 EH。\n"
             "3. 确认代理 URL（登录窗口会使用当前值）。\n"
-            "4. 普通平台点「打开登录浏览器并获取」；EH 仅手动填写或导入 Cookie。\n"
+            "4. 普通平台点「打开登录浏览器并获取」；EH、HentaiPaw 使用手动或文件导入入口。\n"
             "5. 在官网窗口自行登录并完成验证，不要把密码输入软件。\n"
             "6. 普通平台检测到必需 Cookie 后自动保存并关闭窗口。\n"
             "   EH 保存不联网，需要时单独点击「验证 EH 登录（联网）」。\n"
@@ -1591,6 +1671,8 @@ class SettingsTabMixin:
             "- Instagram: sessionid\n"
             "- E-Hentai 表站: ipb_member_id、ipb_pass_hash\n"
             "- ExHentai 里站: ipb_member_id、ipb_pass_hash、igneous\n"
+            "- JMComic: AVS 表示账号会话，cf_clearance 只表示站点验证\n"
+            "- HentaiPaw: 按需导入本站 Cookie；站点访问检查不验证账号身份，收藏另行导入\n"
             "\n"
             "【注意事项】\n"
             "- 软件不保存账号密码，Cookie 只保存在 data/software_app/。\n"
@@ -1639,7 +1721,8 @@ class SettingsTabMixin:
             f"已打开 {platform} 登录窗口。请在网站内登录并完成验证；检测到所需 Cookie 后窗口会自动关闭。"
         )
         self.status_var.set(f"等待 {platform} 登录完成")
-        self._append_log(f"已打开 {platform} 独立登录窗口；不会读取或保存账号密码")
+        self._record_settings_operation(platform, f"开始获取 {platform} 浏览器 Cookie；{self._settings_check_note(platform, browser=True)}")
+        self._cookie_capture_active_platform = platform
         proxy_url = self.proxy_var.get().strip()
 
         def worker() -> None:
@@ -1655,7 +1738,10 @@ class SettingsTabMixin:
                 return
             self.ui_queue.put(("cookie_capture_done", result))
 
-        threading.Thread(target=worker, name=f"cookie-capture-{spec.key}", daemon=True).start()
+        try:
+            threading.Thread(target=worker, name=f"cookie-capture-{spec.key}", daemon=True).start()
+        except RuntimeError as exc:
+            self._finish_cookie_capture(safe_error_message(exc), error=True)
 
 
     def _import_selected_cookie_file(self) -> None:
@@ -1683,11 +1769,7 @@ class SettingsTabMixin:
             return
         proxy_url = self.proxy_var.get().strip()
         self.cookie_import_button.state(["disabled"])
-        self.cookie_capture_status_var.set(
-            f"正在导入 {platform} Cookie（仅本地检查，不联网）…"
-            if platform in {"E-Hentai 表站", "ExHentai 里站"}
-            else f"正在导入 {platform} Cookie 并检查会话…"
-        )
+        self.cookie_capture_status_var.set(f"正在导入 {platform} Cookie（仅本地检查，不联网）…")
 
         def worker() -> None:
             try:
@@ -1717,20 +1799,25 @@ class SettingsTabMixin:
         self.cookie_import_button.state(["!disabled"])
         if error:
             platform, raw_message = payload
-            self.cookie_capture_status_var.set(f"{platform} Cookie 导入失败：{raw_message}")
-            messagebox.showerror("Cookie 导入失败", str(raw_message), parent=self)
+            message = safe_error_message(f"{platform} Cookie 导入失败：{raw_message}")
+            if self.cookie_capture_platform_var.get().strip() == platform:
+                self.cookie_capture_status_var.set(message)
+                messagebox.showerror("Cookie 导入失败", message, parent=self)
+            self._record_settings_operation(platform, message, error=True)
             return
         platform, count, destination = payload
         if platform == "JMComic":
             self._refresh_jm_auth_status()
-        self.cookie_capture_status_var.set(
+        message = (
             f"{platform} 已从普通浏览器导出文件导入 {count} 个 Cookie；"
             + ("已保存，尚未联网验证；可点击“验证 EH 登录（联网）”。" if platform in {"E-Hentai 表站", "ExHentai 里站"}
                else "已配置本站 Cookie，账号登录状态未验证；公开页面读取成功不代表已登录。" if platform == "HentaiPaw"
                else "请使用平台连接检查或在线资料验证有效性。")
         )
-        self.status_var.set(f"{platform} Cookie 已导入")
-        self._append_log(f"{platform} Cookie 已从文件导入本机运行目录：{destination}")
+        if self.cookie_capture_platform_var.get().strip() == platform:
+            self.cookie_capture_status_var.set(message)
+            self.status_var.set(f"{platform} Cookie 已导入")
+        self._record_settings_operation(platform, message)
         self._refresh_platform_tabs()
 
 
@@ -1741,15 +1828,15 @@ class SettingsTabMixin:
         self.cookie_capture_button.state(["!disabled"])
         self.cookie_capture_button.configure(text="打开登录浏览器并获取")
         if error:
-            message = str(payload or "Cookie 获取未完成")
+            message = safe_error_message(str(payload or "Cookie 获取未完成"))
             self.cookie_capture_status_var.set(message)
             self.status_var.set("Cookie 获取未完成")
-            self._append_log(f"Cookie 获取未完成：{message}")
+            self._record_settings_operation(getattr(self, "_cookie_capture_active_platform", "settings"),
+                                            f"Cookie 获取未完成：{message}", error=True)
             return
 
         platform = str(getattr(payload, "platform", "") or "所选平台")
         count = int(getattr(payload, "cookie_count", 0) or 0)
-        destination = Path(getattr(payload, "destination", ""))
         user_agent = str(getattr(payload, "user_agent", "") or "").strip()
         if platform == "JMComic":
             domain = self.jm_domain_var.get().strip().rstrip("/")
@@ -1762,7 +1849,7 @@ class SettingsTabMixin:
             f"{platform} 登录资料已保存：{count} 个 Cookie。可以关闭网站会话后继续在软件中使用。"
         )
         self.status_var.set(f"{platform} Cookie 已更新")
-        self._append_log(f"{platform} Cookie 已安全保存到本机运行目录：{destination}")
+        self._record_settings_operation(platform, f"{platform} 浏览器 Cookie 已保存：{count} 个")
         self._refresh_platform_tabs()
 
 

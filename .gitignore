@@ -24,6 +24,7 @@ dist/
 *.log
 *.tmp
 *.temp
+package-smoke.json
 
 # Local databases and runtime state
 .yuqiuda-http-*/

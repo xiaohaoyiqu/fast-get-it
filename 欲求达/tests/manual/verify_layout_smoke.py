@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,10 @@ import time
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--platform", default="twitter")
+    parser.add_argument("--scope", default="")
+    args = parser.parse_args()
     repo = Path(__file__).resolve().parents[2]
     root = repo / "data/software_app/verification" / f"layout-{time.time_ns()}"
     root.mkdir(parents=True)
@@ -23,6 +28,10 @@ def main():
     from software_app.ui.tk_app import SoftwareDesktop
 
     app = SoftwareDesktop()
+    app._select_module(args.platform)
+    if args.scope:
+        app.content_scope_var.set(args.scope)
+        app._content_scope_changed()
     errors = []
     app.report_callback_exception = lambda _typ, value, _tb: errors.append(str(value))
     checks = []

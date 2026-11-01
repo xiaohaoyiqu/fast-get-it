@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import errno
 import tempfile
 import threading
 import unittest
@@ -17,6 +18,8 @@ from software_app.core.adapter import TaskCancelled
 from software_app.core.blocklist import work_from_target
 from software_app.core.browser_cookie_capture import cookie_capture_spec, import_cookie_file
 from software_app.core.mixed_batch import route_batch
+from software_app.core.storage import AppStorage
+from software_app.core.task_manager import TaskManager
 from software_app.crawlers.common import MediaDownloadResult
 from software_app.crawlers.hentaipaw import HentaiPawClient, normalize_article_url, parse_article, parse_reader
 
@@ -43,7 +46,8 @@ def reader_html(urls=None, article_id="123", text_record=False, split=False):
 
 class HentaiPawTests(unittest.TestCase):
     def test_canonical_article(self):
-        for value in ("123", "https://hentaipaw.com/articles/123/", "https://zh.hentaipaw.com/articles/123#top"):
+        for value in ("123", "https://hentaipaw.com/articles/123/", "https://zh.hentaipaw.com/articles/123#top",
+                      "https://zh.hentaipaw.com/viewer?articleId=123&page=2"):
             with self.subTest(value=value):
                 self.assertEqual(normalize_article_url(value), "https://zh.hentaipaw.com/articles/123")
 
@@ -52,7 +56,9 @@ class HentaiPawTests(unittest.TestCase):
                       "https://evil.org/articles/123", "https://u:p@zh.hentaipaw.com/articles/123",
                       "https://zh.hentaipaw.com:444/articles/123", "http://zh.hentaipaw.com/articles/123",
                       "https://zh.hentaipaw.com/articles/search?keyword=test",
-                      "https://zh.hentaipaw.com/viewer?articleId=123&page=1"):
+                      "https://zh.hentaipaw.com/viewer?articleId=123&articleId=999",
+                      "https://zh.hentaipaw.com/viewer?articleId=123&page=0",
+                      "https://zh.hentaipaw.com/viewer?articleId=123&redirect=https://evil.org"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 normalize_article_url(value)
 
@@ -76,10 +82,14 @@ class HentaiPawTests(unittest.TestCase):
 
     def test_live_preview_uses_bounded_reader(self):
         with patch("software_app.crawlers.hentaipaw.client.WebPageCrawler._fetch_html",
-                   return_value=(HTML, "https://zh.hentaipaw.com/articles/123")) as fetch:
+                   side_effect=[(HTML, "https://zh.hentaipaw.com/articles/123"),
+                                (reader_html(), "https://zh.hentaipaw.com/viewer?articleId=123&page=1")]) as fetch:
             result = HentaiPawAdapter().preview_target("123", {"live": True})
-        fetch.assert_called_once()
+        self.assertEqual(fetch.call_count, 2)
         self.assertEqual(result.title, "Example Gallery")
+        self.assertEqual(result.metadata["page_count"], 2)
+        self.assertTrue(result.metadata["reader_verified"])
+        self.assertEqual(result.metadata["thumbnail_url"], result.metadata["cover_url"])
 
     def test_redirect_to_other_work_is_rejected(self):
         with patch("software_app.crawlers.hentaipaw.client.WebPageCrawler._fetch_html",
@@ -182,7 +192,7 @@ class HentaiPawTests(unittest.TestCase):
         html = '<a href="/articles/123"><img alt="Example"></a><a href="/articles/123">Example</a>'
         html += '<a href="https://evil.org/articles/999">bad</a><a href="/articles/456">Second</a>'
         with HentaiPawClient() as client, patch.object(client, "_fetch", return_value=(
-            html, "https://zh.hentaipaw.com/articles/search?keyword=example",
+            html, "https://zh.hentaipaw.com/articles/search?keyword=a%26b",
         )) as fetch:
             rows = client.search("a&b", 1)
         self.assertEqual(len(rows), 1)
@@ -229,3 +239,120 @@ class HentaiPawTests(unittest.TestCase):
                     client.download(DownloadTask("test", "hentaipaw", "123", Path(folder)),
                                     CallbackSet(), threading.Event())
             self.assertEqual(list(Path(folder).iterdir()), [])
+
+    def test_search_follows_matching_pagination_and_preserves_card_title(self):
+        first = ('<a href="/articles/123"><img alt="Example, English"><div title="Example">Example</div>'
+                 '<p>Artist name</p></a><a href="/articles/search?keyword=example&amp;page=2">next</a>')
+        second = '<a href="/articles/123">Example</a><a href="/articles/456">Second</a>'
+        with HentaiPawClient() as client, patch.object(client, "_fetch", side_effect=[
+            (first, "https://zh.hentaipaw.com/articles/search?keyword=example"),
+            (second, "https://zh.hentaipaw.com/articles/search?keyword=example&page=2"),
+        ]) as fetch:
+            rows = client.search("example", 10)
+        self.assertEqual([row["title"] for row in rows], ["Example", "Second"])
+        self.assertEqual(fetch.call_count, 2)
+
+    def test_search_never_follows_other_keywords_or_external_pagination(self):
+        html = ('<a href="/articles/123">Example</a>'
+                '<a href="https://evil.org/articles/search?keyword=example&page=2">next</a>'
+                '<a href="/articles/search?keyword=other&amp;page=2">next</a>')
+        with HentaiPawClient() as client, patch.object(client, "_fetch", return_value=(
+            html, "https://zh.hentaipaw.com/articles/search?keyword=example",
+        )) as fetch:
+            rows = client.search("example", 10)
+        fetch.assert_called_once()
+        self.assertEqual(len(rows), 1)
+
+    def test_zero_search_limit_does_not_fetch(self):
+        with HentaiPawClient() as client, patch.object(client, "_fetch") as fetch:
+            self.assertEqual(client.search("example", 0), [])
+        fetch.assert_not_called()
+
+    def test_article_login_redirect_has_actionable_message(self):
+        with HentaiPawClient() as client, patch.object(client, "_fetch", return_value=(
+            "<h1>Log in</h1>", "https://zh.hentaipaw.com/login",
+        )):
+            with self.assertRaisesRegex(PermissionError, "Cookie"):
+                client.article("123")
+
+    def test_cover_loader_rejects_non_cover_urls_before_sending_requests(self):
+        adapter = HentaiPawAdapter()
+        for url in ("https://evil.org/123/thumbnails/cover.webp", "https://cdn.imagedeliveries.com/123/hash/1.webp",
+                    "https://u:p@cdn.imagedeliveries.com/123/thumbnails/cover.webp"):
+            with self.subTest(url=url), patch("software_app.adapters.hentaipaw.request_get") as fetch:
+                with self.assertRaises(ValueError):
+                    adapter.fetch_preview_image_bytes(url)
+                fetch.assert_not_called()
+
+
+class HentaiPawQueueTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=Path.cwd())
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.storage = AppStorage(self.root / "state.db")
+        self.manager = TaskManager(self.storage)
+        self.addCleanup(lambda: self.manager.shutdown(timeout=2))
+        self.manager.register_adapter(HentaiPawAdapter())
+        self.indices = []
+        self.fail_page = 2
+        self.local_error = False
+        self.patches = [
+            patch.object(HentaiPawClient, "article", return_value=parse_article(HTML, "123")),
+            patch.object(HentaiPawClient, "reader", return_value=parse_reader(reader_html(), "123")),
+            patch("software_app.crawlers.hentaipaw.client.download_media_file", side_effect=self.transfer),
+        ]
+        for mocked in self.patches:
+            mocked.start()
+            self.addCleanup(mocked.stop)
+
+    def transfer(self, session, url, source, destination, cancel_event, suffix, **kwargs):
+        page = int(destination.stem)
+        self.indices.append(page)
+        if self.local_error:
+            raise OSError(errno.ENOSPC, "generated disk full")
+        if page == self.fail_page:
+            raise ValueError("generated invalid image")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"generated image fixture")
+        return MediaDownloadResult(destination.stat().st_size, False, destination)
+
+    def start(self):
+        task = self.manager.start_task("hentaipaw", "123", self.root, {"archive_mode": "task", "retries": 0})
+        self.manager.wait(task.task_id, 10)
+        return task
+
+    def test_partial_download_and_retry_keep_page_results_and_original_folder(self):
+        with patch("software_app.core.task_manager.run_archive_postprocess") as archive:
+            original = self.start()
+        self.assertEqual(self.storage.get_task(original.task_id)["status"], "partial")
+        self.assertEqual(self.storage.media_summary(original.task_id), {"saved": 1, "failed": 1})
+        archive.assert_not_called()
+        failed = self.storage.media_results(original.task_id, unfinished=True)[0]
+        self.fail_page = 0
+        with patch("software_app.crawlers.hentaipaw.client.platform_output_root") as new_directory:
+            retry = self.manager.retry_task(original.task_id, failed_only=True)
+            self.manager.wait(retry.task_id, 10)
+        new_directory.assert_not_called()
+        self.assertEqual(self.indices, [1, 2, 2])
+        self.assertEqual(self.storage.get_task(retry.task_id)["status"], "completed")
+        self.assertEqual(self.storage.media_results(original.task_id, unfinished=True), [])
+        self.assertTrue((self.root / failed["folder"] / "images/0002.png").is_file())
+
+    def test_disk_error_stops_later_pages_and_keeps_them_pending(self):
+        self.local_error = True
+        task = self.start()
+        self.assertEqual(self.indices, [1])
+        self.assertEqual(self.storage.get_task(task.task_id)["status"], "failed")
+        self.assertEqual(self.storage.media_summary(task.task_id), {"failed": 1, "pending": 1})
+
+    def test_early_failure_does_not_scan_other_works_into_task(self):
+        unrelated = self.root / "other-work.jpg"
+        unrelated.write_bytes(b"other work")
+        with patch.object(HentaiPawClient, "reader", side_effect=PermissionError("Login required")), patch.object(
+            self.storage, "scan_media_files", wraps=self.storage.scan_media_files,
+        ) as scan:
+            task = self.start()
+        self.assertEqual(self.storage.get_task(task.task_id)["status"], "failed")
+        scan.assert_not_called()
+        self.assertEqual(self.storage.task_file_records(task.task_id), [])

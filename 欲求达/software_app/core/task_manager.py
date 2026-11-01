@@ -767,7 +767,8 @@ class TaskManager:
                     # A media plan already identifies this task's work. A broad
                     # directory scan could steal recent outputs from the parent
                     # task after a filtered or failed subset refresh.
-                    partial_records = [] if self.storage.media_summary(task.task_id) else self.storage.scan_media_files(
+                    partial_records = [] if (getattr(adapter, "reports_files", False)
+                                             or self.storage.media_summary(task.task_id)) else self.storage.scan_media_files(
                         scan_root, task.module_id, task.task_id, modified_after=scan_started_at,
                     )
                     known_paths = {str(record.path).casefold() for record in emitted_records}

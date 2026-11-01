@@ -14,4 +14,4 @@
 
 已有 `data/`、`dist/` 和 `.venv/` 保留原位置；源码运行会继续读取现有 `data/software_app/`，避免丢失账号与下载历史。`YUQIUDA_HOME` 可显式指定运行数据目录。历史爬虫、参考工程和油猴脚本保留在原目录。
 
-HentaiPaw 已支持作品预览、关键词搜索、阅读器原图下载和独立 Cookie 导入。E-Hentai / ExHentai、Google 相似图片和网页资源已标记为可用。能力范围与登录核查结果见 [平台说明](欲求达/文档/平台/试验模块与HentaiPaw.md)。
+HentaiPaw 已支持作品预览、关键词搜索、分类与排行榜、阅读器原图下载、逐页补下、收藏导入导出及独立 Cookie 与访问检查。E-Hentai / ExHentai、Google 相似图片和网页资源已标记为可用。能力范围与登录核查结果见 [平台说明](欲求达/文档/平台/试验模块与HentaiPaw.md)。

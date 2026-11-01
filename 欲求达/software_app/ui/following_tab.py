@@ -131,6 +131,12 @@ class FollowingTabMixin:
         )
         self.eh_unfavorite_button.grid(row=0, column=4, sticky="w")
         self.eh_unfavorite_button.grid_remove()
+        self.hentaipaw_previous_button = ttk.Button(candidate_actions, text="上一页分类", width=0, command=lambda: self._hentaipaw_index_page(-1))
+        self.hentaipaw_previous_button.grid(row=6, column=0, sticky="ew")
+        self.hentaipaw_previous_button.grid_remove()
+        self.hentaipaw_next_button = ttk.Button(candidate_actions, text="下一页分类", width=0, command=lambda: self._hentaipaw_index_page(1))
+        self.hentaipaw_next_button.grid(row=6, column=1, sticky="ew")
+        self.hentaipaw_next_button.grid_remove()
         self.following_progress_label = ttk.Label(
             button_row,
             textvariable=self.following_progress_status_var,
@@ -266,7 +272,20 @@ class FollowingTabMixin:
         for button in (self.bluesky_follow_button, self.bluesky_unfollow_button):
             button.grid() if adapter.module_id == "bluesky" else button.grid_remove()
         for button in (self.eh_favorite_button, self.eh_unfavorite_button):
-            button.grid() if adapter.module_id == "ehentai" else button.grid_remove()
+            button.grid() if adapter.module_id in {"ehentai", "hentaipaw"} else button.grid_remove()
+        if adapter.module_id == "hentaipaw":
+            self.eh_favorite_button.configure(text="加入软件收藏", command=lambda: self._hentaipaw_set_favorite(True))
+            self.eh_unfavorite_button.configure(text="移出软件收藏", command=lambda: self._hentaipaw_set_favorite(False))
+        else:
+            self.eh_favorite_button.configure(text="加入 EH 收藏", command=lambda: self._manage_eh_favorite(True))
+            self.eh_unfavorite_button.configure(text="移出 EH 收藏", command=lambda: self._manage_eh_favorite(False))
+        from software_app.crawlers.hentaipaw.catalog import CATEGORY_SCOPES
+
+        for button in (self.hentaipaw_previous_button, self.hentaipaw_next_button):
+            button.grid() if adapter.module_id == "hentaipaw" and scope in CATEGORY_SCOPES else button.grid_remove()
+            context = getattr(self, "_platform_search_context", None)
+            busy = context is not None and context[:2] == (adapter.module_id, scope)
+            button.state(["disabled"] if busy else ["!disabled"])
         candidate_names = {
             "twitter": "Twitter 关注 / 用户",
             "pixiv": "Pixiv 作者 / 作品候选",
@@ -408,6 +427,12 @@ class FollowingTabMixin:
             self.following_export_button.configure(text="导出关注", command=self._export_following_accounts)
             self.following_import_button.state(["!disabled"] if adapter.module_id in {"pixiv", "jmcomic", "instagram"} else ["disabled"])
             self.following_export_button.state(["disabled"])
+            if adapter.module_id == "hentaipaw":
+                self.following_import_button.configure(text="导入浏览器收藏", command=self._hentaipaw_import_favorites)
+                self.following_export_button.configure(text="导出软件收藏", command=self._hentaipaw_export_favorites)
+                self.following_import_button.state(["!disabled"])
+                self.following_export_button.state(["!disabled"])
+                self.candidate_local_button.configure(text="读取软件收藏" if scope == "软件收藏" else "显示本次结果")
             self.following_full_refresh_button.state(["disabled"])
             is_search_scope = (
                 adapter.module_id == "google_image"
@@ -417,6 +442,8 @@ class FollowingTabMixin:
                 )
                 or (adapter.module_id == "jmcomic" and scope not in {"漫画 ID / 链接", "章节 ID / 链接"})
                 or (adapter.module_id == "bluesky" and scope != "帖子 / 媒体")
+                or (adapter.module_id == "ehentai" and scope != "画廊链接 / ID")
+                or (adapter.module_id == "hentaipaw" and scope != "作品链接 / ID")
             )
             if adapter.module_id == "pixiv" and scope in {"作品收藏", "小说收藏"}:
                 self.candidate_refresh_var.set("更新我的作品收藏" if scope == "作品收藏" else "更新我的小说收藏")
@@ -447,6 +474,8 @@ class FollowingTabMixin:
             else:
                 self.candidate_refresh_var.set("打开相似搜索" if adapter.module_id == "google_image" else "执行此类搜索")
             can_refresh = is_search_scope and ("search" in adapter.info.capabilities or adapter.module_id == "google_image")
+            context = getattr(self, "_platform_search_context", None)
+            can_refresh = can_refresh and not (context is not None and context[:2] == (adapter.module_id, scope))
             self.candidate_refresh_button.state(["!disabled"] if can_refresh else ["disabled"])
             self.following_tree.heading("handle", text="目标")
             self.following_tree.heading("name", text="标题")
@@ -782,6 +811,9 @@ class FollowingTabMixin:
         return PLATFORM_CONTENT_SCOPES.get(module_id, ("目标",))[0]
 
     def _load_platform_candidates(self) -> None:
+        if self.module_var.get() == "hentaipaw" and self.content_scope_var.get() == "软件收藏":
+            self._hentaipaw_show_favorites()
+            return
         if self.module_var.get() == "twitter" and self.content_scope_var.get() == "关注账号":
             self._load_following_accounts()
             self._show_following_cache_info(self.manager.get_adapter("twitter").following_cache_info())
@@ -984,7 +1016,7 @@ class FollowingTabMixin:
             desired, label, message = payload
             action = "关注" if desired else "取消关注"
             self.status_var.set(f"Bluesky {action}失败")
-            self._append_log(f"Bluesky {action} {label} 失败：{message}")
+            self._record_settings_operation("bluesky", f"Bluesky {action} {label} 失败：{message}", error=True)
             messagebox.showerror(f"Bluesky {action}失败", str(message), parent=self)
         else:
             desired, label, result = payload
@@ -992,7 +1024,7 @@ class FollowingTabMixin:
             changed = bool(result.get("changed")) if isinstance(result, dict) else False
             message = f"已{action} {label}" if changed else f"{label} 已经处于目标状态，无需重复操作"
             self.status_var.set(message)
-            self._append_log(message)
+            self._record_settings_operation("bluesky", message)
         self._candidate_selection_changed()
 
     def _manage_eh_favorite(self, desired: bool) -> None:
@@ -1096,13 +1128,13 @@ class FollowingTabMixin:
         action = "加入收藏" if desired else "移出收藏"
         if error:
             self.status_var.set(f"EH {action}失败")
-            self._append_log(f"EH {action} {label} 失败：{detail}")
+            self._record_settings_operation("ehentai", f"EH {action} {label} 失败：{detail}", error=True)
             messagebox.showerror(f"EH {action}失败", str(detail), parent=self)
         else:
             changed = bool(detail.get("changed")) if isinstance(detail, dict) else False
             message = f"已将 {label} {action}" if changed else f"{label} 已经处于目标收藏状态，无需重复操作"
             self.status_var.set(message)
-            self._append_log(message)
+            self._record_settings_operation("ehentai", message)
         self._candidate_selection_changed()
 
     def _candidate_selection_changed(self, _event=None) -> None:
@@ -1137,8 +1169,11 @@ class FollowingTabMixin:
             and single
             and str(row.get("input_kind") or "") == "gallery"
         ) if row else False
+        hp_work = bool(row and self.module_var.get() == "hentaipaw" and single and row.get("downloadable", True))
         for button in (self.eh_favorite_button, self.eh_unfavorite_button):
-            button.state(["!disabled"] if eh_gallery else ["disabled"])
+            button.state(["!disabled"] if eh_gallery or hp_work else ["disabled"])
+        is_category = bool(row and self.module_var.get() == "hentaipaw" and row.get("input_kind") == "category")
+        self.candidate_preview_button.configure(text="展开分类" if is_category else "在线获取资料")
         author_keys = [self._candidate_author_key(item) for item in rows]
         self.candidate_block_author_button.state(["!disabled"] if any(author_keys) else ["disabled"])
         self.candidate_block_work_button.state(["!disabled"] if any(
@@ -1258,6 +1293,9 @@ class FollowingTabMixin:
             messagebox.showwarning("未选择候选", "请先选择一个作者、作品或页面")
             return
         module_id = str(row.get("module_id") or self.module_var.get())
+        if module_id == "hentaipaw" and row.get("input_kind") == "category":
+            self._hentaipaw_open_category()
+            return
         target = str(row.get("target") or "").strip()
         if module_id == "google_image" and target.startswith(("http://", "https://")):
             module_id = "website"
@@ -1677,8 +1715,8 @@ class FollowingTabMixin:
             self.status_var.set(f"已加载关注作者 {len(self.following_rows)} 个")
         else:
             self.status_var.set("本地关注缓存中没有可用的 Twitter 账号")
-        self._refresh_target_browser()
         if self.module_var.get() == "twitter":
+            self._refresh_target_browser()
             self._refresh_platform_tabs()
 
     def _selected_following_handle(self) -> str:
@@ -1885,8 +1923,8 @@ class FollowingTabMixin:
                     row.get("source") or "-",
                 ),
             )
-        self._refresh_target_browser()
         if self.module_var.get() == "twitter":
+            self._refresh_target_browser()
             self._refresh_platform_tabs()
 
     def _selected_history_row(self) -> dict | None:
@@ -2095,6 +2133,8 @@ class FollowingTabMixin:
 
             options.update(saved_aria2_limits(settings).options())
             options["max_torrents"] = 1
+        if module_id == "hentaipaw":
+            options["types"] = "1"
         return options
 
     def _clear_twitter_download_records(self) -> None:

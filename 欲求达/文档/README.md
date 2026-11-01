@@ -8,7 +8,7 @@
 - [E-Hentai / ExHentai](平台/E-Hentai使用与登录.md)：独立会话、验证、搜索与下载。
 - [JMComic](平台/JMComic使用与登录.md)：登录资料、章节下载与访问错误。
 - [Bluesky 与 Instagram](平台/Bluesky与Instagram.md)：接入范围、账号资料与媒体入口。
-- [平台状态与 HentaiPaw](平台/试验模块与HentaiPaw.md)：可用标记、登录核查、Cookie 导入和原图下载。
+- [平台状态与 HentaiPaw](平台/试验模块与HentaiPaw.md)：预览、分类、排行、原图下载、逐页补下、收藏导入导出及访问检查。
 
 ## 开发
 

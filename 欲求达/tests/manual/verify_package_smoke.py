@@ -24,16 +24,22 @@ def main():
         runtime = Path(temporary)
         env = {**os.environ, "YUQIUDA_HOME": str(runtime), "YUQIUDA_OUTPUT_DIR": str(runtime / "media"),
                "PYTHONIOENCODING": "utf-8"}
-        for command in ("--help", "modules"):
-            result = subprocess.run([str(cli), command], cwd=runtime, env=env, capture_output=True,
+        commands = (
+            ("--help",), ("modules",),
+            ("preview", "hentaipaw", "123"),
+            ("preview", "hentaipaw", "https://zh.hentaipaw.com/tags"),
+            ("search", "hentaipaw", "全部", "--scope", "软件收藏", "--limit", "1"),
+        )
+        for command in commands:
+            result = subprocess.run([str(cli), *command], cwd=runtime, env=env, capture_output=True,
                                     text=True, encoding="utf-8", errors="replace", timeout=45)
             if result.returncode:
                 raise RuntimeError(f"CLI {command}: {result.stderr[-2000:]}")
-            if command == "modules" and not all(name in result.stdout for name in (
-                "twitter", "pixiv", "jmcomic", "ehentai", "bluesky", "instagram", "google_image", "website",
+            if command == ("modules",) and not all(name in result.stdout for name in (
+                "twitter", "pixiv", "jmcomic", "ehentai", "bluesky", "instagram", "google_image", "website", "hentaipaw",
             )):
                 raise AssertionError("packaged modules missing")
-            checks.append(f"cli {command}")
+            checks.append("cli " + " ".join(command))
         if not (runtime / "data/software_app/content_downloader.db").is_file():
             raise AssertionError("package did not respect isolated runtime directory")
         checks.append("isolated runtime")

@@ -70,6 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("query")
     search_parser.add_argument("--limit", type=int, default=20)
     search_parser.add_argument("--headless", action="store_true")
+    search_parser.add_argument("--scope", default="", help="搜索范围，例如 HentaiPaw 的标签分类、日榜或软件收藏")
 
     download_parser = subparsers.add_parser("download", help="启动下载任务")
     download_parser.add_argument("module")
@@ -275,12 +276,13 @@ def preview_target(module_id: str, target: str, types: str, live: bool = False, 
     return 0
 
 
-def search_targets(module_id: str, query: str, limit: int, headless: bool = False) -> int:
+def search_targets(module_id: str, query: str, limit: int, headless: bool = False, scope: str = "") -> int:
     context = create_app_context()
     adapter = context.task_manager.get_adapter(module_id)
     try:
         rows = adapter.search_targets(query, limit=limit, options={
             "headless": headless, "proxy_url": str(context.storage.get_setting("proxy_url", "") or ""),
+            "search_mode": scope,
         })
     except Exception as exc:  # noqa: BLE001
         print(f"搜索失败: {exc}", file=sys.stderr)
@@ -344,7 +346,7 @@ def main() -> int:
     if args.command == "preview":
         return preview_target(args.module, args.target, args.types, args.live, args.input_kind)
     if args.command == "search":
-        return search_targets(args.module, args.query, args.limit, args.headless)
+        return search_targets(args.module, args.query, args.limit, args.headless, args.scope)
     if args.command == "download":
         return download_target(args.module, args.target, args.types, args.output_dir)
     if args.command == "library":

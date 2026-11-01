@@ -27,10 +27,14 @@
 | `verify_bandwidth_smoke.py`、`verify_domain_backoff_smoke.py` | 本机 HTTP 共享限速和长退避 |
 | `verify_aria2_limits_smoke.py`、`verify_hls_resume_smoke.py`、`verify_media_engine_smoke.py` | aria2、HLS 及真实 FFmpeg；相关外部工具需可用 |
 | `verify_tool_install_smoke.py` | 生成候选工具并验证安装失败保护 |
-| `verify_package_smoke.py` | 检查指定目录的 GUI／CLI 成品；`--gui` 会打开窗口并正常关闭 |
+| `verify_package_smoke.py` | 检查 GUI／CLI 成品、九个平台、HentaiPaw 本地预览、分类识别和软件收藏入口；`--gui` 打开窗口并正常关闭，使用隔离数据 |
 | `verify_daily_platform_live.py` | 按平台执行有界实站验收；访问网站，部分平台读取指定运行目录中已保存的登录资料 |
 | `verify_pixiv_live_smoke.py`、`verify_eh_live_smoke.py` | 平台专项实站入口，先阅读参数与脚本范围再运行 |
 | `verify_hentaipaw_live_smoke.py` | HentaiPaw 详情与原图列表、可选搜索及单页下载校验；默认匿名，账号测试需显式提供 Cookie 文件 |
+| `verify_hentaipaw_desktop_smoke.py` | HentaiPaw 原生界面、封面、页数、候选入队与 Cookie 入口，使用隔离数据和生成图片，不访问真实账号 |
+| `verify_ui_state_smoke.py` | 九个平台切换、规划范围与可用范围的按钮恢复、搜索乱序返回及过期错误；使用隔离数据与模拟响应 |
+| `verify_platform_feedback_smoke.py` | 所有平台内容范围、设置检查成功与失败、配置未保存提示、Cookie 平台切换和日志落库；使用隔离数据与模拟响应 |
+| `verify_hentaipaw_features_smoke.py` | HentaiPaw 分类展开、排行、软件收藏管理、导入导出和站点访问检查；使用生成数据，不读取真实浏览器收藏 |
 
 本机编排示例：
 
@@ -40,7 +44,13 @@
 .\.venv\Scripts\python.exe -X utf8 tests/manual/verify_package_smoke.py dist
 ```
 
-`verify_runtime_smoke.py database` 是数据库迁移验收入口，会备份并在验证中访问当前用户数据库，不属于日常默认烟测。不要因为整理文档而运行它。实站脚本也不包含在本机日常编排中；Pixiv 账号继续按用户要求跳过。
+`verify_runtime_smoke.py database` 是数据库迁移验收入口，会备份并在验证中访问当前用户数据库，不属于日常默认烟测。不要因为整理文档而运行它。实站脚本也不包含在本机日常编排中；使用真实账号资料前需得到授权，未配置时不能将匿名读取当作登录验证。
+
+## 2026-11-01 验收范围
+
+源码自动回归通过 1072 项；平台设置与反馈的原生检查通过 89 个检查点，三种窗口尺寸、两档字体的布局检查通过 1207 项。GUI／CLI 单文件构建后，8 项成品启动与入口检查通过，替换至最终目录后再次通过。
+
+有界实站检查覆盖 HentaiPaw 匿名在线预览、日榜和单页原图，JMComic 搜索与首图，以及 EH 表站验证、画廊搜索和单页图片。Twitter 本次只验证公开主页读取；Instagram 只确认页面目标输出有效图片，未验证帖子与 Reels。以上结果不代表所有平台、账号或业务均可用。原始日志、截图和个人账号检查结果保留在本地，不纳入源码提交。
 
 ## 产物保留规则
 

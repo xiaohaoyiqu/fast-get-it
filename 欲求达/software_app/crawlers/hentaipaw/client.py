@@ -10,8 +10,8 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 import requests
 
 from software_app.core.adapter import TaskCancelled
+from software_app.core.media_results import media_descriptor, refreshed_media, retry_folder, run_media_jobs
 from software_app.core.models import FileRecord, ProgressEvent, classify_file
-from software_app.core.security import safe_error_message
 from software_app.core.settings import HENTAIPAW_DATA_DIR
 from software_app.core.task_control import task_cancelled
 from software_app.crawlers.common import (
@@ -33,8 +33,16 @@ def normalize_article_url(raw: str) -> str:
             or parsed.username or parsed.password or parsed.port not in {None, 443}):
         raise ValueError("请输入 HentaiPaw HTTPS 作品链接或数字 ID")
     match = re.fullmatch(r"/articles/([0-9]+)/?", parsed.path)
+    if parsed.path == "/viewer":
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        article = query.get("articleId", [])
+        page = query.get("page", ["1"])
+        if (set(query) <= {"articleId", "page"} and len(article) == 1
+                and re.fullmatch(r"[0-9]+", article[0]) and len(page) == 1 and re.fullmatch(r"[1-9][0-9]*", page[0])):
+            return f"{BASE_URL}/articles/{article[0]}"
+        raise ValueError("阅读器链接需要有效的 articleId 和页码")
     if not match or parsed.query:
-        raise ValueError("请使用 /articles/数字ID 作品链接")
+        raise ValueError("请使用 /articles/数字ID 作品链接或阅读器链接")
     return f"{BASE_URL}/articles/{match[1]}"
 
 
@@ -87,6 +95,7 @@ def parse_article(html: str, url: str) -> dict:
         "title": title,
         "url": normalized,
         "cover_url": parser.cover,
+        "thumbnail_url": parser.cover,
         "visible_page_count": len(parser.pages),
         "reader_url": f"{BASE_URL}/viewer?articleId={article_id}&page=1",
         "download_ready": True,
@@ -192,12 +201,16 @@ class _SearchParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.rows = {}
         self.active = None
+        self.links = []
+        self.named_title = False
 
     def handle_starttag(self, tag, attrs):
         values = dict(attrs)
         if tag == "a":
             self.active = None
+            self.named_title = False
             href = str(values.get("href") or "")
+            self.links.append(urljoin(BASE_URL, href))
             try:
                 url = normalize_article_url(urljoin(BASE_URL, href))
             except ValueError:
@@ -206,13 +219,16 @@ class _SearchParser(HTMLParser):
         if tag == "img" and self.active is not None:
             if not self.active["title"]:
                 self.active["title"] = str(values.get("alt") or "").strip()
+        if self.active is not None and values.get("title"):
+            self.active["title"] = str(values["title"]).strip()
+            self.named_title = True
 
     def handle_endtag(self, tag):
         if tag == "a":
             self.active = None
 
     def handle_data(self, data):
-        if self.active is not None and data.strip():
+        if self.active is not None and not self.named_title and data.strip():
             if self.active["title"].strip() != data.strip():
                 self.active["title"] += " " + data.strip()
 
@@ -249,7 +265,10 @@ class HentaiPawClient:
     def article(self, raw: str, options: dict | None = None) -> dict:
         url = normalize_article_url(raw)
         html, final_url = self._fetch(url, options)
-        final_url = normalize_article_url(final_url)
+        try:
+            final_url = normalize_article_url(final_url)
+        except ValueError:
+            raise PermissionError("作品页跳转到登录或验证页面，请检查本站 Cookie 和代理设置") from None
         if final_url != url:
             raise ValueError("作品页跳转到其他作品，请核对链接")
         return parse_article(html, url)
@@ -268,16 +287,40 @@ class HentaiPawClient:
         query = str(query or "").strip()
         if not query:
             return []
-        url = BASE_URL + "/articles/search?" + urlencode({"keyword": query})
-        html, final_url = self._fetch(url, options)
-        if urlsplit(final_url).path != "/articles/search":
-            raise PermissionError("搜索页面发生跳转，请核对站点登录状态")
-        parser = _SearchParser()
-        parser.feed(html)
+        limit = max(0, min(int(limit), 100))
+        if not limit:
+            return []
         rows = []
-        for row in parser.rows.values():
-            rows.append({**row, "title": row["title"].strip() or row["id"], "module_id": "hentaipaw"})
-        return rows[:max(1, min(int(limit), 100))]
+        seen = set()
+        for page in range(1, 11):
+            params = {"keyword": query}
+            if page > 1:
+                params["page"] = page
+            url = BASE_URL + "/articles/search?" + urlencode(params)
+            html, final_url = self._fetch(url, options)
+            final = urlsplit(final_url)
+            if final.path != "/articles/search" or parse_qs(final.query).get("keyword") != [query]:
+                raise PermissionError("搜索页面发生跳转，请核对站点登录状态")
+            parser = _SearchParser()
+            parser.feed(html)
+            for row in parser.rows.values():
+                if row["url"] not in seen:
+                    seen.add(row["url"])
+                    rows.append({**row, "title": row["title"].strip() or row["id"], "module_id": "hentaipaw"})
+                if len(rows) >= limit:
+                    return rows
+            next_page = False
+            for link in parser.links:
+                parsed = urlsplit(link)
+                values = parse_qs(parsed.query)
+                if (parsed.scheme == "https" and parsed.netloc == "zh.hentaipaw.com"
+                        and parsed.path == "/articles/search" and values.get("keyword") == [query]
+                        and values.get("page") == [str(page + 1)]):
+                    next_page = True
+                    break
+            if not next_page:
+                break
+        return rows
 
     def download(self, task, callbacks, cancel_event):
         options = dict(task.options, cancel_event=cancel_event)
@@ -285,8 +328,27 @@ class HentaiPawClient:
             raise TaskCancelled("任务已取消")
         if "1" not in str(options.get("types", "1234")):
             raise ValueError("HentaiPaw 漫画下载需要选择图片类型")
+        callbacks.on_progress(ProgressEvent(task.task_id, task.module_id, "info", "HentaiPaw 正在读取作品详情",
+                                            metadata={"phase": "details"}))
         info = self.article(task.target, options)
+        callbacks.on_progress(ProgressEvent(task.task_id, task.module_id, "info", "HentaiPaw 正在解析阅读器原图列表",
+                                            metadata={"phase": "discover"}))
         urls = self.reader(task.target, options)
+        callbacks.on_progress(ProgressEvent(task.task_id, task.module_id, "info", f"HentaiPaw 已核实 {len(urls)} 页，正在准备下载范围",
+                                            metadata={"phase": "plan", "page_count": len(urls)}))
+        if "_retry_media" in options:
+            jobs = []
+            media = [{"url": url, "type": "image"} for url in urls]
+            for item in options["_retry_media"]:
+                if normalize_article_url(item["target"]) != info["url"]:
+                    raise ValueError("补下记录与当前作品不匹配，未下载其他作品")
+                page = refreshed_media(media, item)
+                folder = retry_folder(task, item)
+                jobs.append((item, lambda item=item, page=page, folder=folder: self._download_page(
+                    task, info, page["url"], folder, int(item["index"]), cancel_event, page_count=len(urls),
+                )))
+            run_media_jobs(task, callbacks, cancel_event, jobs)
+            return
         maximum = max(0, int(options.get("max_files") or 0))
         selected = urls[:maximum] if maximum else urls
         folder = platform_output_root(task.output_dir, "HentaiPaw") / safe_component(
@@ -296,32 +358,27 @@ class HentaiPawClient:
         write_text_atomic(document, json.dumps({**info, "page_count": len(urls)}, ensure_ascii=False, indent=2))
         callbacks.on_file(FileRecord(document.resolve(), task.module_id, task.task_id, "text", document.stat().st_size,
                                      title=info["title"], source_url=info["url"], source_id=info["target_id"]))
-        errors = []
+        jobs = []
         for index, url in enumerate(selected, 1):
             if task_cancelled(cancel_event):
                 raise TaskCancelled("任务已取消")
-            source_suffix = Path(urlsplit(url).path).suffix
-            suffix = normalized_media_extension("image/*", source_suffix, "image", options)
-            destination = folder / "images" / f"{index:04d}{suffix}"
-            source = destination.with_name(f".{index:04d}.source{source_suffix}")
-            try:
-                result = download_media_file(
-                    self.session, url, source, destination, cancel_event, suffix, verify_image=True,
-                    conflict_policy=str(options.get("file_conflict") or "reuse"), public_referer=info["reader_url"],
-                )
-            except TaskCancelled:
-                raise
-            except Exception as exc:
-                message = f"第 {index} 页下载失败：{safe_error_message(exc)}"
-                errors.append(message)
-                callbacks.on_progress(ProgressEvent(task.task_id, task.module_id, "warning", message))
-                continue
-            callbacks.on_file(FileRecord(
-                result.path.resolve(), task.module_id, task.task_id, classify_file(result.path), result[0],
-                title=info["title"], source_url=info["url"], source_id=info["target_id"],
-                metadata={"page": index, "page_count": len(urls), "reused": result[1]},
-            ))
-            callbacks.on_progress(ProgressEvent(task.task_id, task.module_id, "info", f"漫画图片 {index}/{len(selected)}",
-                                                current=index, total=len(selected)))
-        if errors:
-            raise RuntimeError(f"{len(errors)} 页下载失败；可重试任务补下缺页。" + errors[0])
+            item = media_descriptor(task, info["url"], index, "image", url, folder)
+            jobs.append((item, lambda index=index, url=url: self._download_page(
+                task, info, url, folder, index, cancel_event, page_count=len(urls),
+            )))
+        run_media_jobs(task, callbacks, cancel_event, jobs)
+
+    def _download_page(self, task, info, url, folder, index, cancel_event, *, page_count=None):
+        source_suffix = Path(urlsplit(url).path).suffix
+        suffix = normalized_media_extension("image/*", source_suffix, "image", task.options)
+        destination = folder / "images" / f"{index:04d}{suffix}"
+        source = destination.with_name(f".{index:04d}.source{source_suffix}")
+        result = download_media_file(
+            self.session, url, source, destination, cancel_event, suffix, verify_image=True,
+            conflict_policy=str(task.options.get("file_conflict") or "reuse"), public_referer=info["reader_url"],
+        )
+        return FileRecord(
+            result.path.resolve(), task.module_id, task.task_id, classify_file(result.path), result[0],
+            title=info["title"], source_url=info["url"], source_id=info["target_id"],
+            metadata={"page": index, "page_count": page_count or info["visible_page_count"], "reused": result[1]},
+        )

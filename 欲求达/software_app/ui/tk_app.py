@@ -36,6 +36,8 @@ from software_app.ui.desktop_support import (
     collect_image_files as _collect_image_files,  # noqa: F401 - compatibility for older imports
 )
 from software_app.ui.following_tab import FollowingTabMixin
+from software_app.ui.feedback import friendly_error
+from software_app.ui.hentaipaw import HentaiPawUiMixin
 from software_app.ui.google_search_tab import GOOGLE_BATCH_RESULT_LIMIT, GoogleSearchTabMixin, google_search_failure_hint
 from software_app.ui.library_tab import LibraryTabMixin
 from software_app.ui.platform_config import (
@@ -133,6 +135,7 @@ def slash_separates_targets(module_id: str, scope: str) -> bool:
         "bluesky": {"关注账号", "帖子 / 媒体"},
         "instagram": {"账号 / 用户名", "帖子 / 链接", "Reels / 链接"},
         "ehentai": {"画廊链接 / ID"},
+        "hentaipaw": {"作品链接 / ID"},
         "google_image": {"候选页面"},
         "website": {"网页"},
     }
@@ -140,6 +143,7 @@ def slash_separates_targets(module_id: str, scope: str) -> bool:
 
 
 class SoftwareDesktop(
+    HentaiPawUiMixin,
     PersonConfigMixin,
     FollowingTabMixin,
     GoogleSearchTabMixin,
@@ -271,6 +275,8 @@ class SoftwareDesktop(
         self.generic_avatar_request_id = 0
         self.generic_avatar_source = ""
         self.generic_preview_request_id = 0
+        self.platform_search_request_id = 0
+        self._platform_search_context = None
         self.module_var = tk.StringVar(value=self.adapters[0].module_id if self.adapters else "")
         self.module_labels = {}
         self.module_label_var = tk.StringVar()
@@ -1000,6 +1006,7 @@ class SoftwareDesktop(
         self._refresh_module_detail()
 
     def _refresh_module_detail(self) -> None:
+        self._invalidate_platform_search()
         adapter = self._selected_adapter()
         self._configure_content_scopes(adapter.module_id)
         if adapter.module_id == "pixiv":
@@ -1029,6 +1036,7 @@ class SoftwareDesktop(
             "instagram": "Instagram 用户 / 帖子 / Reels URL",
             "google_image": "查询图片（见相似搜索页）",
             "website": "候选网页 URL",
+            "hentaipaw": "HentaiPaw 作品 ID / 详情或阅读器链接",
         }
         self.target_label_var.set(target_labels.get(adapter.module_id, "目标 / URL"))
         subtitles = {
@@ -1071,6 +1079,9 @@ class SoftwareDesktop(
         elif adapter.module_id == "website":
             self.types_entry.state(["disabled"])
             self.download_type_help_var.set("网页资源爬虫会自动识别图片、视频和音频，下载类型无需填写")
+        elif adapter.module_id == "hentaipaw":
+            self.types_entry.state(["disabled"])
+            self.download_type_help_var.set("HentaiPaw 按漫画图片下载，使用图片格式设置；不沿用其他平台的视频筛选")
         elif adapter.module_id == "google_image":
             self.types_entry.state(["disabled"])
             self.download_type_help_var.set("Google 只查找候选页面；资源类型在选中页面后由网页爬虫自动识别")
@@ -1108,6 +1119,7 @@ class SoftwareDesktop(
         self._refresh_profile_target_hint()
 
     def _content_scope_changed(self, _event=None) -> None:
+        self._invalidate_platform_search()
         module_id = self.module_var.get()
         self.platform_scope_selection[module_id] = self.content_scope_var.get()
         self._refresh_profile_target_hint()
@@ -1152,6 +1164,12 @@ class SoftwareDesktop(
         elif module_id == "ehentai":
             self.target_label_var.set(f"EH 目标 · {self.content_scope_var.get()}")
             self.page_subtitle_var.set("表/里站账号分开 · 里站尽量使用非亚洲代理/VPN · 不自动购买付费归档")
+        elif module_id == "hentaipaw":
+            from software_app.crawlers.hentaipaw.catalog import RANK_SCOPES
+
+            if self.content_scope_var.get() in RANK_SCOPES or self.content_scope_var.get() == "软件收藏":
+                self.platform_search_var.set("")
+            self.page_subtitle_var.set("浏览分类或排行榜后选择作品下载 · 软件收藏可导入浏览器 favorites JSON")
         self._configure_scope_actions()
         self._refresh_target_browser()
         self._refresh_platform_tabs()
@@ -1165,6 +1183,9 @@ class SoftwareDesktop(
             return
         if module_id != "pixiv":
             self.start_button.configure(text="开始任务")
+            adapter = self._selected_adapter()
+            enabled = "download" in adapter.info.capabilities and adapter.info.stage != "planned" and module_id != "google_image"
+            self.start_button.state(["!disabled"] if enabled else ["disabled"])
             return
         if scope == "关注画师":
             self.start_button.configure(text="从列表下载")
@@ -1235,7 +1256,9 @@ class SoftwareDesktop(
             self.platform_search_hint_var.set(hint)
             self.platform_search_button_var.set(button)
             searchable = ("search" in adapter.info.capabilities or adapter.module_id in {"google_image", "website"}) and "规划" not in scope
-            self.platform_search_button.state(["!disabled"] if searchable else ["disabled"])
+            context = getattr(self, "_platform_search_context", None)
+            busy = context is not None and context[:2] == (adapter.module_id, scope)
+            self.platform_search_button.state(["!disabled"] if searchable and not busy else ["disabled"])
             self.platform_search_entry.state(["!disabled"] if adapter.module_id != "google_image" and searchable else ["disabled"])
 
             if adapter.module_id == "pixiv" and scope == "关注画师":
@@ -1309,7 +1332,9 @@ class SoftwareDesktop(
         }
         self.platform_search_hint_var.set(twitter_hints.get(scope, "输入 @用户名查找"))
         self.platform_search_button_var.set("使用" if scope == "帖子 / 媒体 URL" else "查找")
-        self.platform_search_button.state(["!disabled"])
+        context = getattr(self, "_platform_search_context", None)
+        busy = context is not None and context[:2] == ("twitter", scope)
+        self.platform_search_button.state(["disabled"] if busy else ["!disabled"])
         self.platform_search_entry.state(["!disabled"])
 
         for row in self.following_rows:
@@ -1409,6 +1434,8 @@ class SoftwareDesktop(
             return
         search_mode = self.content_scope_var.get()
         query = self.platform_search_var.get().strip()
+        if module_id == "hentaipaw" and search_mode not in {"作品链接 / ID", "关键词搜索"} and not query:
+            query = "全部"
         if module_id == "jmcomic" and search_mode == "分类 / 排行" and not query:
             query = "全部"
         elif module_id == "jmcomic" and search_mode == "漫画收藏夹" and not query:
@@ -1450,6 +1477,16 @@ class SoftwareDesktop(
         if "search" not in adapter.info.capabilities:
             messagebox.showinfo("当前平台", f"{adapter.display_name} 暂不支持目标搜索")
             return
+        try:
+            # Read Tk variables on the UI thread and freeze this request's scope.
+            options = self._current_target_options(query)
+            options["output_dir"] = output_dir
+        except Exception as exc:
+            messagebox.showerror("搜索设置无效", safe_error_message(exc))
+            return
+        self.platform_search_request_id += 1
+        request_id = self.platform_search_request_id
+        self._platform_search_context = (module_id, search_mode, query)
         self.platform_search_button.state(["disabled"])
         if hasattr(self, "candidate_refresh_button"):
             self.candidate_refresh_button.state(["disabled"])
@@ -1459,9 +1496,9 @@ class SoftwareDesktop(
 
         def worker() -> None:
             try:
-                options = self._current_target_options(query)
-                options["output_dir"] = output_dir
                 result_limit = 20
+                if module_id == "hentaipaw" and search_mode not in {"作品链接 / ID", "关键词搜索"}:
+                    result_limit = 100
                 if module_id == "pixiv":
                     result_limit = int(options.get("history_limit") or options.get("max_works") or 20)
                 if module_id == "pixiv" and search_mode in {"作品收藏", "小说收藏"}:
@@ -1474,11 +1511,49 @@ class SoftwareDesktop(
                 else:
                     rows = adapter.search_targets(query, limit=result_limit, options=options)
             except Exception as exc:  # noqa: BLE001
-                self.ui_queue.put(("platform_search_error", (module_id, str(exc))))
+                self.ui_queue.put(("platform_search_error", (request_id, module_id, search_mode, query, str(exc))))
                 return
-            self.ui_queue.put(("platform_search_loaded", (module_id, query, rows)))
+            self.ui_queue.put(("platform_search_loaded", (request_id, module_id, search_mode, query, rows)))
 
-        threading.Thread(target=worker, name=f"{module_id}-target-search", daemon=True).start()
+        try:
+            threading.Thread(target=worker, name=f"{module_id}-target-search", daemon=True).start()
+        except RuntimeError as exc:
+            self._finish_platform_search((request_id, module_id, search_mode, query, str(exc)), error=True)
+
+    def _invalidate_platform_search(self) -> None:
+        if getattr(self, "_platform_search_context", None) is not None:
+            self.status_var.set("已切换搜索范围，先前请求不会更新当前页面")
+        self.platform_search_request_id = getattr(self, "platform_search_request_id", 0) + 1
+        self._platform_search_context = None
+
+    def _finish_platform_search(self, payload, *, error=False) -> None:
+        request_id, module_id, scope, query, result = payload
+        if (request_id != self.platform_search_request_id
+                or self._platform_search_context != (module_id, scope, query)
+                or self.module_var.get() != module_id or self.content_scope_var.get() != scope):
+            return
+        self._platform_search_context = None
+        self.platform_search_button.state(["!disabled"])
+        if error:
+            self._refresh_platform_tabs()
+            self.status_var.set("目标搜索暂未完成")
+            self._append_log(self._friendly_error(result, "目标搜索"))
+            return
+        rows = result if isinstance(result, list) else []
+        self._show_platform_search_results(module_id, query, rows)
+        if module_id == "pixiv" and scope in {"作品收藏", "小说收藏"}:
+            kind = "novel" if scope == "小说收藏" else "work"
+            cache = self.manager.get_adapter("pixiv").load_bookmark_payload(kind)
+            from software_app.crawlers.pixiv.bookmark_discovery import REASONS
+
+            state = "所选范围完整" if cache.get("complete") else REASONS.get(
+                str(cache.get("stop_reason") or ""), "部分或旧版记录")
+            self.status_var.set(
+                f"Pixiv 收藏已更新：本次取得 {cache.get('fetched_count', 0)} 个，"
+                f"本地保留 {cache.get('count', 0)} 个（{state}）"
+            )
+        else:
+            self.status_var.set(f"目标搜索完成：{len(rows)} 个结果")
 
     def _show_platform_search_results(self, module_id: str, query: str, rows: list[dict]) -> None:
         if self.module_var.get() != module_id:
@@ -1728,6 +1803,10 @@ class SoftwareDesktop(
                 bio_parts.append("标签：" + " · ".join(tags))
             if metadata.get("chapters"):
                 bio_parts.append(f"章节：{len(metadata['chapters'])} 个")
+        if preview.module_id == "hentaipaw":
+            profile_handle = f"HentaiPaw · {metadata.get('target_id') or ''}"
+            if metadata.get("reader_verified"):
+                bio_parts.append(f"阅读器已验证，共 {metadata['page_count']} 页")
         self.profile_name_var.set(title)
         self.profile_handle_var.set(profile_handle)
         self.profile_bio_var.set("\n".join(part for part in bio_parts if part))
@@ -1977,7 +2056,8 @@ class SoftwareDesktop(
                 or metadata.get("thumbnail_url") or ""
             ),
             "input_kind": str(metadata.get("input_kind") or ""),
-            "downloadable": True,
+            "downloadable": bool(metadata.get("download_ready", True)),
+            "read_only_reason": preview.description if metadata.get("download_ready") is False else "",
             "_batch_result": True,
             "_batch_preview": TargetPreview(
                 module_id=preview.module_id,
@@ -1993,6 +2073,7 @@ class SoftwareDesktop(
                           if key == "tags" and isinstance(value, list)
                           else [None] * min(len(value), 20)
                           if key in {"search_results", "chapters"} and isinstance(value, list)
+                          else value if key in {"reader_verified", "page_count"} and isinstance(value, (bool, int))
                           else str(value)[:1000] if isinstance(value, (str, int, float, bool)) else None)
                     for key, value in metadata.items()
                     if key in {
@@ -2000,6 +2081,7 @@ class SoftwareDesktop(
                         "display_name", "tags", "published_at", "search_results", "chapters",
                         "avatar_url", "profile_image_url",
                         "thumbnail_url", "profile_url", "title", "browser_destination",
+                        "reader_verified", "page_count",
                     }
                 },
             ),
@@ -2834,8 +2916,8 @@ class SoftwareDesktop(
                                 source,
                                 {"proxy_url": str(self.storage.get_setting("proxy_url", "") or "")},
                             )
-                        elif self.module_var.get() == "ehentai":
-                            data = self.manager.get_adapter("ehentai").fetch_preview_image_bytes(
+                        elif self.module_var.get() in {"ehentai", "hentaipaw"}:
+                            data = self.manager.get_adapter(self.module_var.get()).fetch_preview_image_bytes(
                                 source,
                                 {"proxy_url": str(self.storage.get_setting("proxy_url", "") or "")},
                             )
@@ -2943,6 +3025,16 @@ class SoftwareDesktop(
             return
         module_id = self.module_var.get()
         scope = self.content_scope_var.get()
+        if module_id == "hentaipaw":
+            try:
+                from software_app.crawlers.hentaipaw.catalog import normalize_catalog_url
+
+                normalize_catalog_url(target)
+            except ValueError:
+                pass
+            else:
+                messagebox.showinfo("请先选择作品", "分类和排行榜用于浏览。请先执行搜索或展开分类，再选择具体作品下载。")
+                return
         prefilled = getattr(self, "_prefilled_task_targets", None)
         if prefilled and prefilled[0] == module_id and prefilled[1] == target:
             targets = list(prefilled[2])
@@ -3070,25 +3162,7 @@ class SoftwareDesktop(
 
     @staticmethod
     def _friendly_error(message: object, action: str) -> str:
-        raw = safe_error_message(str(message or "")).strip()
-        lowered = raw.lower()
-        if any(marker in lowered for marker in ("proxyerror", "unable to connect to proxy", "proxy connection")):
-            return f"当前设置的代理无法连接，{action}未完成；请在“设置 → 代理 URL”中修改或清空代理后重试。"
-        if any(marker in lowered for marker in ("no such window", "invalid session", "disconnected", "target window")):
-            return f"浏览器已经关闭，{action}已结束。"
-        if "pixiv" in action.casefold() and ("timeout" in lowered or "超时" in raw):
-            return (
-                f"Pixiv 网络请求连接超时，{action}未完成；第 1 页或资料内容尚未返回。"
-                "这不是软件按总时长定时关闭，请检查网络，或在“设置 → 代理 URL”中更换可用代理后重试。"
-            )
-        if "timeout" in lowered or "超时" in raw:
-            return f"等待时间较长，{action}已停止；已获取的本地或部分结果仍会保留。"
-        if any(marker in lowered for marker in ("login", "auth_token", "cookie")) or "登录" in raw:
-            return f"当前登录状态可能已失效，暂时无法完成{action}；可以稍后更新 Cookie 再试。"
-        first_line = raw.splitlines()[0] if raw else "暂时没有完成"
-        if len(first_line) > 180:
-            first_line = first_line[:177] + "…"
-        return f"{action}暂未完成：{first_line}"
+        return friendly_error(message, action)
 
     def _poll_queue(self) -> None:
         self._poll_job = None
@@ -3377,23 +3451,7 @@ class SoftwareDesktop(
                     self.status_var.set("在线预览暂未完成")
                     self._append_log(message)
                 elif event_type == "platform_search_loaded":
-                    module_id, query, rows = payload  # type: ignore[misc]
-                    if self.module_var.get() == module_id:
-                        self.platform_search_button.state(["!disabled"])
-                        self._show_platform_search_results(module_id, query, rows if isinstance(rows, list) else [])
-                        if module_id == "pixiv" and self.content_scope_var.get() in {"作品收藏", "小说收藏"}:
-                            kind = "novel" if self.content_scope_var.get() == "小说收藏" else "work"
-                            cache = self.manager.get_adapter("pixiv").load_bookmark_payload(kind)
-                            from software_app.crawlers.pixiv.bookmark_discovery import REASONS
-
-                            state = "所选范围完整" if cache.get("complete") else REASONS.get(
-                                str(cache.get("stop_reason") or ""), "部分或旧版记录")
-                            self.status_var.set(
-                                f"Pixiv 收藏已更新：本次取得 {cache.get('fetched_count', 0)} 个，"
-                                f"本地保留 {cache.get('count', 0)} 个（{state}）"
-                            )
-                        else:
-                            self.status_var.set(f"目标搜索完成：{len(rows) if isinstance(rows, list) else 0} 个结果")
+                    self._finish_platform_search(payload)
                 elif event_type == "batch_info_done":
                     request_id, module_id, rows, cancelled = payload  # type: ignore[misc]
                     if request_id == self.batch_info_request_id:
@@ -3405,13 +3463,9 @@ class SoftwareDesktop(
                             state = "已停止" if cancelled else "完成"
                             self.status_var.set(f"批量资料获取{state}：{len(rows) if isinstance(rows, list) else 0} 项")
                 elif event_type == "platform_search_error":
-                    module_id, message = payload  # type: ignore[misc]
-                    if self.module_var.get() == module_id:
-                        self.platform_search_button.state(["!disabled"])
-                        self._refresh_platform_tabs()
-                    friendly = self._friendly_error(message, "目标搜索")
-                    self.status_var.set("目标搜索暂未完成")
-                    self._append_log(friendly)
+                    self._finish_platform_search(payload, error=True)
+                elif event_type == "hentaipaw_access_result":
+                    self._finish_hentaipaw_access(payload)
                 elif event_type == "google_search_progress":
                     progress_payload = payload if isinstance(payload, dict) else {}
                     self.google_search_progress_var.set(
@@ -3604,31 +3658,9 @@ class SoftwareDesktop(
                 elif event_type == "cookie_import_error":
                     self._finish_cookie_file_import(payload, error=True)
                 elif event_type == "header_import_done":
-                    self.header_convert_button.state(["!disabled"])
-                    self.jm_header_convert_button.state(["!disabled"])
-                    platform, converted, count, verified = payload
-                    message = (
-                        f"{platform} 请求头已转换为 {converted.destination.name}，并导入 {count} 个 Cookie。"
-                        + ("已完成目标站点在线验证。" if verified else "请继续使用平台连接检查验证会话。")
-                    )
-                    self.cookie_capture_status_var.set(message)
-                    if platform == "JMComic":
-                        self._refresh_jm_auth_status()
-                    self.status_var.set(f"{platform} Cookie 已导入")
-                    self._append_log(message)
-                    self._refresh_platform_tabs()
+                    self._finish_header_import(payload, error=False)
                 elif event_type == "header_import_error":
-                    self.header_convert_button.state(["!disabled"])
-                    self.jm_header_convert_button.state(["!disabled"])
-                    platform, destination, raw_message = payload
-                    message = self._friendly_error(raw_message, f"{platform} Cookie 导入")
-                    self.cookie_capture_status_var.set(
-                        f"JSON 已生成但未导入：{Path(destination).name}；{message}"
-                    )
-                    self.status_var.set(f"{platform} Cookie JSON 导入失败")
-                    if platform == "JMComic":
-                        self.jm_auth_status_var.set(f"JMComic Cookie JSON 导入失败：{message}")
-                    self._append_log(f"{platform} Cookie JSON 导入失败：{message}")
+                    self._finish_header_import(payload, error=True)
                 elif event_type == "eh_validation_done":
                     self._finish_eh_validation(payload, error=False)
                 elif event_type == "eh_validation_error":
@@ -3664,46 +3696,8 @@ class SoftwareDesktop(
                     self._finish_jm_plain_capture(payload, error=False)
                 elif event_type == "jm_plain_capture_error":
                     self._finish_jm_plain_capture(payload, error=True)
-                elif event_type == "fanbox_status_loaded":
-                    self.fanbox_check_button.state(["!disabled"])
-                    payload_dict = payload if isinstance(payload, dict) else {}
-                    message = str(payload_dict.get("message") or "FANBOX 状态读取完成")
-                    self.fanbox_status_var.set(message)
-                    self.status_var.set("FANBOX 订阅状态已更新")
-                    self._append_log(message)
-                elif event_type == "pixiv_connection_loaded":
-                    self.pixiv_connection_button.state(["!disabled"])
-                    result = payload if isinstance(payload, dict) else {}
-                    message = str(result.get("message") or "Pixiv 连接检查完成")
-                    self.pixiv_connection_status_var.set(message)
-                    self.status_var.set("Pixiv 连接检查完成")
-                    self._append_log(message)
-                elif event_type == "pixiv_connection_error":
-                    self.pixiv_connection_button.state(["!disabled"])
-                    message = self._friendly_error(payload, "Pixiv 资料和头像连接检查")
-                    self.pixiv_connection_status_var.set(message)
-                    self.status_var.set("Pixiv 连接检查失败")
-                    self._append_log(message)
-                elif event_type == "jm_connection_loaded":
-                    self.jm_connection_button.state(["!disabled"])
-                    message = str(payload.get("message") or "JMComic 站点连接检查完成") if isinstance(payload, dict) else str(payload)
-                    self.jm_connection_status_var.set(message)
-                    self._refresh_jm_auth_status()
-                    self.status_var.set("JMComic 连接检查完成")
-                    self._append_log(message)
-                elif event_type == "jm_connection_error":
-                    self.jm_connection_button.state(["!disabled"])
-                    message = self._friendly_error(payload, "JMComic 站点连接检查")
-                    self.jm_connection_status_var.set(message)
-                    self._refresh_jm_auth_status()
-                    self.status_var.set("JMComic 连接检查失败")
-                    self._append_log(message)
-                elif event_type == "fanbox_status_error":
-                    self.fanbox_check_button.state(["!disabled"])
-                    message = self._friendly_error(payload, "FANBOX 订阅状态")
-                    self.fanbox_status_var.set("读取失败；请检查 FANBOXSESSID 和代理")
-                    self.status_var.set("FANBOX 订阅状态读取失败")
-                    self._append_log(message)
+                elif event_type == "settings_check_finished":
+                    self._finish_settings_check(payload)
                 elif event_type == "pixiv_following_status":
                     message = str(payload or "").strip()
                     if message and self.following_refreshing:

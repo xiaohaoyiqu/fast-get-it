@@ -257,6 +257,8 @@ class BlueskyClient:
         )
 
     def download(self, task: DownloadTask, callbacks: CallbackSet, cancel_event: threading.Event) -> None:
+        callbacks.on_progress(ProgressEvent(task.task_id, task.module_id, "info", "Bluesky 正在读取帖子与媒体列表",
+                                            metadata={"phase": "discover"}))
         if "_retry_media" in task.options:
             cache = {}
 
