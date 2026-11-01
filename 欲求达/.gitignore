@@ -1,0 +1,64 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# IDE and local tooling
+.idea/
+.vscode/
+.continue/
+.codex/
+.ruff_cache/
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# Local databases and runtime state
+.yuqiuda-http-*/
+.yuqiuda-hls-*/
+*.db
+*.sqlite
+*.sqlite3
+/data/software_app/
+data/**/downloads/
+**/downloaded_urls.json
+**/failed_urls.json
+**/following_accounts.json
+**/profile_previews/
+
+# Login cookies and browser drivers
+**/X_cookie.json
+**/*cookie*.json
+**/browser_headers.json
+**/chromedriver*.exe
+data/software_app/browser/*_profile/
+/1.txt
+
+# Separately versioned userscript repository
+/油猴脚本/
+
+# Local screenshots not used by repository documentation
+/图片/
+
+# Local maintenance and planning documents
+/文档/测试报告*.md
+/文档/项目整理记录.md
+/文档/开源下载器对比.md
+/文档/参考源码评估.md
+/文档/仓库与目录说明.md
+/文档/QQBot接入注意事项.txt
+/文档/开发暂停与接续.md
+/文档/功能路线图.md
+/文档/设计/

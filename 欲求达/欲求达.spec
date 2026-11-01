@@ -1,0 +1,73 @@
+﻿# -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
+
+root = Path(SPECPATH)
+a = Analysis(
+    [str(root / "run_software.py")],
+    pathex=[str(root)],
+    binaries=[
+        (str(root / "software_app/crawlers/twitter/chromedriver.exe"), "."),
+    ],
+    datas=[
+        (str(root / "software_app/crawlers/twitter"), "software_app/crawlers/twitter"),
+        (str(root / "software_app/crawlers/pixiv"), "software_app/crawlers/pixiv"),
+        (str(root / "software_app/crawlers/jmcomic"), "software_app/crawlers/jmcomic"),
+    ],
+    hiddenimports=[
+        "PIL",
+        "PIL._imaging",
+        "PIL._imagingft",
+        "PIL._imagingmath",
+        "PIL._imagingmorph",
+        "PIL._tkinter_finder",
+        "PIL.Image",
+        "PIL.ImageTk",
+        "tkinterweb",
+        "win32crypt",
+        "Crypto.Cipher.AES",
+    ],
+    hookspath=[str(root / "pyinstaller_hooks")],
+    hooksconfig={},
+    runtime_hooks=[str(root / "pyinstaller_hooks/rthook_force_stdlib_json.py")],
+    excludes=["torch", "torchvision", "torchaudio", "pandas", "scipy", "matplotlib"],
+    noarchive=False,
+    optimize=0,
+)
+pyz = PYZ(a.pure)
+
+common_kwargs = dict(
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon=str(root / "1.ico"),
+)
+
+gui_exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name="欲求达",
+    console=False,
+    **common_kwargs,
+)
+
+cli_exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name="欲求达-cli",
+    console=True,
+    **common_kwargs,
+)
