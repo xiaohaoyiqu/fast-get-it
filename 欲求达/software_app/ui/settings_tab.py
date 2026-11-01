@@ -1424,7 +1424,7 @@ class SettingsTabMixin:
             "FANBOX": "通过 Pixiv 账号登录，并以 FANBOX 支持方案接口确认会话；保存时保留已有 Pixiv Cookie。",
             "Instagram": "登录完成后检测 sessionid；可以在页面内完成验证码或双重验证。",
             "JMComic": "AVS 表示账号会话，cf_clearance 只表示通过站点验证；个人列表还需要正确的个人主页用户名。",
-            "HentaiPaw": "可导入浏览器导出的 Cookie JSON、cookies.txt 或 Cookie 请求头。只保存本站 Cookie；配置成功不代表账号已验证。匿名可读的作品无需 Cookie。",
+            "HentaiPaw": "公开作品无需导入 Cookie，浏览器里找不到 Cookie 时可以直接使用。要同步浏览器收藏，请在 HentaiPaw 候选页导入 Local Storage 中的 favorites JSON。",
             "E-Hentai 表站": "仅手动填写或导入：在已登录浏览器的 F12 → Application → Storage → Cookies → e-hentai.org 查看 ipb_member_id、ipb_pass_hash。保存不联网，需验证时再点“验证 EH 登录（联网）”。",
             "ExHentai 里站": "仅手动填写或导入：确认里站页面正常，在 F12 → Application → Storage → Cookies → exhentai.org 查看 ipb_member_id、ipb_pass_hash、igneous。保存不联网，验证和下载需可用的网络／代理。",
         }
@@ -1450,6 +1450,15 @@ class SettingsTabMixin:
             self.cookie_capture_help_label.grid_remove()
         if platform == "HentaiPaw":
             self.cookie_capture_button.grid_remove()
+            self.cookie_capture_help_var.set(
+                "① 浏览和下载公开作品：无需导入 Cookie，可先点“检查站点访问（联网）”。\n"
+                "② 导入收藏：在原来收藏作品的浏览器和站点，按 F12 → Application → Local Storage，"
+                "复制 favorites 的完整值，保存为 hentaipaw-favorites.json；在 HentaiPaw 候选页点“导入浏览器收藏”。\n"
+                "③ Cookie 仅按需导入：支持本站 Cookie JSON、cookies.txt 或 Cookie 请求头；"
+                "Cookies 列表为空时无需导入，也不要把 favorites JSON 当成 Cookie 文件。"
+            )
+            self.cookie_capture_help_label.grid()
+        self.cookie_import_button.configure(text="导入 Cookie（可选）" if platform == "HentaiPaw" else "导入 Cookie 文件")
         if hasattr(self, "hentaipaw_access_button"):
             self.hentaipaw_access_button.grid() if platform == "HentaiPaw" else self.hentaipaw_access_button.grid_remove()
         self.header_convert_button.grid()
@@ -1628,6 +1637,28 @@ class SettingsTabMixin:
 
     def _open_cookie_capture_guide(self) -> None:
         platform = self.cookie_capture_platform_var.get().strip()
+        if platform == "HentaiPaw":
+            messagebox.showinfo(
+                "HentaiPaw：需要导入什么",
+                "【浏览和下载公开作品】\n"
+                "不需要导入任何文件。浏览器的 Cookies 列表为空或没有本站条目时，可以直接使用软件。"
+                "先点“检查站点访问（联网）”，再搜索或输入作品链接。\n\n"
+                "【导入浏览器收藏】\n"
+                "1. 使用原来收藏作品的同一浏览器，打开当时使用的 HentaiPaw 站点。\n"
+                "2. 按 F12 → Application（应用）→ Local Storage（本地存储），选择该站点域名。\n"
+                "3. 找到 favorites，复制它的完整值，以 UTF-8 保存为 hentaipaw-favorites.json。\n"
+                "4. 在软件选择 HentaiPaw，进入候选页，点“导入浏览器收藏”，选择这份文件。\n"
+                "如果没有 favorites，先在原网站收藏一部作品，再刷新存储列表；"
+                "也可以直接在软件中把候选加入“软件收藏”，无需导入。\n\n"
+                "【可选的 Cookie 导入】\n"
+                "只有你确实取得本站 Cookie，并需要带会话访问时才使用。"
+                "支持 Cookie JSON、Netscape cookies.txt 或 Cookie 请求头文本。"
+                "未找到 Cookie 时不要创建空文件，也不要填其他平台的 Cookie。\n"
+                "收藏 JSON 与 Cookie 文件是两种数据，必须使用各自的导入入口。"
+                "站点可访问、Cookie 已保存都不表示账号身份已验证。",
+                parent=self,
+            )
+            return
         if platform in {"E-Hentai 表站", "ExHentai 里站"}:
             messagebox.showinfo(
                 f"{platform} Cookie 获取说明",

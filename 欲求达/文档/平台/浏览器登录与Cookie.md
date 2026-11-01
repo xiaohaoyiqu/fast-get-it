@@ -35,7 +35,7 @@
 | Pixiv | `PHPSESSID`，且账号接口验证成功 | 保存 Pixiv 会话，并保留已有 FANBOX Cookie；用于收藏、私密关注、R-18 和账号历史等登录功能。 |
 | FANBOX | `FANBOXSESSID`，且支持方案接口验证成功 | 保存 FANBOX 会话，并保留已有 Pixiv Cookie；用于登录限定和已支持的付费帖子读取。 |
 | Instagram | `sessionid` | 保存 Instagram 网页会话；用于公开页面被登录墙拦截或登录限定页面。 |
-| HentaiPaw | 导入本站 Cookie，不假定存在固定登录字段 | 单独保存为 `hentaipaw/cookies.json`；访问检查只确认公共页面及 Cookie 配置，不验证账号身份。浏览器本地收藏需另行导入。 |
+| HentaiPaw | 可选；公开作品无需 Cookie，浏览器没有本站 Cookie 时不必导入 | 如需带会话访问，导入实际取得的本站 Cookie，保存为 `hentaipaw/cookies.json`；访问检查不验证账号身份。收藏应导入 Local Storage 中 `favorites` 的 JSON，使用候选页的收藏导入入口。 |
 | E-Hentai 表站 | `ipb_member_id`、`ipb_pass_hash`；保存后可手动验证 | 手动填写或导入，保存为 `e-hentai-cookies.json`，只用于表站及表站收藏夹。 |
 | ExHentai 里站 | `ipb_member_id`、`ipb_pass_hash`、`igneous`；保存后可手动验证 | 手动填写或导入，保存为 `exhentai-cookies.json`，只用于里站及里站收藏夹。 |
 

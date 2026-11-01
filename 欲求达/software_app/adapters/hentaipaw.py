@@ -110,7 +110,8 @@ class HentaiPawAdapter(CrawlerAdapter):
         except Exception as exc:
             return {**status, "accessible": False, "message": safe_error_message(exc)}
         return {**status, "accessible": accessible, "favorites_storage": "browser_localStorage",
-                "message": ("公共页面可访问；账号登录状态未验证。本站收藏位于浏览器 localStorage，需单独导入。"
+                "message": ("公共页面可访问，公开作品可直接使用，无需导入 Cookie；账号登录状态未验证。"
+                            "导入浏览器收藏请使用 Local Storage 中的 favorites JSON。"
                             if accessible else "返回页面未能确认为 HentaiPaw，可能需要完成站点验证。")}
 
     def import_cookie_file(self, source):

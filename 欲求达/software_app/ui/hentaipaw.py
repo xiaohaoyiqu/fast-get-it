@@ -23,8 +23,9 @@ class HentaiPawUiMixin:
     def _hentaipaw_import_favorites(self):
         messagebox.showinfo(
             "导入浏览器收藏",
-            "在收藏所在的浏览器打开 HentaiPaw，进入开发者工具 → Application → Local Storage → 本站。\n"
-            "复制 favorites 的完整值，保存成 JSON 文件后导入。Cookie 文件不包含这份收藏。\n"
+            "在原来收藏作品的同一浏览器和站点打开 HentaiPaw，进入 F12 → Application → Local Storage → 本站。\n"
+            "复制 favorites 的完整值，以 UTF-8 保存为 hentaipaw-favorites.json 后导入。Cookie 文件不包含这份收藏。\n"
+            "如果没有 favorites，先在网站收藏一部作品后刷新；也可直接在软件里加入收藏，无需导入。\n"
             "导入会合并到软件收藏，不改写浏览器中的原收藏。",
             parent=self,
         )
